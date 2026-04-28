@@ -8,6 +8,8 @@ from torch import nn
 import torch.nn.functional as F
 from typing import Union, Tuple, Dict, Optional
 
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig, dump_eviction_snapshot
+
 XFORMERS_AVAILABLE = False
 
 
@@ -50,7 +52,11 @@ class Attention(nn.Module):
         k: torch.Tensor, 
         v: torch.Tensor, 
         cache_budget: int,
-        num_anchor_tokens: int
+        num_anchor_tokens: int,
+        cache_analysis_config: Optional[CacheAnalysisConfig] = None,
+        layer_id: Optional[int] = None,
+        step_idx: Optional[int] = None,
+        tokens_per_frame: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Evicts tokens from the key-value cache based on key cosine similarity.
@@ -82,6 +88,19 @@ class Attention(nn.Module):
 
         _, top_indices = torch.topk(-scores, k=num_to_keep_from_candidates, dim=-1)
         top_indices = top_indices.sort(dim=-1).values
+
+        if cache_analysis_config is not None and layer_id is not None and step_idx is not None:
+            dump_eviction_snapshot(
+                cache_analysis_config,
+                k_before=k,
+                scores=scores,
+                kept_candidate_indices=top_indices,
+                layer_id=layer_id,
+                step_idx=step_idx,
+                cache_budget=cache_budget,
+                num_anchor_tokens=num_anchor_tokens,
+                tokens_per_frame=tokens_per_frame,
+            )
         
         expanded_indices = top_indices.unsqueeze(-1).expand(B, H, num_to_keep_from_candidates, D)
         kept_candidate_k = torch.gather(candidate_k, 2, expanded_indices)
@@ -98,7 +117,11 @@ class Attention(nn.Module):
         attn_mask=None, 
         past_key_values=None, 
         use_cache=False,
-        cache_budget = None
+        cache_budget = None,
+        cache_analysis_config: Optional[CacheAnalysisConfig] = None,
+        layer_id: Optional[int] = None,
+        step_idx: Optional[int] = None,
+        tokens_per_frame: Optional[int] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -119,7 +142,16 @@ class Attention(nn.Module):
                 k = torch.cat([past_k, k], dim=2)
                 v = torch.cat([past_v, v], dim=2)
             if cache_budget is not None and k.shape[2] > cache_budget:
-                k, v, scores = self.eviction(k, v, cache_budget, self.num_anchor_tokens)
+                k, v, scores = self.eviction(
+                    k,
+                    v,
+                    cache_budget,
+                    self.num_anchor_tokens,
+                    cache_analysis_config=cache_analysis_config,
+                    layer_id=layer_id,
+                    step_idx=step_idx,
+                    tokens_per_frame=tokens_per_frame,
+                )
 
             new_kv = (k, v)
 

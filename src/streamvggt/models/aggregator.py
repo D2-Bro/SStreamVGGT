@@ -14,6 +14,7 @@ from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +193,8 @@ class Aggregator(nn.Module):
         past_key_values=None,
         use_cache=False,
         past_frame_idx=0,
-        total_budget=0
+        total_budget=0,
+        cache_analysis_config: Optional[CacheAnalysisConfig] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -277,7 +279,8 @@ class Aggregator(nn.Module):
                             past_key_values_block=past_key_values[global_idx] if past_key_values[global_idx] is not None else None,
                             use_cache=True,
                             past_frame_idx=past_frame_idx,
-                            cache_budget=current_budgets[global_idx].item()
+                            cache_budget=current_budgets[global_idx].item(),
+                            cache_analysis_config=cache_analysis_config,
                         )
                         past_key_values[global_idx - 1] = new_kv
                         if current_scores is not None: # pruning happened
@@ -338,7 +341,8 @@ class Aggregator(nn.Module):
         past_key_values_block=None,
         use_cache=False,
         past_frame_idx=0,
-        cache_budget=None
+        cache_budget=None,
+        cache_analysis_config: Optional[CacheAnalysisConfig] = None,
     ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
@@ -369,7 +373,11 @@ class Aggregator(nn.Module):
                     attn_mask=attn_mask, 
                     past_key_values=past_key_values_block,
                     use_cache=True,
-                    cache_budget=cache_budget
+                    cache_budget=cache_budget,
+                    cache_analysis_config=cache_analysis_config,
+                    layer_id=global_idx,
+                    step_idx=past_frame_idx,
+                    tokens_per_frame=P,
                 )
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)

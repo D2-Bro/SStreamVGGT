@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Callable, List, Any, Tuple, Dict, Union
+from typing import Callable, List, Any, Tuple, Dict, Union, Optional
 import warnings
 
 import torch
@@ -68,11 +68,40 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None, attn_mask=None, past_key_values=None, use_cache=False, cache_budget=None) -> Union[Tensor, Tuple[Tensor, Dict]]:
+    def forward(
+        self,
+        x: Tensor,
+        pos=None,
+        attn_mask=None,
+        past_key_values=None,
+        use_cache=False,
+        cache_budget=None,
+        cache_analysis_config=None,
+        layer_id: Optional[int] = None,
+        step_idx: Optional[int] = None,
+        tokens_per_frame: Optional[int] = None,
+    ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             
-        def attn_residual_func(x: Tensor, pos=None, attn_mask=None, past_key_values=None, use_cache=False, cache_budget=None) -> Union[Tensor, Tuple[Tensor, Dict]]:
+        def attn_residual_func(
+            x: Tensor,
+            pos=None,
+            attn_mask=None,
+            past_key_values=None,
+            use_cache=False,
+            cache_budget=None,
+        ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             if use_cache:
-                output, new_kv, scores = self.attn(self.norm1(x), pos=pos, past_key_values=past_key_values, use_cache=True, cache_budget=cache_budget)
+                output, new_kv, scores = self.attn(
+                    self.norm1(x),
+                    pos=pos,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    cache_budget=cache_budget,
+                    cache_analysis_config=cache_analysis_config,
+                    layer_id=layer_id,
+                    step_idx=step_idx,
+                    tokens_per_frame=tokens_per_frame,
+                )
                 return self.ls1(output), new_kv, scores
             else:
                 if attn_mask is not None:

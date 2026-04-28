@@ -15,6 +15,7 @@ from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.utils.load_fn import load_and_preprocess_images
 from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from streamvggt.utils.geometry import FrameDiskCache
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
@@ -43,6 +44,16 @@ def run_inference(args: argparse.Namespace):
     if args.frame_cache_dir:
         frame_writer = FrameDiskCache(args.frame_cache_dir)
 
+    cache_analysis_config = CacheAnalysisConfig.from_cli(
+        args.cache_analysis_dir,
+        layers=args.cache_analysis_layers,
+        heads=args.cache_analysis_heads,
+        steps=args.cache_analysis_steps,
+        max_snapshots=args.cache_analysis_max_snapshots,
+    )
+    if cache_analysis_config is not None:
+        print(f"Cache analysis snapshots enabled: {cache_analysis_config.output_dir}")
+
     model = StreamVGGT(total_budget=1200000)
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
 
@@ -53,12 +64,34 @@ def run_inference(args: argparse.Namespace):
     print("Model loaded successfully onto the GPU.")
 
     print(f"Loading images from input directory: {args.input_dir}")
-    image_names = sorted(glob.glob(os.path.join(args.input_dir, "*")))
+    image_names = sorted(glob.glob(os.path.join(args.input_dir, "*color.*")))
     
     if not image_names:
         print(f"Error: No images found in {args.input_dir}. Please check the path and file extensions.")
         return
-        
+
+    if args.frame_stride < 1:
+        print(f"Error: --frame_stride must be >= 1, got {args.frame_stride}.")
+        return
+    original_num_images = len(image_names)
+    image_names = image_names[::args.frame_stride]
+
+    if args.max_frames is not None:
+        if args.max_frames < 1:
+            print(f"Error: --max_frames must be >= 1, got {args.max_frames}.")
+            return
+        image_names = image_names[:args.max_frames]
+
+    if not image_names:
+        print("Error: No images remain after applying --frame_stride/--max_frames.")
+        return
+
+    if args.frame_stride > 1 or args.max_frames is not None:
+        print(
+            f"Frame selection: {original_num_images} input images -> {len(image_names)} frames "
+            f"(stride={args.frame_stride}, max_frames={args.max_frames})"
+        )
+
     print(f"Found {len(image_names)} images to process.")
     images = load_and_preprocess_images(image_names).to(device)
     print(f"Preprocessed images tensor shape: {images.shape}")
@@ -78,7 +111,12 @@ def run_inference(args: argparse.Namespace):
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            output = model.inference(frames,frame_writer=frame_writer,cache_results=cache_results)
+            output = model.inference(
+                frames,
+                frame_writer=frame_writer,
+                cache_results=cache_results,
+                cache_analysis_config=cache_analysis_config,
+            )
 
     torch.cuda.synchronize()
     end_time_model = time.time()
@@ -148,7 +186,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_path", 
         type=str, 
-        default="/checkpoints.pth", 
+        default="../OVGGT/ckpt/checkpoints.pth",
         help="Path to the model checkpoint file (.pth)."
     )
     parser.add_argument(
@@ -161,6 +199,48 @@ if __name__ == "__main__":
         "--no_cache_results",
         action="store_true",
         help="Prediction results will not be accumulated in GPU memory",
+    )
+    parser.add_argument(
+        "--frame_stride",
+        type=int,
+        default=2,
+        help="Use every Nth frame from the sorted input image list",
+    )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=150,
+        help="Maximum number of frames to process after applying frame_stride",
+    )
+    parser.add_argument(
+        "--cache_analysis_dir",
+        type=str,
+        default=None,
+        help="Optional directory for per-head cache eviction analysis snapshots",
+    )
+    parser.add_argument(
+        "--cache_analysis_layers",
+        type=str,
+        default="all",
+        help="Layers to dump, e.g. '0,3,8-10' or 'all'",
+    )
+    parser.add_argument(
+        "--cache_analysis_heads",
+        type=str,
+        default="all",
+        help="Heads to dump, e.g. '0,4,12-15' or 'all'",
+    )
+    parser.add_argument(
+        "--cache_analysis_steps",
+        type=str,
+        default="all",
+        help="Streaming steps to dump, e.g. '10,20-25' or 'all'",
+    )
+    parser.add_argument(
+        "--cache_analysis_max_snapshots",
+        type=int,
+        default=None,
+        help="Optional global cap on the number of per-head snapshots written",
     )
     parser.add_argument(
         "--output_path",

@@ -10,6 +10,8 @@ from transformers.file_utils import ModelOutput
 from typing import Optional, Tuple, List, Any, Callable
 from dataclasses import dataclass
 
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig
+
 @dataclass
 class StreamVGGTOutput(ModelOutput):
     ress: Optional[List[dict]] = None
@@ -110,7 +112,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         past_key_values=None, 
         frame_writer: Optional[Callable[[int, dict, dict], None]] = None,
         cache_results: bool = True,
-        total_budget=None
+        total_budget=None,
+        cache_analysis_config: Optional[CacheAnalysisConfig] = None,
     ):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
@@ -127,7 +130,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 past_key_values=past_key_values,
                 use_cache=True, 
                 past_frame_idx=i,
-                total_budget=total_budget
+                total_budget=total_budget,
+                cache_analysis_config=cache_analysis_config,
             )
 
             
