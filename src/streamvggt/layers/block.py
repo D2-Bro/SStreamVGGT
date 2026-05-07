@@ -77,9 +77,14 @@ class Block(nn.Module):
         use_cache=False,
         cache_budget=None,
         cache_analysis_config=None,
+        pre_eviction_snapshot_config=None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
+        eviction_policy: str = "mean",
+        eviction_debug: bool = False,
+        leverage_sketch_dim: Optional[int] = 16,
+        recent_merge_config=None,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             
         def attn_residual_func(
@@ -98,9 +103,14 @@ class Block(nn.Module):
                     use_cache=True,
                     cache_budget=cache_budget,
                     cache_analysis_config=cache_analysis_config,
+                    pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                     layer_id=layer_id,
                     step_idx=step_idx,
                     tokens_per_frame=tokens_per_frame,
+                    eviction_policy=eviction_policy,
+                    eviction_debug=eviction_debug,
+                    leverage_sketch_dim=leverage_sketch_dim,
+                    recent_merge_config=recent_merge_config,
                 )
                 return self.ls1(output), new_kv, scores
             else:

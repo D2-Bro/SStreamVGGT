@@ -10,7 +10,8 @@ from transformers.file_utils import ModelOutput
 from typing import Optional, Tuple, List, Any, Callable
 from dataclasses import dataclass
 
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
+from streamvggt.layers.recent_merge import RecentMergeConfig, RecentSimilarityMerge
 
 @dataclass
 class StreamVGGTOutput(ModelOutput):
@@ -114,10 +115,22 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         cache_results: bool = True,
         total_budget=None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
+        pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_policy: str = "mean",
+        eviction_debug: bool = False,
+        leverage_sketch_dim: Optional[int] = 16,
+        recent_merge_config: Optional[RecentMergeConfig] = None,
     ):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
         total_budget = self.total_budget
+        recent_merger = None
+        if recent_merge_config is not None and recent_merge_config.enabled:
+            recent_merger = RecentSimilarityMerge(
+                recent_merge_config,
+                patch_start_idx=self.aggregator.patch_start_idx,
+                patch_size=self.aggregator.patch_size,
+            )
         
         all_ress = []
         processed_frames = [] 
@@ -132,6 +145,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 past_frame_idx=i,
                 total_budget=total_budget,
                 cache_analysis_config=cache_analysis_config,
+                pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                eviction_policy=eviction_policy,
+                eviction_debug=eviction_debug,
+                leverage_sketch_dim=leverage_sketch_dim,
+                recent_merge_config=recent_merge_config,
             )
 
             
@@ -168,6 +186,31 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     query_points = track
                     vis = vis[:, 0]
                     track_conf = conf[:, 0]
+
+            if recent_merger is not None:
+                tokens_per_frame = int(aggregated_tokens[-1].shape[2])
+                geom = recent_merger.record_frame_geometry(
+                    frame_id=i,
+                    depth=depth,
+                    depth_conf=depth_conf,
+                    pose_enc=camera_pose,
+                    image_hw=images.shape[-2:],
+                    tokens_per_frame=tokens_per_frame,
+                )
+                if geom is not None:
+                    for layer_id, layer_kv in enumerate(past_key_values):
+                        if layer_kv is None or len(layer_kv) != 3:
+                            continue
+                        k_cache, v_cache, metadata = layer_kv
+                        recent_merger.update_metadata_for_frame(metadata, i)
+                        k_cache, v_cache, metadata, _ = recent_merger.merge_layer(
+                            k_cache,
+                            v_cache,
+                            metadata,
+                            layer_id=layer_id,
+                            frame_id=i,
+                        )
+                        past_key_values[layer_id] = (k_cache, v_cache, metadata)
 
             res_gpu = {
                 "pts3d_in_other_view": pts3d,

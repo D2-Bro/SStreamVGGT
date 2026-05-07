@@ -97,7 +97,11 @@ class SevenScenes(BaseStereoViewDataset):
             print(f"Found {len(self.scene_list)} sequences in split {self.split}")
             return
 
-        scenes = os.listdir(base_dir)
+        scenes = sorted(
+            scene
+            for scene in os.listdir(base_dir)
+            if osp.isdir(osp.join(base_dir, scene))
+        )
 
         file_split = {"train": "TrainSplit.txt", "test": "TestSplit.txt"}[self.split]
 

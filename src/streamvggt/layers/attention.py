@@ -8,7 +8,14 @@ from torch import nn
 import torch.nn.functional as F
 from typing import Union, Tuple, Dict, Optional
 
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig, dump_eviction_snapshot
+from streamvggt.utils.cache_analysis import (
+    CacheAnalysisConfig,
+    PreEvictionSnapshotConfig,
+    dump_eviction_snapshot,
+    dump_pre_eviction_snapshot,
+)
+from streamvggt.layers.eviction import EvictionManager
+from streamvggt.layers.recent_merge import KVCacheMetadata, RecentMergeConfig
 
 XFORMERS_AVAILABLE = False
 
@@ -43,6 +50,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
         self.num_anchor_tokens = 0
+        self._eviction_managers = {}
 
     def _reset_cache_state(self):
         self.num_anchor_tokens = 0
@@ -51,13 +59,18 @@ class Attention(nn.Module):
         self, 
         k: torch.Tensor, 
         v: torch.Tensor, 
+        metadata: Optional[KVCacheMetadata],
         cache_budget: int,
         num_anchor_tokens: int,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
+        pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        eviction_policy: str = "mean",
+        eviction_debug: bool = False,
+        leverage_sketch_dim: Optional[int] = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCacheMetadata], float]:
         """
         Evicts tokens from the key-value cache based on key cosine similarity.
 
@@ -73,33 +86,46 @@ class Attention(nn.Module):
         B, H, N, D = k.shape
 
         if N <= cache_budget:
-            return k, v
+            return k, v, metadata, 0.0
 
         anchor_k, candidate_k = k.split([num_anchor_tokens, N - num_anchor_tokens], dim=2)
         anchor_v, candidate_v = v.split([num_anchor_tokens, N - num_anchor_tokens], dim=2)
 
         num_to_keep_from_candidates = cache_budget - num_anchor_tokens
 
-        candidate_k_norm = F.normalize(candidate_k, p=2, dim=-1)
-        mean_vector = torch.mean(candidate_k_norm, dim=2, keepdim=True)
-
-        scores = torch.sum(candidate_k_norm * mean_vector, dim=-1)
-        avg_scores = scores.mean().item()
-
-        _, top_indices = torch.topk(-scores, k=num_to_keep_from_candidates, dim=-1)
-        top_indices = top_indices.sort(dim=-1).values
+        manager_key = (eviction_policy, eviction_debug, leverage_sketch_dim)
+        eviction = self._eviction_managers.get(manager_key)
+        if eviction is None:
+            eviction = EvictionManager(
+                policy=eviction_policy,
+                debug=eviction_debug,
+                leverage_sketch_dim=leverage_sketch_dim,
+            )
+            self._eviction_managers[manager_key] = eviction
+        eviction_result = eviction.select(
+            k,
+            cache_budget,
+            num_anchor_tokens,
+            need_summary=cache_analysis_config is not None or eviction_debug,
+            layer_id=layer_id,
+            step_idx=step_idx,
+        )
+        top_indices = eviction_result.kept_candidate_indices
+        avg_scores = eviction_result.summary_score
 
         if cache_analysis_config is not None and layer_id is not None and step_idx is not None:
             dump_eviction_snapshot(
                 cache_analysis_config,
                 k_before=k,
-                scores=scores,
+                scores=eviction_result.mean_scores,
                 kept_candidate_indices=top_indices,
                 layer_id=layer_id,
                 step_idx=step_idx,
                 cache_budget=cache_budget,
                 num_anchor_tokens=num_anchor_tokens,
                 tokens_per_frame=tokens_per_frame,
+                eviction_policy=eviction_policy,
+                leverage_sketch_dim=leverage_sketch_dim,
             )
         
         expanded_indices = top_indices.unsqueeze(-1).expand(B, H, num_to_keep_from_candidates, D)
@@ -108,8 +134,13 @@ class Attention(nn.Module):
 
         final_k = torch.cat([anchor_k, kept_candidate_k], dim=2)
         final_v = torch.cat([anchor_v, kept_candidate_v], dim=2)
+        final_metadata = (
+            metadata.prune_after_eviction(top_indices, num_anchor_tokens)
+            if metadata is not None
+            else None
+        )
 
-        return final_k, final_v, avg_scores
+        return final_k, final_v, final_metadata, avg_scores
 
     def forward(self, 
         x: torch.Tensor, 
@@ -119,9 +150,14 @@ class Attention(nn.Module):
         use_cache=False,
         cache_budget = None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
+        pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
+        eviction_policy: str = "mean",
+        eviction_debug: bool = False,
+        leverage_sketch_dim: Optional[int] = 16,
+        recent_merge_config: Optional[RecentMergeConfig] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -137,23 +173,63 @@ class Attention(nn.Module):
             self.num_anchor_tokens = k.shape[2] 
 
         if use_cache:
+            metadata = None
+            if recent_merge_config is not None and recent_merge_config.enabled:
+                metadata = KVCacheMetadata.for_current_frame(
+                    batch_size=B,
+                    num_heads=self.num_heads,
+                    num_tokens=k.shape[2],
+                    frame_id=step_idx if step_idx is not None else 0,
+                )
             if past_key_values is not None:
-                past_k, past_v = past_key_values
+                if len(past_key_values) == 3:
+                    past_k, past_v, past_metadata = past_key_values
+                else:
+                    past_k, past_v = past_key_values
+                    past_metadata = None
                 k = torch.cat([past_k, k], dim=2)
                 v = torch.cat([past_v, v], dim=2)
-            if cache_budget is not None and k.shape[2] > cache_budget:
-                k, v, scores = self.eviction(
+                if metadata is not None and past_metadata is not None:
+                    metadata = past_metadata.concat(metadata)
+                elif metadata is not None:
+                    metadata = None
+            if (
+                pre_eviction_snapshot_config is not None
+                and layer_id is not None
+                and step_idx is not None
+            ):
+                dump_pre_eviction_snapshot(
+                    pre_eviction_snapshot_config,
+                    k_cache=k,
+                    v_cache=v,
+                    layer_id=layer_id,
+                    step_idx=step_idx,
+                    cache_budget=cache_budget,
+                    num_anchor_tokens=self.num_anchor_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                )
+            eviction_deferred_for_snapshot = (
+                pre_eviction_snapshot_config is not None
+                and step_idx is not None
+                and step_idx <= pre_eviction_snapshot_config.target_step_idx
+            )
+            if cache_budget is not None and k.shape[2] > cache_budget and not eviction_deferred_for_snapshot:
+                k, v, metadata, scores = self.eviction(
                     k,
                     v,
+                    metadata,
                     cache_budget,
                     self.num_anchor_tokens,
                     cache_analysis_config=cache_analysis_config,
                     layer_id=layer_id,
                     step_idx=step_idx,
                     tokens_per_frame=tokens_per_frame,
+                    eviction_policy=eviction_policy,
+                    eviction_debug=eviction_debug,
+                    leverage_sketch_dim=leverage_sketch_dim,
                 )
 
-            new_kv = (k, v)
+            new_kv = (k, v, metadata) if metadata is not None else (k, v)
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(

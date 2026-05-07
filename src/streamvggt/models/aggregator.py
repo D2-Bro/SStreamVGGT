@@ -12,9 +12,10 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 
 from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
+from streamvggt.layers.recent_merge import RecentMergeConfig
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,11 @@ class Aggregator(nn.Module):
         past_frame_idx=0,
         total_budget=0,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
+        pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_policy: str = "mean",
+        eviction_debug: bool = False,
+        leverage_sketch_dim: Optional[int] = 16,
+        recent_merge_config: Optional[RecentMergeConfig] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -272,8 +278,6 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     if use_cache:
-                        if past_key_values[global_idx] is not None:
-                            k, v = past_key_values[global_idx]
                         tokens, global_idx, global_intermediates, new_kv, current_scores = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos,
                             past_key_values_block=past_key_values[global_idx] if past_key_values[global_idx] is not None else None,
@@ -281,6 +285,11 @@ class Aggregator(nn.Module):
                             past_frame_idx=past_frame_idx,
                             cache_budget=current_budgets[global_idx].item(),
                             cache_analysis_config=cache_analysis_config,
+                            pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                            eviction_policy=eviction_policy,
+                            eviction_debug=eviction_debug,
+                            leverage_sketch_dim=leverage_sketch_dim,
+                            recent_merge_config=recent_merge_config,
                         )
                         past_key_values[global_idx - 1] = new_kv
                         if current_scores is not None: # pruning happened
@@ -343,6 +352,11 @@ class Aggregator(nn.Module):
         past_frame_idx=0,
         cache_budget=None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
+        pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_policy: str = "mean",
+        eviction_debug: bool = False,
+        leverage_sketch_dim: Optional[int] = 16,
+        recent_merge_config: Optional[RecentMergeConfig] = None,
     ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
@@ -375,9 +389,14 @@ class Aggregator(nn.Module):
                     use_cache=True,
                     cache_budget=cache_budget,
                     cache_analysis_config=cache_analysis_config,
+                    pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                     layer_id=global_idx,
                     step_idx=past_frame_idx,
                     tokens_per_frame=P,
+                    eviction_policy=eviction_policy,
+                    eviction_debug=eviction_debug,
+                    leverage_sketch_dim=leverage_sketch_dim,
+                    recent_merge_config=recent_merge_config,
                 )
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)

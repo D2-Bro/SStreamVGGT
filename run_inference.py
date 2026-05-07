@@ -15,7 +15,8 @@ from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.utils.load_fn import load_and_preprocess_images
 from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from streamvggt.utils.geometry import FrameDiskCache
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
+from streamvggt.layers.recent_merge import RecentMergeConfig
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
@@ -51,8 +52,61 @@ def run_inference(args: argparse.Namespace):
         steps=args.cache_analysis_steps,
         max_snapshots=args.cache_analysis_max_snapshots,
     )
+    try:
+        pre_eviction_snapshot_config = PreEvictionSnapshotConfig.from_cli(
+            args.snapshot_before_eviction,
+            args.snapshot_output_dir,
+            frame_count=args.snapshot_frame_count,
+            layers=args.snapshot_layers,
+            heads=args.snapshot_heads,
+            max_snapshots=args.snapshot_max_snapshots,
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
     if cache_analysis_config is not None:
         print(f"Cache analysis snapshots enabled: {cache_analysis_config.output_dir}")
+    if pre_eviction_snapshot_config is not None:
+        print(
+            "Pre-eviction common cache snapshot enabled: "
+            f"{pre_eviction_snapshot_config.output_dir} at frame_count={pre_eviction_snapshot_config.frame_count}"
+        )
+    if args.merge_window < 1:
+        print(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
+        return
+    if not (0.0 <= args.merge_similarity_threshold <= 1.0):
+        print(
+            "Error: --merge_similarity_threshold must be in [0, 1], "
+            f"got {args.merge_similarity_threshold}."
+        )
+        return
+    if args.merge_voxel_size <= 0:
+        print(f"Error: --merge_voxel_size must be > 0, got {args.merge_voxel_size}.")
+        return
+    if args.merge_chunk_size < 1:
+        print(f"Error: --merge_chunk_size must be >= 1, got {args.merge_chunk_size}.")
+        return
+    print(f"Using eviction policy: {args.eviction_policy}")
+    if args.eviction_policy == "svd_leverage":
+        sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
+        print(f"Using SVD leverage sketch dim: {sketch_label}")
+    recent_merge_config = RecentMergeConfig(
+        enabled=args.enable_recent_merge,
+        window=args.merge_window,
+        similarity_threshold=args.merge_similarity_threshold,
+        voxel_size=args.merge_voxel_size,
+        use_depth_confidence=args.merge_use_depth_confidence,
+        debug=args.merge_debug,
+        chunk_size=args.merge_chunk_size,
+        disable_geometry_check=args.merge_disable_geometry_check,
+    )
+    if recent_merge_config.enabled:
+        print(
+            "Recent similarity merge enabled: "
+            f"window={recent_merge_config.window}, "
+            f"threshold={recent_merge_config.similarity_threshold}, "
+            f"voxel_size={recent_merge_config.voxel_size}"
+        )
 
     model = StreamVGGT(total_budget=1200000)
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
@@ -81,6 +135,13 @@ def run_inference(args: argparse.Namespace):
             print(f"Error: --max_frames must be >= 1, got {args.max_frames}.")
             return
         image_names = image_names[:args.max_frames]
+
+    if pre_eviction_snapshot_config is not None and len(image_names) > pre_eviction_snapshot_config.frame_count:
+        image_names = image_names[: pre_eviction_snapshot_config.frame_count]
+        print(
+            "Snapshot mode truncates inference input to "
+            f"{pre_eviction_snapshot_config.frame_count} frames before eviction comparison."
+        )
 
     if not image_names:
         print("Error: No images remain after applying --frame_stride/--max_frames.")
@@ -116,6 +177,11 @@ def run_inference(args: argparse.Namespace):
                 frame_writer=frame_writer,
                 cache_results=cache_results,
                 cache_analysis_config=cache_analysis_config,
+                pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                eviction_policy=args.eviction_policy,
+                eviction_debug=args.eviction_debug,
+                leverage_sketch_dim=args.leverage_sketch_dim,
+                recent_merge_config=recent_merge_config,
             )
 
     torch.cuda.synchronize()
@@ -241,6 +307,121 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Optional global cap on the number of per-head snapshots written",
+    )
+    parser.add_argument(
+        "--snapshot_before_eviction",
+        "--snapshot-before-eviction",
+        action="store_true",
+        help="Dump a shared per-head KV cache snapshot before eviction at snapshot_frame_count",
+    )
+    parser.add_argument(
+        "--snapshot_frame_count",
+        "--snapshot-frame-count",
+        type=int,
+        default=40,
+        help="Number of sequential frames to accumulate before dumping the common cache snapshot",
+    )
+    parser.add_argument(
+        "--snapshot_output_dir",
+        "--snapshot-output-dir",
+        type=str,
+        default=None,
+        help="Directory for pre-eviction common cache snapshot .pt/.json files",
+    )
+    parser.add_argument(
+        "--snapshot_layers",
+        "--snapshot-layers",
+        type=str,
+        default="all",
+        help="Layers to dump for pre-eviction snapshots, e.g. '0,3,8-10' or 'all'",
+    )
+    parser.add_argument(
+        "--snapshot_heads",
+        "--snapshot-heads",
+        type=str,
+        default="all",
+        help="Heads to dump for pre-eviction snapshots, e.g. '0,4,12-15' or 'all'",
+    )
+    parser.add_argument(
+        "--snapshot_max_snapshots",
+        "--snapshot-max-snapshots",
+        type=int,
+        default=None,
+        help="Optional global cap on pre-eviction per-head snapshots written",
+    )
+    parser.add_argument(
+        "--eviction_policy",
+        "--eviction-policy",
+        type=str,
+        default="mean",
+        choices=("mean", "baseline_mean", "svd_leverage"),
+        help="KV cache eviction policy for streaming global attention",
+    )
+    parser.add_argument(
+        "--eviction_debug",
+        "--eviction-debug",
+        action="store_true",
+        help="Print lightweight eviction policy shape/count diagnostics",
+    )
+    parser.add_argument(
+        "--leverage_sketch_dim",
+        "--leverage-sketch-dim",
+        type=int,
+        default=16,
+        help="Right sketch dimension for svd_leverage eviction; set 0 for exact full-space QR",
+    )
+    parser.add_argument(
+        "--enable_recent_merge",
+        "--enable-recent-merge",
+        action="store_true",
+        help="Enable sliding-window geometry-validated KV similarity merging",
+    )
+    parser.add_argument(
+        "--merge_window",
+        "--merge-window",
+        type=int,
+        default=3,
+        help="Number of previous frames considered by recent KV merging",
+    )
+    parser.add_argument(
+        "--merge_similarity_threshold",
+        "--merge-similarity-threshold",
+        type=float,
+        default=0.9,
+        help="Minimum cosine similarity for recent KV merge candidates",
+    )
+    parser.add_argument(
+        "--merge_voxel_size",
+        "--merge-voxel-size",
+        type=float,
+        default=0.05,
+        help="Voxel size in world units for recent merge geometry validation",
+    )
+    parser.add_argument(
+        "--merge_use_depth_confidence",
+        "--merge-use-depth-confidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use depth confidence to weight recent KV EMA merges",
+    )
+    parser.add_argument(
+        "--merge_debug",
+        "--merge-debug",
+        action="store_true",
+        help="Print per-layer recent merge diagnostics",
+    )
+    parser.add_argument(
+        "--merge_chunk_size",
+        "--merge-chunk-size",
+        type=int,
+        default=512,
+        help="Current-token chunk size for batched recent merge cosine search",
+    )
+    parser.add_argument(
+        "--merge_disable_geometry_check",
+        "--merge-disable-geometry-check",
+        action="store_true",
+        help="Disable voxel validation for ablations; geometry check is enabled by default",
     )
     parser.add_argument(
         "--output_path",

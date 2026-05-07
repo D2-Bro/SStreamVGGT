@@ -42,6 +42,13 @@ def get_args_parser():
     parser.add_argument("--freeze", action="store_true")
     parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
     parser.add_argument("--use_proj", action="store_true")
+    parser.add_argument("--eviction_policy", type=str, default="mean", help="Cache eviction policy")
+    parser.add_argument(
+        "--leverage_sketch_dim",
+        type=int,
+        default=16,
+        help="Right sketch dimension for svd_leverage eviction; set 0 for exact full-space QR",
+    )
     return parser
 
 
@@ -62,12 +69,12 @@ def main(args):
     datasets_all = {
         "7scenes": SevenScenes(
             split="test",
-            ROOT="/home/ma-user/work/dataset/3D_Reconstruction/7scenes",
+            ROOT="/data2/dongjae/datasets/7scenes_sfm",
             resolution=resolution,
             num_seq=1,
             full_video=True,
             kf_every=2,
-            # max_frames=args.max_frames,
+            max_frames=args.max_frames,
         ),  # 20),
         # "NRGBD": NRGBD(
         #     split="test",
@@ -90,7 +97,7 @@ def main(args):
         from eval.mv_recon.criterion import Regr3D_t_ScaleShiftInv, L21
         from dust3r.utils.geometry import geotrf
         from copy import deepcopy
-        model = StreamVGGT()
+        model = StreamVGGT(total_budget=200000)
         ckpt = torch.load(args.weights, map_location=device)
         model.load_state_dict(ckpt, strict=True)
         model.eval()
@@ -170,6 +177,7 @@ def main(args):
                     if model_name == "stream3r" or "VGGT":
                         revisit = args.revisit
                         update = not args.freeze
+                        num_input_frames = len(batch)
                         if revisit > 1:
                             # repeat input for 'revisit' times
                             new_views = []
@@ -201,7 +209,20 @@ def main(args):
 
                         with torch.cuda.amp.autocast(dtype=dtype):
                             with torch.no_grad():
-                                results = model.inference(batch)
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize(device)
+                                infer_start = time.perf_counter()
+                                results = model.inference(
+                                    batch,
+                                    eviction_policy=args.eviction_policy,
+                                    leverage_sketch_dim=args.leverage_sketch_dim,
+                                )
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize(device)
+                                infer_time = time.perf_counter() - infer_start
+                                fps = num_input_frames / infer_time if infer_time > 0 else float("inf")
+                                time_all.append(infer_time)
+                                fps_all.append(fps)
 
                             preds, batch = results.ress, results.views 
 
@@ -223,6 +244,15 @@ def main(args):
                             if args.revisit > 1:
                                 preds = preds[-valid_length:]
                                 batch = batch[-valid_length:]
+
+                            timing_scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
+                            timing_msg = (
+                                f"Timing before eval - Idx: {timing_scene_id}, "
+                                f"Time: {infer_time:.6f}, FPS: {fps:.3f}"
+                            )
+                            print(timing_msg)
+                            with open(log_file, "a") as f_log:
+                                print(timing_msg, file=f_log)
                                 
 
                         # Evaluation
@@ -290,10 +320,10 @@ def main(args):
                     save_params["pts_gt_all"] = pts_gt_all
                     save_params["masks_all"] = masks_all
 
-                    np.save(
-                        os.path.join(save_path, f"{scene_id.replace('/', '_')}.npy"),
-                        save_params,
-                    )
+                    # np.save(
+                    #     os.path.join(save_path, f"{scene_id.replace('/', '_')}.npy"),
+                    #     save_params,
+                    # )
 
                     if "DTU" in name_data:
                         threshold = 100
@@ -353,12 +383,12 @@ def main(args):
                     pcd.colors = o3d.utility.Vector3dVector(
                         images_all_masked.reshape(-1, 3)
                     )
-                    o3d.io.write_point_cloud(
-                        os.path.join(
-                            save_path, f"{scene_id.replace('/', '_')}-mask.ply"
-                        ),
-                        pcd,
-                    )
+                    # o3d.io.write_point_cloud(
+                    #     os.path.join(
+                    #         save_path, f"{scene_id.replace('/', '_')}-mask.ply"
+                    #     ),
+                    #     pcd,
+                    # )
 
                     pcd_gt = o3d.geometry.PointCloud()
                     pcd_gt.points = o3d.utility.Vector3dVector(
@@ -367,10 +397,10 @@ def main(args):
                     pcd_gt.colors = o3d.utility.Vector3dVector(
                         images_all_masked.reshape(-1, 3)
                     )
-                    o3d.io.write_point_cloud(
-                        os.path.join(save_path, f"{scene_id.replace('/', '_')}-gt.ply"),
-                        pcd_gt,
-                    )
+                    # o3d.io.write_point_cloud(
+                    #     os.path.join(save_path, f"{scene_id.replace('/', '_')}-gt.ply"),
+                    #     pcd_gt,
+                    # )
 
                     trans_init = np.eye(4)
 
@@ -386,12 +416,12 @@ def main(args):
 
                     pcd = pcd.transform(transformation)
 
-                    o3d.io.write_point_cloud(
-                        os.path.join(
-                            save_path, f"{scene_id.replace('/', '_')}-mask_align.ply"
-                        ),
-                        pcd,
-                    )
+                    # o3d.io.write_point_cloud(
+                    #     os.path.join(
+                    #         save_path, f"{scene_id.replace('/', '_')}-mask_align.ply"
+                    #     ),
+                    #     pcd,
+                    # )
 
                     pcd.estimate_normals()
                     pcd_gt.estimate_normals()
@@ -406,10 +436,10 @@ def main(args):
                         pcd_gt.points, pcd.points, gt_normal, pred_normal
                     )
                     print(
-                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
+                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, Time: {infer_time}, FPS: {fps}"
                     )
                     print(
-                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}",
+                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, Time: {infer_time}, FPS: {fps}",
                         file=open(log_file, "a"),
                     )
 
@@ -446,7 +476,7 @@ def main(args):
                             data = match.groupdict()
                             # Exclude 'scene_id' from metrics as it's an identifier
                             for key, value in data.items():
-                                if key != "scene_id":
+                                if key != "scene_id" and value is not None:
                                     metrics[key].append(float(value))
                             metrics["nc"].append(
                                 (float(data["nc1"]) + float(data["nc2"])) / 2
@@ -482,6 +512,7 @@ pattern = r"""
     Compc_med:\s*(?P<comp_med>[^,]+),\s*
     NC1c_med:\s*(?P<nc1_med>[^,]+),\s*
     NC2c_med:\s*(?P<nc2_med>[^,]+)
+    (?:,\s*Time:\s*(?P<time>[^,]+),\s*FPS:\s*(?P<fps>[^,]+))?
 """
 
 regex = re.compile(pattern, re.VERBOSE)
