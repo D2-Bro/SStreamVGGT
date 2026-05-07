@@ -9,7 +9,7 @@ from eval.mv_recon.base import BaseStereoViewDataset
 from dust3r.utils.image import imread_cv2
 import eval.mv_recon.dataset_utils.cropping as cropping
 import imageio.v3 as iio
-from tifffile import tifffile
+# from tifffile import tifffile
 from einops import rearrange
 
 

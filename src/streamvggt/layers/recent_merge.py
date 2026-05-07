@@ -91,16 +91,17 @@ class KVCacheMetadata:
         token_confidence = token_confidence.detach().cpu().float()
         B, H, _ = self.frame_ids.shape
         max_tokens = token_confidence.shape[1]
-        for b in range(B):
-            for h in range(H):
-                mask = self.frame_ids[b, h] == int(frame_id)
-                if not bool(mask.any()):
-                    continue
-                token_ids = self.token_indices[b, h, mask].long()
-                valid = (token_ids >= 0) & (token_ids < max_tokens)
-                values = torch.ones_like(token_ids, dtype=torch.float32)
-                values[valid] = token_confidence[b, token_ids[valid]]
-                self.accumulated_confidence[b, h, mask] = values
+        mask = self.frame_ids == int(frame_id)
+        if not bool(mask.any()):
+            return
+
+        batch_ids = torch.arange(B, dtype=torch.long).view(B, 1, 1).expand(B, H, self.frame_ids.shape[2])
+        token_ids = self.token_indices.long()
+        valid = mask & (token_ids >= 0) & (token_ids < max_tokens)
+
+        values = torch.ones_like(self.accumulated_confidence)
+        values[valid] = token_confidence[batch_ids[valid], token_ids[valid]]
+        self.accumulated_confidence[mask] = values[mask]
 
 
 @dataclass
@@ -302,22 +303,40 @@ class RecentSimilarityMerge:
             for b in range(B):
                 for h in range(H):
                     matches = per_head_matches[(b, h)]
-                    for token_id in common_token_ids:
-                        cur_pos, cand_pos, sim, new_conf = matches[token_id]
-                        old_conf = float(metadata.accumulated_confidence[b, h, cand_pos].item())
-                        old_w = old_conf if self.config.use_depth_confidence else 1.0
-                        new_w = new_conf if self.config.use_depth_confidence else 1.0
-                        denom = old_w + new_w + 1e-6
-                        alpha = old_w / denom
-                        k[b, h, cand_pos] = alpha * k[b, h, cand_pos] + (1.0 - alpha) * k[b, h, cur_pos]
-                        v[b, h, cand_pos] = alpha * v[b, h, cand_pos] + (1.0 - alpha) * v[b, h, cur_pos]
-                        metadata.accumulated_confidence[b, h, cand_pos] = old_conf + new_conf
-                        metadata.merge_counts[b, h, cand_pos] += 1
-                        metadata.last_updated_frame[b, h, cand_pos] = int(frame_id)
-                        stats.similarities.append(float(sim))
-                        stats.confidences.append(float(new_conf))
-                        cand_frame = int(metadata.frame_ids[b, h, cand_pos].item())
-                        stats.frame_gaps.append(int(frame_id) - cand_frame)
+                    rows = [matches[token_id] for token_id in common_token_ids]
+                    cur_pos = torch.tensor([row[0] for row in rows], device=k.device, dtype=torch.long)
+                    cand_pos = torch.tensor([row[1] for row in rows], device=k.device, dtype=torch.long)
+                    new_conf = torch.tensor(
+                        [row[3] for row in rows],
+                        device=metadata.accumulated_confidence.device,
+                        dtype=metadata.accumulated_confidence.dtype,
+                    )
+                    cand_pos_cpu = cand_pos.cpu()
+                    old_conf = metadata.accumulated_confidence[b, h, cand_pos_cpu]
+                    if self.config.use_depth_confidence:
+                        old_w = old_conf.to(device=k.device, dtype=k.dtype)
+                        new_w = new_conf.to(device=k.device, dtype=k.dtype)
+                    else:
+                        old_w = torch.ones_like(old_conf, device=k.device, dtype=k.dtype)
+                        new_w = torch.ones_like(old_conf, device=k.device, dtype=k.dtype)
+                    alpha = (old_w / (old_w + new_w + 1e-6)).view(-1, 1).to(dtype=k.dtype)
+                    one = torch.ones_like(alpha)
+                    merged_k = alpha * k[b, h, cand_pos] + (one - alpha) * k[b, h, cur_pos]
+                    alpha_v = alpha.to(dtype=v.dtype)
+                    one_v = one.to(dtype=v.dtype)
+                    merged_v = alpha_v * v[b, h, cand_pos] + (one_v - alpha_v) * v[b, h, cur_pos]
+
+                    k[b, h, cand_pos] = merged_k.to(dtype=k.dtype)
+                    v[b, h, cand_pos] = merged_v.to(dtype=v.dtype)
+                    metadata.accumulated_confidence[b, h, cand_pos_cpu] = old_conf + new_conf.cpu()
+                    metadata.merge_counts[b, h, cand_pos_cpu] += 1
+                    metadata.last_updated_frame[b, h, cand_pos_cpu] = int(frame_id)
+
+                    if self.config.debug:
+                        stats.similarities.extend(float(row[2]) for row in rows)
+                        stats.confidences.extend(float(row[3]) for row in rows)
+                        cand_frames = metadata.frame_ids[b, h, cand_pos_cpu]
+                        stats.frame_gaps.extend((int(frame_id) - cand_frames).tolist())
 
         keep_indices_cpu = self._build_keep_indices(metadata, frame_id, common_token_ids)
         keep_indices = keep_indices_cpu.to(device=k.device, dtype=torch.long)
@@ -362,21 +381,23 @@ class RecentSimilarityMerge:
         if not bool(valid_cur.any()) or not bool(valid_cand.any()):
             return {}, stats
 
-        cur_pos = cur_pos[valid_cur]
-        cand_pos = cand_pos[valid_cand]
-        cur_vox = cur_vox[valid_cur]
-        cand_vox = cand_vox[valid_cand]
-        cur_conf = cur_conf[valid_cur]
-        if cur_pos.numel() == 0 or cand_pos.numel() == 0:
+        cur_pos_cpu = cur_pos[valid_cur]
+        cand_pos_cpu = cand_pos[valid_cand]
+        cur_vox = cur_vox[valid_cur].to(device=k.device)
+        cand_vox = cand_vox[valid_cand].to(device=k.device)
+        cur_conf_cpu = cur_conf[valid_cur]
+        if cur_pos_cpu.numel() == 0 or cand_pos_cpu.numel() == 0:
             return {}, stats
 
-        cur_k = F.normalize(k[b, h, cur_pos.to(k.device)].float(), dim=-1)
-        cand_k = F.normalize(k[b, h, cand_pos.to(k.device)].float(), dim=-1)
+        cur_pos = cur_pos_cpu.to(device=k.device)
+        cand_pos = cand_pos_cpu.to(device=k.device)
+        cur_k = F.normalize(k[b, h, cur_pos].float(), dim=-1)
+        cand_k = F.normalize(k[b, h, cand_pos].float(), dim=-1)
         if self.config.disable_geometry_check:
             same_voxel = torch.ones(
                 (cur_vox.shape[0], cand_vox.shape[0]),
                 dtype=torch.bool,
-                device=cur_vox.device,
+                device=k.device,
             )
         else:
             same_voxel = (cur_vox[:, None, :] == cand_vox[None, :, :]).all(dim=-1)
@@ -389,25 +410,34 @@ class RecentSimilarityMerge:
             end = min(start + chunk, cur_k.shape[0])
             sim = cur_k[start:end] @ cand_k.T
             threshold_mask = sim >= float(self.config.similarity_threshold)
-            stats.threshold_pairs += int(threshold_mask.sum().item())
-            voxel_mask = same_voxel[start:end].to(device=sim.device)
+            voxel_mask = same_voxel[start:end]
             valid_mask = threshold_mask & voxel_mask
-            stats.voxel_pairs += int(valid_mask.sum().item())
+            if self.config.debug:
+                stats.threshold_pairs += int(threshold_mask.sum().item())
+                stats.voxel_pairs += int(valid_mask.sum().item())
             masked = sim.masked_fill(~valid_mask, -float("inf"))
             values, indices = masked.max(dim=1)
-            for local_row, (score, cand_col) in enumerate(zip(values.detach().cpu(), indices.detach().cpu())):
-                if not torch.isfinite(score):
-                    continue
-                global_row = start + local_row
-                best_rows.append(
-                    (
-                        float(score.item()),
-                        int(cur_pos[global_row].item()),
-                        int(cand_pos[int(cand_col.item())].item()),
-                        int(metadata.token_indices[b, h, cur_pos[global_row]].item()),
-                        float(cur_conf[global_row].item()),
-                    )
+            finite = torch.isfinite(values)
+            valid_rows = torch.nonzero(finite, as_tuple=False).flatten()
+            if valid_rows.numel() == 0:
+                continue
+
+            global_rows = valid_rows.detach().cpu() + int(start)
+            cand_cols = indices[finite].detach().cpu().long()
+            scores = values[finite].detach().cpu()
+            cur_cache_pos = cur_pos_cpu[global_rows].long()
+            cand_cache_pos = cand_pos_cpu[cand_cols].long()
+            token_ids = metadata.token_indices[b, h, cur_cache_pos].long()
+            confidences = cur_conf_cpu[global_rows]
+            best_rows.extend(
+                zip(
+                    scores.tolist(),
+                    cur_cache_pos.tolist(),
+                    cand_cache_pos.tolist(),
+                    token_ids.tolist(),
+                    confidences.tolist(),
                 )
+            )
 
         best_rows.sort(key=lambda row: (-row[0], row[3], row[2]))
         for score, cur_cache_pos, cand_cache_pos, token_id, conf in best_rows:
@@ -429,15 +459,22 @@ class RecentSimilarityMerge:
         voxels = torch.full((positions.numel(), 3), _INVALID_VOXEL, dtype=torch.int32)
         valid = torch.zeros((positions.numel(),), dtype=torch.bool)
         confidence = torch.zeros((positions.numel(),), dtype=torch.float32)
-        for row, (frame_id, token_id) in enumerate(zip(frame_ids.tolist(), token_ids.tolist())):
+        for frame_id in torch.unique(frame_ids).tolist():
             geom = self._geometry.get(int(frame_id))
             if geom is None:
                 continue
-            if b >= geom.valid.shape[0] or token_id < 0 or token_id >= geom.valid.shape[1]:
+            if b >= geom.valid.shape[0]:
                 continue
-            valid[row] = bool(geom.valid[b, token_id].item())
-            voxels[row] = geom.voxel_ids[b, token_id]
-            confidence[row] = geom.confidence[b, token_id]
+            frame_mask = frame_ids == int(frame_id)
+            frame_token_ids = token_ids[frame_mask]
+            frame_valid = (frame_token_ids >= 0) & (frame_token_ids < geom.valid.shape[1])
+            if not bool(frame_valid.any()):
+                continue
+            rows = torch.nonzero(frame_mask, as_tuple=False).flatten()[frame_valid]
+            token_rows = frame_token_ids[frame_valid]
+            valid[rows] = geom.valid[b, token_rows]
+            voxels[rows] = geom.voxel_ids[b, token_rows]
+            confidence[rows] = geom.confidence[b, token_rows]
         return voxels, valid, confidence
 
     def _build_keep_indices(
@@ -446,21 +483,12 @@ class RecentSimilarityMerge:
         frame_id: int,
         remove_token_ids: list[int],
     ) -> torch.Tensor:
-        remove = set(int(x) for x in remove_token_ids)
         B, H, N = metadata.frame_ids.shape
-        keep = torch.empty((B, H, N - len(remove)), dtype=torch.long)
-        for b in range(B):
-            for h in range(H):
-                rows = []
-                for idx in range(N):
-                    is_removed = (
-                        int(metadata.frame_ids[b, h, idx].item()) == int(frame_id)
-                        and int(metadata.token_indices[b, h, idx].item()) in remove
-                    )
-                    if not is_removed:
-                        rows.append(idx)
-                keep[b, h] = torch.tensor(rows, dtype=torch.long)
-        return keep
+        remove = torch.tensor(remove_token_ids, dtype=metadata.token_indices.dtype)
+        remove_mask = (metadata.frame_ids == int(frame_id)) & torch.isin(metadata.token_indices, remove)
+        keep_mask = ~remove_mask
+        keep = torch.nonzero(keep_mask, as_tuple=False)[:, 2].view(B, H, N - len(remove_token_ids))
+        return keep.to(dtype=torch.long)
 
     def _debug(self, layer_id: int, frame_id: int, stats: RecentMergeStats) -> None:
         if not self.config.debug:

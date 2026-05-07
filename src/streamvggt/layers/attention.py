@@ -88,11 +88,6 @@ class Attention(nn.Module):
         if N <= cache_budget:
             return k, v, metadata, 0.0
 
-        anchor_k, candidate_k = k.split([num_anchor_tokens, N - num_anchor_tokens], dim=2)
-        anchor_v, candidate_v = v.split([num_anchor_tokens, N - num_anchor_tokens], dim=2)
-
-        num_to_keep_from_candidates = cache_budget - num_anchor_tokens
-
         manager_key = (eviction_policy, eviction_debug, leverage_sketch_dim)
         eviction = self._eviction_managers.get(manager_key)
         if eviction is None:
@@ -128,12 +123,12 @@ class Attention(nn.Module):
                 leverage_sketch_dim=leverage_sketch_dim,
             )
         
-        expanded_indices = top_indices.unsqueeze(-1).expand(B, H, num_to_keep_from_candidates, D)
-        kept_candidate_k = torch.gather(candidate_k, 2, expanded_indices)
-        kept_candidate_v = torch.gather(candidate_v, 2, expanded_indices)
-
-        final_k = torch.cat([anchor_k, kept_candidate_k], dim=2)
-        final_v = torch.cat([anchor_v, kept_candidate_v], dim=2)
+        anchor_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
+        anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
+        keep_indices = torch.cat([anchor_indices, top_indices + int(num_anchor_tokens)], dim=2)
+        expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, cache_budget, D)
+        final_k = torch.gather(k, 2, expanded_indices)
+        final_v = torch.gather(v, 2, expanded_indices)
         final_metadata = (
             metadata.prune_after_eviction(top_indices, num_anchor_tokens)
             if metadata is not None

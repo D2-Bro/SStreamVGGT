@@ -72,7 +72,8 @@ class EvictionManager:
             raise ValueError(f"Cannot keep {num_to_keep} candidates from {num_candidates} candidates")
 
         candidate_k = k[:, :, num_anchor_tokens:, :]
-        mean_scores = self._mean_scores(candidate_k)
+        need_mean_scores = self.policy in ("mean", "baseline_mean") or need_summary or self.debug
+        mean_scores = self._mean_scores(candidate_k) if need_mean_scores else None
 
         if self.policy in ("mean", "baseline_mean"):
             policy_scores = mean_scores
@@ -83,7 +84,7 @@ class EvictionManager:
         else:
             raise AssertionError(f"Unhandled eviction policy: {self.policy}")
 
-        summary_score = mean_scores.mean().item() if need_summary else 0.0
+        summary_score = mean_scores.mean().item() if need_summary and mean_scores is not None else 0.0
         if self.debug:
             sketch_label = (
                 "exact"
@@ -98,7 +99,9 @@ class EvictionManager:
         return EvictionResult(
             kept_candidate_indices=kept,
             policy_scores=policy_scores,
-            mean_scores=mean_scores,
+            mean_scores=mean_scores
+            if mean_scores is not None
+            else torch.empty(B, H, 0, device=k.device, dtype=torch.float32),
             summary_score=summary_score,
         )
 

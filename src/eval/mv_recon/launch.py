@@ -17,6 +17,7 @@ from tqdm import tqdm
 import uuid
 import json
 from collections import defaultdict
+from streamvggt.layers.recent_merge import RecentMergeConfig
 
 def get_args_parser():
     parser = argparse.ArgumentParser("3D Reconstruction evaluation", add_help=False)
@@ -49,6 +50,29 @@ def get_args_parser():
         default=16,
         help="Right sketch dimension for svd_leverage eviction; set 0 for exact full-space QR",
     )
+    parser.add_argument(
+        "--enable_recent_merge",
+        action="store_true",
+        help="Enable geometry-validated recent KV cache merging",
+    )
+    parser.add_argument(
+        "--merge_window",
+        type=int,
+        default=3,
+        help="Number of recent frames considered for KV cache merging",
+    )
+    parser.add_argument(
+        "--merge_similarity_threshold",
+        type=float,
+        default=0.9,
+        help="Cosine similarity threshold for recent KV cache merging",
+    )
+    parser.add_argument(
+        "--merge_voxel_size",
+        type=float,
+        default=0.05,
+        help="Voxel size for geometry validation during recent KV cache merging",
+    )
     return parser
 
 
@@ -69,7 +93,7 @@ def main(args):
     datasets_all = {
         "7scenes": SevenScenes(
             split="test",
-            ROOT="/data2/dongjae/datasets/7scenes_sfm",
+            ROOT="/home/dongjae/data/7scenes_sfm",
             resolution=resolution,
             num_seq=1,
             full_video=True,
@@ -212,10 +236,17 @@ def main(args):
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize(device)
                                 infer_start = time.perf_counter()
+                                recent_merge_config = RecentMergeConfig(
+                                    enabled=args.enable_recent_merge,
+                                    window=args.merge_window,
+                                    similarity_threshold=args.merge_similarity_threshold,
+                                    voxel_size=args.merge_voxel_size,
+                                )
                                 results = model.inference(
                                     batch,
                                     eviction_policy=args.eviction_policy,
                                     leverage_sketch_dim=args.leverage_sketch_dim,
+                                    recent_merge_config=recent_merge_config,
                                 )
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize(device)
