@@ -70,6 +70,8 @@ class Attention(nn.Module):
         eviction_policy: str = "mean",
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
+        leverage_granularity: str = "head",
+        leverage_feature: str = "key",
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCacheMetadata], float]:
         """
         Evicts tokens from the key-value cache based on key cosine similarity.
@@ -88,19 +90,28 @@ class Attention(nn.Module):
         if N <= cache_budget:
             return k, v, metadata, 0.0
 
-        manager_key = (eviction_policy, eviction_debug, leverage_sketch_dim)
+        manager_key = (
+            eviction_policy,
+            eviction_debug,
+            leverage_sketch_dim,
+            leverage_granularity,
+            leverage_feature,
+        )
         eviction = self._eviction_managers.get(manager_key)
         if eviction is None:
             eviction = EvictionManager(
                 policy=eviction_policy,
                 debug=eviction_debug,
                 leverage_sketch_dim=leverage_sketch_dim,
+                leverage_granularity=leverage_granularity,
+                leverage_feature=leverage_feature,
             )
             self._eviction_managers[manager_key] = eviction
         eviction_result = eviction.select(
             k,
             cache_budget,
             num_anchor_tokens,
+            v=v,
             need_summary=cache_analysis_config is not None or eviction_debug,
             layer_id=layer_id,
             step_idx=step_idx,
@@ -152,6 +163,8 @@ class Attention(nn.Module):
         eviction_policy: str = "mean",
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
+        leverage_granularity: str = "head",
+        leverage_feature: str = "key",
         recent_merge_config: Optional[RecentMergeConfig] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
@@ -222,6 +235,8 @@ class Attention(nn.Module):
                     eviction_policy=eviction_policy,
                     eviction_debug=eviction_debug,
                     leverage_sketch_dim=leverage_sketch_dim,
+                    leverage_granularity=leverage_granularity,
+                    leverage_feature=leverage_feature,
                 )
 
             new_kv = (k, v, metadata) if metadata is not None else (k, v)

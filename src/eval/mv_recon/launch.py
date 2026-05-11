@@ -19,6 +19,15 @@ import json
 from collections import defaultdict
 from streamvggt.layers.recent_merge import RecentMergeConfig
 
+
+def resolve_global_attn_idx_ranges(args):
+    if args.middle_global_only and args.global_attn_idx_ranges is not None:
+        raise ValueError("--middle-global-only cannot be combined with --global-attn-idx-ranges")
+    if args.middle_global_only:
+        return "9:"
+    return args.global_attn_idx_ranges
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser("3D Reconstruction evaluation", add_help=False)
     parser.add_argument(
@@ -51,6 +60,20 @@ def get_args_parser():
         help="Right sketch dimension for svd_leverage eviction; set 0 for exact full-space QR",
     )
     parser.add_argument(
+        "--leverage_granularity",
+        type=str,
+        default="head",
+        choices=("head", "layer"),
+        help="Granularity for svd_leverage eviction: per-head or one shared layer-wise score vector",
+    )
+    parser.add_argument(
+        "--leverage_feature",
+        type=str,
+        default="key",
+        choices=("key", "key_value"),
+        help="Feature tensor for svd_leverage eviction: keys only or concatenated keys and values",
+    )
+    parser.add_argument(
         "--enable_recent_merge",
         action="store_true",
         help="Enable geometry-validated recent KV cache merging",
@@ -73,10 +96,143 @@ def get_args_parser():
         default=0.05,
         help="Voxel size for geometry validation during recent KV cache merging",
     )
+    parser.add_argument(
+        "--merge_use_depth_confidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use depth confidence to weight recent KV EMA merges",
+    )
+    parser.add_argument(
+        "--merge_debug",
+        action="store_true",
+        help="Print per-layer recent merge diagnostics",
+    )
+    parser.add_argument(
+        "--merge_chunk_size",
+        type=int,
+        default=512,
+        help="Current-token chunk size for batched recent merge cosine search",
+    )
+    parser.add_argument(
+        "--merge_disable_geometry_check",
+        action="store_true",
+        help="Disable voxel validation for ablations; geometry check is enabled by default",
+    )
+    parser.add_argument(
+        "--merge_candidate_mode",
+        choices=("full", "spatial", "voxel", "voxel_spatial"),
+        default="full",
+        help="Candidate search mode for recent merge",
+    )
+    parser.add_argument(
+        "--merge_patch_radius",
+        type=int,
+        default=1,
+        help="Patch-grid radius for local spatial recent merge candidate search",
+    )
+    parser.add_argument(
+        "--merge_voxel_neighbor_radius",
+        type=int,
+        default=0,
+        help="Chebyshev voxel neighbor radius for local voxel recent merge candidates",
+    )
+    parser.add_argument(
+        "--merge_max_candidates_per_token",
+        type=int,
+        default=64,
+        help="Maximum local recent merge candidates retained per current token",
+    )
+    parser.add_argument(
+        "--merge_local_fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow local candidate modes to fall back to weaker local candidates",
+    )
+    parser.add_argument(
+        "--merge_profile",
+        action="store_true",
+        help="Print recent merge profiling timings",
+    )
+    parser.add_argument(
+        "--merge_recall_debug",
+        action="store_true",
+        help="Compare local recent merge candidates against full-window candidates for diagnostics",
+    )
+    parser.add_argument(
+        "--merge_recall_debug_max_tokens",
+        type=int,
+        default=1024,
+        help="Maximum source tokens sampled per layer/head for recent merge recall diagnostics",
+    )
+    parser.add_argument(
+        "--global_attn_idx_ranges",
+        "--global-attn-idx-ranges",
+        type=str,
+        default=None,
+        help="Half-open global attention index ranges to keep global, e.g. '9:', '9:20', '6:10,14:20'",
+    )
+    parser.add_argument(
+        "--middle_global_only",
+        "--middle-global-only",
+        action="store_true",
+        help="Shortcut for --global-attn-idx-ranges 9:",
+    )
+    parser.add_argument(
+        "--global_attn_debug",
+        "--global-attn-debug",
+        action="store_true",
+        help="Print per-block global-to-frame and KV cache decisions",
+    )
+    parser.add_argument(
+        "--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)"
+    )
     return parser
 
 
 def main(args):
+    try:
+        global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
+    except ValueError as exc:
+        raise SystemExit(f"Error: {exc}") from exc
+    if global_attn_idx_ranges is not None:
+        print(f"Global attention index ranges enabled: {global_attn_idx_ranges}")
+    if args.eviction_policy == "svd_leverage":
+        sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
+        print(
+            "Using SVD leverage eviction: "
+            f"sketch_dim={sketch_label}, "
+            f"granularity={args.leverage_granularity}, "
+            f"feature={args.leverage_feature}"
+        )
+    if args.merge_window < 1:
+        raise SystemExit(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
+    if not (0.0 <= args.merge_similarity_threshold <= 1.0):
+        raise SystemExit(
+            "Error: --merge_similarity_threshold must be in [0, 1], "
+            f"got {args.merge_similarity_threshold}."
+        )
+    if args.merge_voxel_size <= 0:
+        raise SystemExit(f"Error: --merge_voxel_size must be > 0, got {args.merge_voxel_size}.")
+    if args.merge_chunk_size < 1:
+        raise SystemExit(f"Error: --merge_chunk_size must be >= 1, got {args.merge_chunk_size}.")
+    if args.merge_patch_radius < 0:
+        raise SystemExit(f"Error: --merge_patch_radius must be >= 0, got {args.merge_patch_radius}.")
+    if args.merge_voxel_neighbor_radius < 0:
+        raise SystemExit(
+            "Error: --merge_voxel_neighbor_radius must be >= 0, "
+            f"got {args.merge_voxel_neighbor_radius}."
+        )
+    if args.merge_max_candidates_per_token < 1:
+        raise SystemExit(
+            "Error: --merge_max_candidates_per_token must be >= 1, "
+            f"got {args.merge_max_candidates_per_token}."
+        )
+    if args.merge_recall_debug_max_tokens < 1:
+        raise SystemExit(
+            "Error: --merge_recall_debug_max_tokens must be >= 1, "
+            f"got {args.merge_recall_debug_max_tokens}."
+        )
+
     add_path_to_dust3r(args.weights)
     from eval.mv_recon.data import SevenScenes, NRGBD
     from eval.mv_recon.utils import accuracy, completion
@@ -121,7 +277,7 @@ def main(args):
         from eval.mv_recon.criterion import Regr3D_t_ScaleShiftInv, L21
         from dust3r.utils.geometry import geotrf
         from copy import deepcopy
-        model = StreamVGGT(total_budget=200000)
+        model = StreamVGGT(total_budget=args.budget)
         ckpt = torch.load(args.weights, map_location=device)
         model.load_state_dict(ckpt, strict=True)
         model.eval()
@@ -241,12 +397,28 @@ def main(args):
                                     window=args.merge_window,
                                     similarity_threshold=args.merge_similarity_threshold,
                                     voxel_size=args.merge_voxel_size,
+                                    use_depth_confidence=args.merge_use_depth_confidence,
+                                    debug=args.merge_debug,
+                                    chunk_size=args.merge_chunk_size,
+                                    disable_geometry_check=args.merge_disable_geometry_check,
+                                    candidate_mode=args.merge_candidate_mode,
+                                    patch_radius=args.merge_patch_radius,
+                                    voxel_neighbor_radius=args.merge_voxel_neighbor_radius,
+                                    max_candidates_per_token=args.merge_max_candidates_per_token,
+                                    local_fallback=args.merge_local_fallback,
+                                    profile=args.merge_profile,
+                                    recall_debug=args.merge_recall_debug,
+                                    recall_debug_max_tokens=args.merge_recall_debug_max_tokens,
                                 )
                                 results = model.inference(
                                     batch,
                                     eviction_policy=args.eviction_policy,
                                     leverage_sketch_dim=args.leverage_sketch_dim,
+                                    leverage_granularity=args.leverage_granularity,
+                                    leverage_feature=args.leverage_feature,
                                     recent_merge_config=recent_merge_config,
+                                    global_attn_idx_ranges=global_attn_idx_ranges,
+                                    global_attn_debug=args.global_attn_debug,
                                 )
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize(device)
@@ -282,8 +454,6 @@ def main(args):
                                 f"Time: {infer_time:.6f}, FPS: {fps:.3f}"
                             )
                             print(timing_msg)
-                            with open(log_file, "a") as f_log:
-                                print(timing_msg, file=f_log)
                                 
 
                         # Evaluation

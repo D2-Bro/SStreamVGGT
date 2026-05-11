@@ -23,6 +23,15 @@ SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
 if SRC_ROOT not in sys.path:
     sys.path.append(SRC_ROOT)
 
+
+def resolve_global_attn_idx_ranges(args: argparse.Namespace) -> Optional[str]:
+    if args.middle_global_only and args.global_attn_idx_ranges is not None:
+        raise ValueError("--middle-global-only cannot be combined with --global-attn-idx-ranges")
+    if args.middle_global_only:
+        return "9:"
+    return args.global_attn_idx_ranges
+
+
 def run_inference(args: argparse.Namespace):
     """
     Main function to load the model, run inference on input images, and save the results.
@@ -86,10 +95,40 @@ def run_inference(args: argparse.Namespace):
     if args.merge_chunk_size < 1:
         print(f"Error: --merge_chunk_size must be >= 1, got {args.merge_chunk_size}.")
         return
+    if args.merge_patch_radius < 0:
+        print(f"Error: --merge_patch_radius must be >= 0, got {args.merge_patch_radius}.")
+        return
+    if args.merge_voxel_neighbor_radius < 0:
+        print(
+            "Error: --merge_voxel_neighbor_radius must be >= 0, "
+            f"got {args.merge_voxel_neighbor_radius}."
+        )
+        return
+    if args.merge_max_candidates_per_token < 1:
+        print(
+            "Error: --merge_max_candidates_per_token must be >= 1, "
+            f"got {args.merge_max_candidates_per_token}."
+        )
+        return
+    if args.merge_recall_debug_max_tokens < 1:
+        print(
+            "Error: --merge_recall_debug_max_tokens must be >= 1, "
+            f"got {args.merge_recall_debug_max_tokens}."
+        )
+        return
+    try:
+        global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
     print(f"Using eviction policy: {args.eviction_policy}")
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
         print(f"Using SVD leverage sketch dim: {sketch_label}")
+        print(
+            "Using SVD leverage granularity: "
+            f"{args.leverage_granularity} (feature={args.leverage_feature})"
+        )
     recent_merge_config = RecentMergeConfig(
         enabled=args.enable_recent_merge,
         window=args.merge_window,
@@ -99,14 +138,25 @@ def run_inference(args: argparse.Namespace):
         debug=args.merge_debug,
         chunk_size=args.merge_chunk_size,
         disable_geometry_check=args.merge_disable_geometry_check,
+        candidate_mode=args.merge_candidate_mode,
+        patch_radius=args.merge_patch_radius,
+        voxel_neighbor_radius=args.merge_voxel_neighbor_radius,
+        max_candidates_per_token=args.merge_max_candidates_per_token,
+        local_fallback=args.merge_local_fallback,
+        profile=args.merge_profile,
+        recall_debug=args.merge_recall_debug,
+        recall_debug_max_tokens=args.merge_recall_debug_max_tokens,
     )
     if recent_merge_config.enabled:
         print(
             "Recent similarity merge enabled: "
+            f"mode={recent_merge_config.candidate_mode}, "
             f"window={recent_merge_config.window}, "
             f"threshold={recent_merge_config.similarity_threshold}, "
             f"voxel_size={recent_merge_config.voxel_size}"
         )
+    if global_attn_idx_ranges is not None:
+        print(f"Global attention index ranges enabled: {global_attn_idx_ranges}")
 
     model = StreamVGGT(total_budget=1200000)
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
@@ -181,7 +231,11 @@ def run_inference(args: argparse.Namespace):
                 eviction_policy=args.eviction_policy,
                 eviction_debug=args.eviction_debug,
                 leverage_sketch_dim=args.leverage_sketch_dim,
+                leverage_granularity=args.leverage_granularity,
+                leverage_feature=args.leverage_feature,
                 recent_merge_config=recent_merge_config,
+                global_attn_idx_ranges=global_attn_idx_ranges,
+                global_attn_debug=args.global_attn_debug,
             )
 
     torch.cuda.synchronize()
@@ -371,6 +425,22 @@ if __name__ == "__main__":
         help="Right sketch dimension for svd_leverage eviction; set 0 for exact full-space QR",
     )
     parser.add_argument(
+        "--leverage_granularity",
+        "--leverage-granularity",
+        type=str,
+        default="head",
+        choices=("head", "layer"),
+        help="Granularity for svd_leverage eviction: per-head or one shared layer-wise score vector",
+    )
+    parser.add_argument(
+        "--leverage_feature",
+        "--leverage-feature",
+        type=str,
+        default="key",
+        choices=("key", "key_value"),
+        help="Feature tensor for svd_leverage eviction: keys only or concatenated keys and values",
+    )
+    parser.add_argument(
         "--enable_recent_merge",
         "--enable-recent-merge",
         action="store_true",
@@ -422,6 +492,79 @@ if __name__ == "__main__":
         "--merge-disable-geometry-check",
         action="store_true",
         help="Disable voxel validation for ablations; geometry check is enabled by default",
+    )
+    parser.add_argument(
+        "--merge_candidate_mode",
+        "--merge-candidate-mode",
+        choices=("full", "spatial", "voxel", "voxel_spatial"),
+        default="full",
+        help="Candidate search mode for recent merge",
+    )
+    parser.add_argument(
+        "--merge_patch_radius",
+        "--merge-patch-radius",
+        type=int,
+        default=1,
+        help="Patch-grid radius for local spatial recent merge candidate search",
+    )
+    parser.add_argument(
+        "--merge_voxel_neighbor_radius",
+        "--merge-voxel-neighbor-radius",
+        type=int,
+        default=0,
+        help="Chebyshev voxel neighbor radius for local voxel recent merge candidates",
+    )
+    parser.add_argument(
+        "--merge_max_candidates_per_token",
+        "--merge-max-candidates-per-token",
+        type=int,
+        default=64,
+        help="Maximum local recent merge candidates retained per current token",
+    )
+    parser.add_argument(
+        "--merge_local_fallback",
+        "--merge-local-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow local candidate modes to fall back to weaker local candidates",
+    )
+    parser.add_argument(
+        "--merge_profile",
+        "--merge-profile",
+        action="store_true",
+        help="Print recent merge profiling timings",
+    )
+    parser.add_argument(
+        "--merge_recall_debug",
+        "--merge-recall-debug",
+        action="store_true",
+        help="Compare local recent merge candidates against full-window candidates for diagnostics",
+    )
+    parser.add_argument(
+        "--merge_recall_debug_max_tokens",
+        "--merge-recall-debug-max-tokens",
+        type=int,
+        default=1024,
+        help="Maximum source tokens sampled per layer/head for recent merge recall diagnostics",
+    )
+    parser.add_argument(
+        "--global_attn_idx_ranges",
+        "--global-attn-idx-ranges",
+        type=str,
+        default=None,
+        help="Half-open global attention index ranges to keep global, e.g. '9:', '9:20', '6:10,14:20'",
+    )
+    parser.add_argument(
+        "--middle_global_only",
+        "--middle-global-only",
+        action="store_true",
+        help="Shortcut for --global-attn-idx-ranges 9:",
+    )
+    parser.add_argument(
+        "--global_attn_debug",
+        "--global-attn-debug",
+        action="store_true",
+        help="Print per-block global-to-frame and KV cache decisions",
     )
     parser.add_argument(
         "--output_path",

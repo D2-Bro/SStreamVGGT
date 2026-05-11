@@ -84,6 +84,8 @@ class Block(nn.Module):
         eviction_policy: str = "mean",
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
+        leverage_granularity: str = "head",
+        leverage_feature: str = "key",
         recent_merge_config=None,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             
@@ -110,6 +112,8 @@ class Block(nn.Module):
                     eviction_policy=eviction_policy,
                     eviction_debug=eviction_debug,
                     leverage_sketch_dim=leverage_sketch_dim,
+                    leverage_granularity=leverage_granularity,
+                    leverage_feature=leverage_feature,
                     recent_merge_config=recent_merge_config,
                 )
                 return self.ls1(output), new_kv, scores

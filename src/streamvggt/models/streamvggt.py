@@ -38,7 +38,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         history_info: Optional[dict] = None,
         past_key_values=None,
         use_cache=False,
-        past_frame_idx=0
+        past_frame_idx=0,
+        global_attn_idx_ranges: Optional[Any] = None,
+        global_attn_debug: bool = False,
     ):
         images = torch.stack(
             [view["img"] for view in views], dim=0
@@ -53,7 +55,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         if history_info is None:
             history_info = {"token": None}
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images)
+        aggregated_tokens_list, patch_start_idx = self.aggregator(
+            images,
+            global_attn_idx_ranges=global_attn_idx_ranges,
+            global_attn_debug=global_attn_debug,
+        )
         predictions = {}
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -119,7 +125,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         eviction_policy: str = "mean",
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
+        leverage_granularity: str = "head",
+        leverage_feature: str = "key",
         recent_merge_config: Optional[RecentMergeConfig] = None,
+        global_attn_idx_ranges: Optional[Any] = None,
+        global_attn_debug: bool = False,
     ):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
@@ -149,7 +159,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 eviction_policy=eviction_policy,
                 eviction_debug=eviction_debug,
                 leverage_sketch_dim=leverage_sketch_dim,
+                leverage_granularity=leverage_granularity,
+                leverage_feature=leverage_feature,
                 recent_merge_config=recent_merge_config,
+                global_attn_idx_ranges=global_attn_idx_ranges,
+                global_attn_debug=global_attn_debug,
             )
 
             
