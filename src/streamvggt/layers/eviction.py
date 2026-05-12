@@ -61,6 +61,9 @@ class EvictionManager:
         need_summary: bool = False,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
+        current_frame_idx: Optional[int] = None,
+        protect_recent_frames: int = 0,
+        candidate_frame_ids: Optional[torch.Tensor] = None,
     ) -> EvictionResult:
         """Select candidate-local indices to retain.
 
@@ -71,9 +74,12 @@ class EvictionManager:
 
         Returns:
             EvictionResult with candidate-local kept indices shaped
-            ``[B, H, cache_budget - num_anchor_tokens]``.
+            ``[B, H, K]``. ``K`` may exceed ``cache_budget - num_anchor_tokens``
+            when recent-frame protection leaves too few evictable candidates.
         """
         B, H, N, _ = k.shape
+        if protect_recent_frames < 0:
+            raise ValueError(f"protect_recent_frames must be >= 0, got {protect_recent_frames}")
         num_candidates = N - num_anchor_tokens
         num_to_keep = cache_budget - num_anchor_tokens
         if num_to_keep < 0:
@@ -92,15 +98,52 @@ class EvictionManager:
 
         if self.policy in ("mean", "baseline_mean"):
             policy_scores = mean_scores
-            kept = self._keep_lowest_scores(policy_scores, num_to_keep)
+            if protect_recent_frames > 0:
+                kept, protection_debug = self._keep_with_recent_protection(
+                    policy_scores,
+                    num_to_keep,
+                    candidate_frame_ids,
+                    current_frame_idx,
+                    protect_recent_frames,
+                    evict_highest=True,
+                    shared_across_heads=False,
+                )
+            else:
+                kept = self._keep_lowest_scores(policy_scores, num_to_keep)
+                protection_debug = None
         elif self.policy == "svd_leverage":
             if self.leverage_granularity == "head":
                 policy_scores = self._svd_leverage_scores(candidate_k)
-                kept = self._keep_highest_scores(policy_scores, num_to_keep)
+                if protect_recent_frames > 0:
+                    kept, protection_debug = self._keep_with_recent_protection(
+                        policy_scores,
+                        num_to_keep,
+                        candidate_frame_ids,
+                        current_frame_idx,
+                        protect_recent_frames,
+                        evict_highest=False,
+                        shared_across_heads=False,
+                    )
+                else:
+                    kept = self._keep_highest_scores(policy_scores, num_to_keep)
+                    protection_debug = None
             else:
                 policy_scores = self._layer_svd_leverage_scores(candidate_k, candidate_v)
-                kept = self._keep_highest_scores(policy_scores.unsqueeze(1), num_to_keep)
-                kept = kept.expand(B, H, num_to_keep)
+                if protect_recent_frames > 0:
+                    kept, protection_debug = self._keep_with_recent_protection(
+                        policy_scores,
+                        num_to_keep,
+                        candidate_frame_ids,
+                        current_frame_idx,
+                        protect_recent_frames,
+                        evict_highest=False,
+                        shared_across_heads=True,
+                        num_heads=H,
+                    )
+                else:
+                    kept = self._keep_highest_scores(policy_scores.unsqueeze(1), num_to_keep)
+                    kept = kept.expand(B, H, num_to_keep)
+                    protection_debug = None
         else:
             raise AssertionError(f"Unhandled eviction policy: {self.policy}")
 
@@ -111,15 +154,25 @@ class EvictionManager:
                 if self.leverage_sketch_dim in (None, 0)
                 else str(self.leverage_sketch_dim)
             )
-            evicted = num_candidates - num_to_keep
+            requested_evicted = num_candidates - num_to_keep
+            actual_evicted = num_candidates - int(kept.shape[-1])
             feature_dim = D
             if self.policy == "svd_leverage" and self.leverage_granularity == "layer":
                 feature_dim = H * D * (2 if self.leverage_feature == "key_value" else 1)
             msg = (
                 f"[EvictionManager] policy={self.policy} layer={layer_id} step={step_idx} "
-                f"cache={N} budget={cache_budget} keep_candidates={num_to_keep} evicted={evicted} "
+                f"cache={N} budget={cache_budget} keep_candidates={kept.shape[-1]} "
+                f"requested_evicted={requested_evicted} evicted={actual_evicted} "
                 f"scores={tuple(policy_scores.shape)}"
             )
+            if protection_debug is not None:
+                msg += (
+                    f" current_frame_idx={protection_debug['current_frame_idx']} "
+                    f"protect_recent_frames={protection_debug['protect_recent_frames']} "
+                    f"protected_tokens={protection_debug['protected_tokens']} "
+                    f"candidate_tokens={protection_debug['candidate_tokens']} "
+                    f"limited_by_protection={protection_debug['limited_by_protection']}"
+                )
             if self.policy == "svd_leverage":
                 msg += (
                     f" leverage_sketch_dim={sketch_label} "
@@ -127,6 +180,11 @@ class EvictionManager:
                     f"num_heads={H} num_tokens={num_candidates} head_dim={D} feature_dim={feature_dim}"
                 )
             print(msg)
+            if protection_debug is not None and protection_debug["limited_by_protection"]:
+                print(
+                    "[EvictionManager] recent-frame protection limited eviction; "
+                    "cache may temporarily exceed budget"
+                )
             if self.policy == "svd_leverage" and self.leverage_granularity == "layer":
                 print(f"[EvictionManager] layer-wise SVD leverage: X shape={self._last_layer_feature_shape}")
             if self.policy == "svd_leverage" and self._last_leverage_profile:
@@ -156,6 +214,109 @@ class EvictionManager:
     def _keep_highest_scores(scores: torch.Tensor, num_to_keep: int) -> torch.Tensor:
         _, kept = torch.topk(scores, k=num_to_keep, dim=-1)
         return kept.sort(dim=-1).values
+
+    def _keep_with_recent_protection(
+        self,
+        scores: torch.Tensor,
+        num_to_keep: int,
+        candidate_frame_ids: Optional[torch.Tensor],
+        current_frame_idx: Optional[int],
+        protect_recent_frames: int,
+        *,
+        evict_highest: bool,
+        shared_across_heads: bool,
+        num_heads: Optional[int] = None,
+    ) -> tuple[torch.Tensor, Dict[str, int]]:
+        """Keep tokens after excluding recent frames only from eviction candidates.
+
+        SVD/QR leverage scores are computed before this method is called; this
+        mask only limits which scored tokens may be selected for eviction.
+        """
+        if current_frame_idx is None:
+            raise ValueError("current_frame_idx is required when protect_recent_frames > 0")
+        if candidate_frame_ids is None:
+            raise ValueError("candidate_frame_ids is required when protect_recent_frames > 0")
+
+        threshold = int(current_frame_idx) - int(protect_recent_frames) + 1
+        if shared_across_heads:
+            if scores.ndim != 2:
+                raise ValueError(f"Expected layer-wise scores [B, N], got {tuple(scores.shape)}")
+            if candidate_frame_ids.ndim != 3:
+                raise ValueError(
+                    "Expected candidate_frame_ids [B, H, N] for layer-wise protection, "
+                    f"got {tuple(candidate_frame_ids.shape)}"
+                )
+            B, _, N = candidate_frame_ids.shape
+            H = int(num_heads) if num_heads is not None else int(candidate_frame_ids.shape[1])
+            frame_ids = candidate_frame_ids.to(device=scores.device, dtype=torch.long)
+            evictable_mask = ((frame_ids < 0) | (frame_ids < threshold)).all(dim=1)
+            actual_evict = min(N - int(num_to_keep), int(evictable_mask.sum(dim=-1).min().item()))
+            kept_2d = self._keep_after_eviction(scores, evictable_mask, actual_evict, evict_highest)
+            kept = kept_2d.unsqueeze(1).expand(B, H, kept_2d.shape[-1])
+            protected_tokens = int((~evictable_mask).sum().item())
+            candidate_tokens = int(evictable_mask.sum().item())
+        else:
+            if scores.ndim != 3:
+                raise ValueError(f"Expected head-wise scores [B, H, N], got {tuple(scores.shape)}")
+            if candidate_frame_ids.shape != scores.shape:
+                raise ValueError(
+                    "candidate_frame_ids must match head-wise score shape, "
+                    f"got {tuple(candidate_frame_ids.shape)} vs {tuple(scores.shape)}"
+                )
+            _, _, N = scores.shape
+            frame_ids = candidate_frame_ids.to(device=scores.device, dtype=torch.long)
+            evictable_mask = (frame_ids < 0) | (frame_ids < threshold)
+            actual_evict = min(N - int(num_to_keep), int(evictable_mask.sum(dim=-1).min().item()))
+            kept = self._keep_after_eviction(scores, evictable_mask, actual_evict, evict_highest)
+            protected_tokens = int((~evictable_mask).sum().item())
+            candidate_tokens = int(evictable_mask.sum().item())
+
+        requested_evict = scores.shape[-1] - int(num_to_keep)
+        debug = {
+            "current_frame_idx": int(current_frame_idx),
+            "protect_recent_frames": int(protect_recent_frames),
+            "protected_tokens": protected_tokens,
+            "candidate_tokens": candidate_tokens,
+            "requested_eviction_count": int(requested_evict),
+            "actual_eviction_count": int(actual_evict),
+            "limited_by_protection": int(actual_evict < requested_evict),
+        }
+        return kept, debug
+
+    @staticmethod
+    def _keep_after_eviction(
+        scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+        evict_highest: bool,
+    ) -> torch.Tensor:
+        leading_shape = scores.shape[:-1]
+        num_candidates = int(scores.shape[-1])
+        keep_count = num_candidates - int(num_to_evict)
+        kept_flat = torch.empty(
+            int(math.prod(leading_shape)),
+            keep_count,
+            device=scores.device,
+            dtype=torch.long,
+        )
+        all_indices = torch.arange(num_candidates, device=scores.device, dtype=torch.long)
+        scores_flat = scores.reshape(-1, num_candidates)
+        mask_flat = evictable_mask.reshape(-1, num_candidates)
+
+        for row_idx in range(scores_flat.shape[0]):
+            evictable = all_indices[mask_flat[row_idx]]
+            if num_to_evict > 0:
+                row_scores = scores_flat[row_idx][evictable]
+                selection_scores = row_scores if evict_highest else -row_scores
+                _, local_evict = torch.topk(selection_scores, k=num_to_evict, dim=-1)
+                evicted = evictable[local_evict]
+                keep_mask = torch.ones(num_candidates, device=scores.device, dtype=torch.bool)
+                keep_mask[evicted] = False
+                row_kept = all_indices[keep_mask]
+            else:
+                row_kept = all_indices
+            kept_flat[row_idx] = row_kept.sort(dim=-1).values
+        return kept_flat.reshape(*leading_shape, keep_count)
 
     def _get_leverage_right_sketch(
         self,

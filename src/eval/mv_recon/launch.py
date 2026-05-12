@@ -74,6 +74,16 @@ def get_args_parser():
         help="Feature tensor for svd_leverage eviction: keys only or concatenated keys and values",
     )
     parser.add_argument(
+        "--eviction_protect_recent_frames",
+        "--eviction-protect-recent-frames",
+        type=int,
+        default=0,
+        help=(
+            "Protect tokens from the most recent N processed frames from eviction while still "
+            "including them in SVD leverage computation."
+        ),
+    )
+    parser.add_argument(
         "--enable_recent_merge",
         action="store_true",
         help="Enable geometry-validated recent KV cache merging",
@@ -196,13 +206,19 @@ def main(args):
         raise SystemExit(f"Error: {exc}") from exc
     if global_attn_idx_ranges is not None:
         print(f"Global attention index ranges enabled: {global_attn_idx_ranges}")
+    if args.eviction_protect_recent_frames < 0:
+        raise SystemExit(
+            "Error: --eviction_protect_recent_frames must be >= 0, "
+            f"got {args.eviction_protect_recent_frames}."
+        )
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
         print(
             "Using SVD leverage eviction: "
             f"sketch_dim={sketch_label}, "
             f"granularity={args.leverage_granularity}, "
-            f"feature={args.leverage_feature}"
+            f"feature={args.leverage_feature}, "
+            f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
     if args.merge_window < 1:
         raise SystemExit(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
@@ -417,6 +433,7 @@ def main(args):
                                     leverage_sketch_dim=args.leverage_sketch_dim,
                                     leverage_granularity=args.leverage_granularity,
                                     leverage_feature=args.leverage_feature,
+                                    eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                                     recent_merge_config=recent_merge_config,
                                     global_attn_idx_ranges=global_attn_idx_ranges,
                                     global_attn_debug=args.global_attn_debug,

@@ -116,6 +116,12 @@ def run_inference(args: argparse.Namespace):
             f"got {args.merge_recall_debug_max_tokens}."
         )
         return
+    if args.eviction_protect_recent_frames < 0:
+        print(
+            "Error: --eviction_protect_recent_frames must be >= 0, "
+            f"got {args.eviction_protect_recent_frames}."
+        )
+        return
     try:
         global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
     except ValueError as exc:
@@ -129,6 +135,7 @@ def run_inference(args: argparse.Namespace):
             "Using SVD leverage granularity: "
             f"{args.leverage_granularity} (feature={args.leverage_feature})"
         )
+        print(f"Using SVD leverage recent-frame protection: {args.eviction_protect_recent_frames}")
     recent_merge_config = RecentMergeConfig(
         enabled=args.enable_recent_merge,
         window=args.merge_window,
@@ -233,6 +240,7 @@ def run_inference(args: argparse.Namespace):
                 leverage_sketch_dim=args.leverage_sketch_dim,
                 leverage_granularity=args.leverage_granularity,
                 leverage_feature=args.leverage_feature,
+                eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                 recent_merge_config=recent_merge_config,
                 global_attn_idx_ranges=global_attn_idx_ranges,
                 global_attn_debug=args.global_attn_debug,
@@ -439,6 +447,16 @@ if __name__ == "__main__":
         default="key",
         choices=("key", "key_value"),
         help="Feature tensor for svd_leverage eviction: keys only or concatenated keys and values",
+    )
+    parser.add_argument(
+        "--eviction_protect_recent_frames",
+        "--eviction-protect-recent-frames",
+        type=int,
+        default=0,
+        help=(
+            "Protect tokens from the most recent N processed frames from eviction while still "
+            "including them in SVD leverage computation."
+        ),
     )
     parser.add_argument(
         "--enable_recent_merge",

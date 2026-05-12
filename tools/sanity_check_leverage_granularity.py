@@ -138,6 +138,137 @@ def check_low_precision_inputs() -> None:
         _assert_finite(result.policy_scores, f"{dtype} layer scores")
 
 
+def _frame_metadata(batch_size: int, num_heads: int, frame_ids: torch.Tensor) -> KVCacheMetadata:
+    frame_ids = frame_ids.to(dtype=torch.long).view(1, 1, -1).expand(batch_size, num_heads, -1).clone()
+    shape = frame_ids.shape
+    token_indices = torch.arange(shape[2], dtype=torch.int32).view(1, 1, -1).expand(shape).clone()
+    return KVCacheMetadata(
+        frame_ids=frame_ids,
+        token_indices=token_indices,
+        accumulated_confidence=torch.ones(shape, dtype=torch.float32),
+        merge_counts=torch.zeros(shape, dtype=torch.int16),
+        last_updated_frame=frame_ids.clone(),
+    )
+
+
+def _assert_recent_frames_not_evicted(kept: torch.Tensor, frame_ids: torch.Tensor, protected_frames) -> None:
+    candidate_frames = frame_ids[2:]
+    protected_local = {
+        idx for idx, frame_id in enumerate(candidate_frames.tolist()) if int(frame_id) in protected_frames
+    }
+    for row in kept.reshape(-1, kept.shape[-1]):
+        evicted = set(range(candidate_frames.numel())) - set(row.tolist())
+        bad = evicted & protected_local
+        if bad:
+            raise AssertionError(f"protected candidate indices were evicted: {sorted(bad)}")
+
+
+def check_recent_frame_protection_head_mode() -> None:
+    torch.manual_seed(11)
+    batch_size, num_heads, num_tokens, head_dim = 1, 2, 10, 4
+    k = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v = torch.randn_like(k)
+    frame_ids = torch.tensor([0, 0, 0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.long)
+    metadata = _frame_metadata(batch_size, num_heads, frame_ids)
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_sketch_dim=0,
+        leverage_granularity="head",
+    )
+    result = manager.select(
+        k,
+        cache_budget=4,
+        num_anchor_tokens=2,
+        v=v,
+        current_frame_idx=3,
+        protect_recent_frames=2,
+        candidate_frame_ids=metadata.frame_ids[:, :, 2:],
+    )
+    assert result.policy_scores.shape[-1] == num_tokens - 2
+    _assert_recent_frames_not_evicted(result.kept_candidate_indices, frame_ids, {2, 3})
+
+
+def check_recent_frame_protection_layer_modes() -> None:
+    torch.manual_seed(13)
+    batch_size, num_heads, num_tokens, head_dim = 1, 3, 10, 4
+    k = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v = torch.randn_like(k)
+    frame_ids = torch.tensor([0, 0, 0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.long)
+    metadata = _frame_metadata(batch_size, num_heads, frame_ids)
+    for feature in ("key", "key_value"):
+        manager = EvictionManager(
+            policy="svd_leverage",
+            leverage_sketch_dim=4,
+            leverage_granularity="layer",
+            leverage_feature=feature,
+        )
+        result = manager.select(
+            k,
+            cache_budget=4,
+            num_anchor_tokens=2,
+            v=v,
+            current_frame_idx=3,
+            protect_recent_frames=2,
+            candidate_frame_ids=metadata.frame_ids[:, :, 2:],
+        )
+        assert result.policy_scores.shape[-1] == num_tokens - 2
+        _assert_recent_frames_not_evicted(result.kept_candidate_indices, frame_ids, {2, 3})
+        for head_idx in range(1, result.kept_candidate_indices.shape[1]):
+            if not torch.equal(result.kept_candidate_indices[:, 0], result.kept_candidate_indices[:, head_idx]):
+                raise AssertionError("layer-wise protected eviction did not share kept indices across heads")
+
+
+def check_recent_frame_eviction_alignment() -> None:
+    torch.manual_seed(17)
+    batch_size, num_heads, num_tokens, head_dim = 1, 2, 10, 4
+    k = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v = torch.randn_like(k)
+    frame_ids = torch.tensor([0, 0, 0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.long)
+    metadata = _frame_metadata(batch_size, num_heads, frame_ids)
+    attention = Attention(dim=num_heads * head_dim, num_heads=num_heads)
+    final_k, final_v, final_metadata, _ = attention.eviction(
+        k,
+        v,
+        metadata,
+        cache_budget=4,
+        num_anchor_tokens=2,
+        layer_id=0,
+        step_idx=3,
+        eviction_policy="svd_leverage",
+        leverage_sketch_dim=0,
+        leverage_granularity="head",
+        eviction_protect_recent_frames=2,
+    )
+    assert final_k.shape[2] == final_v.shape[2] == final_metadata.frame_ids.shape[2]
+    assert final_k.shape[2] > 4
+    remaining_frames = final_metadata.frame_ids[0, 0].tolist()
+    for protected_frame in (2, 3):
+        if protected_frame not in remaining_frames:
+            raise AssertionError(f"protected frame {protected_frame} disappeared after eviction")
+
+
+def check_protection_disabled_matches_previous_behavior() -> None:
+    k, v = _make_cache()
+    metadata = KVCacheMetadata.for_current_frame(k.shape[0], k.shape[1], k.shape[2], frame_id=3)
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_sketch_dim=4,
+        leverage_granularity="head",
+    )
+    baseline = manager.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+    disabled = manager.select(
+        k,
+        cache_budget=7,
+        num_anchor_tokens=2,
+        v=v,
+        current_frame_idx=3,
+        protect_recent_frames=0,
+        candidate_frame_ids=metadata.frame_ids[:, :, 2:],
+    )
+    if not torch.equal(baseline.kept_candidate_indices, disabled.kept_candidate_indices):
+        raise AssertionError("protect_recent_frames=0 changed eviction indices")
+
+
 def check_small_cache_no_eviction() -> None:
     k, v = _make_cache()
     attention = Attention(dim=k.shape[1] * k.shape[3], num_heads=k.shape[1])
@@ -171,6 +302,10 @@ def main() -> None:
     check_sketch_and_exact_modes()
     check_key_value_feature()
     check_low_precision_inputs()
+    check_recent_frame_protection_head_mode()
+    check_recent_frame_protection_layer_modes()
+    check_recent_frame_eviction_alignment()
+    check_protection_disabled_matches_previous_behavior()
     check_small_cache_no_eviction()
     print("leverage granularity sanity checks passed")
 

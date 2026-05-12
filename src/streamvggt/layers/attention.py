@@ -72,6 +72,7 @@ class Attention(nn.Module):
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
         leverage_feature: str = "key",
+        eviction_protect_recent_frames: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCacheMetadata], float]:
         """
         Evicts tokens from the key-value cache based on key cosine similarity.
@@ -115,6 +116,13 @@ class Attention(nn.Module):
             need_summary=cache_analysis_config is not None or eviction_debug,
             layer_id=layer_id,
             step_idx=step_idx,
+            current_frame_idx=step_idx,
+            protect_recent_frames=eviction_protect_recent_frames,
+            candidate_frame_ids=(
+                metadata.frame_ids[:, :, num_anchor_tokens:]
+                if metadata is not None
+                else None
+            ),
         )
         top_indices = eviction_result.kept_candidate_indices
         avg_scores = eviction_result.summary_score
@@ -137,7 +145,8 @@ class Attention(nn.Module):
         anchor_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
         anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
         keep_indices = torch.cat([anchor_indices, top_indices + int(num_anchor_tokens)], dim=2)
-        expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, cache_budget, D)
+        final_cache_size = keep_indices.shape[2]
+        expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, final_cache_size, D)
         final_k = torch.gather(k, 2, expanded_indices)
         final_v = torch.gather(v, 2, expanded_indices)
         final_metadata = (
@@ -165,6 +174,7 @@ class Attention(nn.Module):
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
         leverage_feature: str = "key",
+        eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
@@ -182,7 +192,11 @@ class Attention(nn.Module):
 
         if use_cache:
             metadata = None
-            if recent_merge_config is not None and recent_merge_config.enabled:
+            metadata_needed = (
+                (recent_merge_config is not None and recent_merge_config.enabled)
+                or int(eviction_protect_recent_frames) > 0
+            )
+            if metadata_needed:
                 metadata = KVCacheMetadata.for_current_frame(
                     batch_size=B,
                     num_heads=self.num_heads,
@@ -197,6 +211,13 @@ class Attention(nn.Module):
                     past_metadata = None
                 k = torch.cat([past_k, k], dim=2)
                 v = torch.cat([past_v, v], dim=2)
+                if metadata is not None and past_metadata is None:
+                    past_metadata = KVCacheMetadata.for_current_frame(
+                        batch_size=B,
+                        num_heads=self.num_heads,
+                        num_tokens=past_k.shape[2],
+                        frame_id=-1,
+                    )
                 if metadata is not None and past_metadata is not None:
                     metadata = past_metadata.concat(metadata)
                 elif metadata is not None:
@@ -237,6 +258,7 @@ class Attention(nn.Module):
                     leverage_sketch_dim=leverage_sketch_dim,
                     leverage_granularity=leverage_granularity,
                     leverage_feature=leverage_feature,
+                    eviction_protect_recent_frames=eviction_protect_recent_frames,
                 )
 
             new_kv = (k, v, metadata) if metadata is not None else (k, v)

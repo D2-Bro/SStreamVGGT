@@ -62,7 +62,7 @@ class KVCacheMetadata:
         shape = (batch_size, num_heads, num_tokens)
         token_indices = torch.arange(num_tokens, dtype=torch.int32).view(1, 1, num_tokens)
         return cls(
-            frame_ids=torch.full(shape, int(frame_id), dtype=torch.int32),
+            frame_ids=torch.full(shape, int(frame_id), dtype=torch.long),
             token_indices=token_indices.expand(shape).clone(),
             accumulated_confidence=torch.ones(shape, dtype=torch.float32),
             merge_counts=torch.zeros(shape, dtype=torch.int16),
