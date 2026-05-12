@@ -249,7 +249,8 @@ def main(args):
     datasets_all = {
         "7scenes": SevenScenes(
             split="test",
-            ROOT="/home/dongjae/data/7scenes_sfm",
+            # ROOT="/home/dongjae/data/7scenes_sfm",
+            ROOT="/data2/dongjae/datasets/7scenes_sfm",
             resolution=resolution,
             num_seq=1,
             full_video=True,
