@@ -1,0 +1,34 @@
+Seq: fire/seq-03 
+
+APE w.r.t. translation part (m)
+(with Sim(3) Umeyama alignment)
+
+       max	0.120489
+      mean	0.051722
+    median	0.046902
+       min	0.008100
+      rmse	0.057366
+       sse	0.987258
+       std	0.024812
+RPE w.r.t. rotation angle in degrees (deg)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	1.434545
+      mean	0.333199
+    median	0.281042
+       min	0.024713
+      rmse	0.396918
+       sse	47.105589
+       std	0.215689
+RPE w.r.t. translation part (m)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	0.067827
+      mean	0.016229
+    median	0.012772
+       min	0.000442
+      rmse	0.019888
+       sse	0.118263
+       std	0.011496

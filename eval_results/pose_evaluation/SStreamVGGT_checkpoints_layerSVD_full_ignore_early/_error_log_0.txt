@@ -1,0 +1,36 @@
+7scenes-chess/seq-03     | ATE: 0.04270, RPE trans: 0.01405, RPE rot: 0.35852
+0.04270
+0.01405
+0.35852
+7scenes-chess/seq-05     | ATE: 0.06067, RPE trans: 0.01170, RPE rot: 0.32335
+0.06067
+0.01170
+0.32335
+7scenes-fire/seq-03      | ATE: 0.02698, RPE trans: 0.01522, RPE rot: 0.32633
+0.02698
+0.01522
+0.32633
+7scenes-fire/seq-04      | ATE: 0.02872, RPE trans: 0.01171, RPE rot: 0.41784
+0.02872
+0.01171
+0.41784
+7scenes-heads/seq-01     | ATE: 0.03943, RPE trans: 0.01340, RPE rot: 0.53298
+0.03943
+0.01340
+0.53298
+7scenes-office/seq-02    | ATE: 0.09381, RPE trans: 0.03489, RPE rot: 0.78604
+0.09381
+0.03489
+0.78604
+7scenes-office/seq-06    | ATE: 0.08911, RPE trans: 0.01813, RPE rot: 0.57156
+0.08911
+0.01813
+0.57156
+7scenes-office/seq-07    | ATE: 0.20416, RPE trans: 0.03009, RPE rot: 0.49548
+0.20416
+0.03009
+0.49548
+7scenes-office/seq-09    | ATE: 0.25094, RPE trans: 0.07126, RPE rot: 3.04645
+0.25094
+0.07126
+3.04645

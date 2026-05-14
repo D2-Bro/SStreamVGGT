@@ -1,0 +1,34 @@
+Seq: pumpkin/seq-01 
+
+APE w.r.t. translation part (m)
+(with Sim(3) Umeyama alignment)
+
+       max	0.228430
+      mean	0.082799
+    median	0.070970
+       min	0.013826
+      rmse	0.093748
+       sse	2.636627
+       std	0.043966
+RPE w.r.t. rotation angle in degrees (deg)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	0.905302
+      mean	0.233844
+    median	0.204652
+       min	0.011817
+      rmse	0.279080
+       sse	23.287816
+       std	0.152325
+RPE w.r.t. translation part (m)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	0.059006
+      mean	0.015602
+    median	0.013245
+       min	0.001274
+      rmse	0.018630
+       sse	0.103780
+       std	0.010182

@@ -1,0 +1,34 @@
+Seq: stairs/seq-04 
+
+APE w.r.t. translation part (m)
+(with Sim(3) Umeyama alignment)
+
+       max	0.144345
+      mean	0.053390
+    median	0.047261
+       min	0.006494
+      rmse	0.060331
+       sse	0.909970
+       std	0.028096
+RPE w.r.t. rotation angle in degrees (deg)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	1.355867
+      mean	0.413662
+    median	0.364367
+       min	0.043434
+      rmse	0.477744
+       sse	56.831676
+       std	0.239005
+RPE w.r.t. translation part (m)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	0.059057
+      mean	0.016058
+    median	0.013988
+       min	0.002694
+      rmse	0.018729
+       sse	0.087343
+       std	0.009640

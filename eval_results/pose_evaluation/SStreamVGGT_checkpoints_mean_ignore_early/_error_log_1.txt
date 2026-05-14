@@ -1,0 +1,36 @@
+7scenes-pumpkin/seq-01   | ATE: 0.11811, RPE trans: 0.04095, RPE rot: 0.67958
+0.11811
+0.04095
+0.67958
+7scenes-pumpkin/seq-07   | ATE: 0.10202, RPE trans: 0.02511, RPE rot: 0.53821
+0.10202
+0.02511
+0.53821
+7scenes-redkitchen/seq-03 | ATE: 0.05877, RPE trans: 0.01681, RPE rot: 0.51573
+0.05877
+0.01681
+0.51573
+7scenes-redkitchen/seq-04 | ATE: 0.07179, RPE trans: 0.02060, RPE rot: 0.58275
+0.07179
+0.02060
+0.58275
+7scenes-redkitchen/seq-06 | ATE: 0.10262, RPE trans: 0.02204, RPE rot: 0.45721
+0.10262
+0.02204
+0.45721
+7scenes-redkitchen/seq-12 | ATE: 0.12748, RPE trans: 0.03914, RPE rot: 0.97412
+0.12748
+0.03914
+0.97412
+7scenes-redkitchen/seq-14 | ATE: 0.07561, RPE trans: 0.02494, RPE rot: 0.54840
+0.07561
+0.02494
+0.54840
+7scenes-stairs/seq-01    | ATE: 0.56474, RPE trans: 0.06950, RPE rot: 1.36572
+0.56474
+0.06950
+1.36572
+7scenes-stairs/seq-04    | ATE: 0.06033, RPE trans: 0.01873, RPE rot: 0.47774
+0.06033
+0.01873
+0.47774

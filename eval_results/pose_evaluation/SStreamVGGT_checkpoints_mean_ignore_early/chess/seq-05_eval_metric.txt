@@ -1,0 +1,34 @@
+Seq: chess/seq-05 
+
+APE w.r.t. translation part (m)
+(with Sim(3) Umeyama alignment)
+
+       max	0.100165
+      mean	0.047095
+    median	0.048950
+       min	0.002367
+      rmse	0.051243
+       sse	0.787768
+       std	0.020198
+RPE w.r.t. rotation angle in degrees (deg)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	1.200048
+      mean	0.308442
+    median	0.258704
+       min	0.033433
+      rmse	0.362185
+       sse	39.222255
+       std	0.189846
+RPE w.r.t. translation part (m)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	0.050117
+      mean	0.013433
+    median	0.012369
+       min	0.001702
+      rmse	0.015465
+       sse	0.071511
+       std	0.007662

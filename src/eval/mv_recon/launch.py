@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader
 from add_ckpt_path import add_path_to_dust3r
 from accelerate import Accelerator
 from torch.utils.data._utils.collate import default_collate
+from accelerate import InitProcessGroupKwargs
+from datetime import timedelta
 import tempfile
 from tqdm import tqdm
 import uuid
@@ -72,6 +74,19 @@ def get_args_parser():
         default="key",
         choices=("key", "key_value"),
         help="Feature tensor for svd_leverage eviction: keys only or concatenated keys and values",
+    )
+    parser.add_argument(
+        "--leverage_projection",
+        type=str,
+        default="random",
+        choices=("random", "head_mean"),
+        help="Projection mode for svd_leverage eviction: random right sketch or deterministic per-head means",
+    )
+    parser.add_argument(
+        "--leverage_head_mean_dim",
+        type=int,
+        default=1,
+        help="Number of mean-pooled channel groups per head for leverage_projection='head_mean'",
     )
     parser.add_argument(
         "--eviction_protect_recent_frames",
@@ -211,6 +226,11 @@ def main(args):
             "Error: --eviction_protect_recent_frames must be >= 0, "
             f"got {args.eviction_protect_recent_frames}."
         )
+    if args.leverage_head_mean_dim < 1:
+        raise SystemExit(
+            "Error: --leverage_head_mean_dim must be >= 1, "
+            f"got {args.leverage_head_mean_dim}."
+        )
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
         print(
@@ -218,6 +238,8 @@ def main(args):
             f"sketch_dim={sketch_label}, "
             f"granularity={args.leverage_granularity}, "
             f"feature={args.leverage_feature}, "
+            f"projection={args.leverage_projection}, "
+            f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
     if args.merge_window < 1:
@@ -250,7 +272,7 @@ def main(args):
         )
 
     add_path_to_dust3r(args.weights)
-    from eval.mv_recon.data import SevenScenes, NRGBD
+    from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D
     from eval.mv_recon.utils import accuracy, completion
 
     if args.size == 512:
@@ -265,14 +287,16 @@ def main(args):
     datasets_all = {
         "7scenes": SevenScenes(
             split="test",
-            # ROOT="/home/dongjae/data/7scenes_sfm",
-            ROOT="/data2/dongjae/datasets/7scenes_sfm",
+            ROOT="/home/dongjae/data/7scenes_sfm",
+            # ROOT="/data2/dongjae/datasets/7scenes_sfm",
             resolution=resolution,
             num_seq=1,
             full_video=True,
             kf_every=2,
             max_frames=args.max_frames,
-        ),  # 20),
+        ),
+        # "ETH3D": ETH3D
+            # 20),
         # "NRGBD": NRGBD(
         #     split="test",
         #     ROOT="/home/ma-user/work/dataset/3D_Reconstruction/neural_rgbd_data",
@@ -283,8 +307,12 @@ def main(args):
         # ),
     }
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(seconds=6000))]
+    )
     device = accelerator.device
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     model_name = args.model_name
     if model_name == "StreamVGGT":
         # from streamvggt.models.streamvggt import StreamVGGT
@@ -298,7 +326,7 @@ def main(args):
         ckpt = torch.load(args.weights, map_location=device)
         model.load_state_dict(ckpt, strict=True)
         model.eval()
-        model = model.to("cuda")
+        model = model.to(device)
     elif model_name == "VGGT":
         from vggt.models.vggt import VGGT
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -310,7 +338,7 @@ def main(args):
         ckpt = torch.load(args.weights, map_location=device)
         model.load_state_dict(ckpt, strict=True)
         model.eval()
-        model = model.to("cuda")
+        model = model.to(device)
 
     else:
         raise NotImplementedError
@@ -433,6 +461,8 @@ def main(args):
                                     leverage_sketch_dim=args.leverage_sketch_dim,
                                     leverage_granularity=args.leverage_granularity,
                                     leverage_feature=args.leverage_feature,
+                                    leverage_projection=args.leverage_projection,
+                                    leverage_head_mean_dim=args.leverage_head_mean_dim,
                                     eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                                     recent_merge_config=recent_merge_config,
                                     global_attn_idx_ranges=global_attn_idx_ranges,

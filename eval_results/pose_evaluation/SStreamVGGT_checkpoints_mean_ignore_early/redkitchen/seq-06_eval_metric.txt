@@ -1,0 +1,34 @@
+Seq: redkitchen/seq-06 
+
+APE w.r.t. translation part (m)
+(with Sim(3) Umeyama alignment)
+
+       max	0.263497
+      mean	0.089970
+    median	0.077690
+       min	0.009877
+      rmse	0.102616
+       sse	3.158987
+       std	0.049350
+RPE w.r.t. rotation angle in degrees (deg)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	2.214548
+      mean	0.377331
+    median	0.308440
+       min	0.032278
+      rmse	0.457211
+       sse	62.503496
+       std	0.258192
+RPE w.r.t. translation part (m)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	0.074500
+      mean	0.019220
+    median	0.017145
+       min	0.003337
+      rmse	0.022040
+       sse	0.145238
+       std	0.010786

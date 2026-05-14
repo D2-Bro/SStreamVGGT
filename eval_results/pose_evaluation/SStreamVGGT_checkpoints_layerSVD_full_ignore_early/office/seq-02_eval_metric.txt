@@ -1,0 +1,34 @@
+Seq: office/seq-02 
+
+APE w.r.t. translation part (m)
+(with Sim(3) Umeyama alignment)
+
+       max	0.198817
+      mean	0.086344
+    median	0.079504
+       min	0.009880
+      rmse	0.093807
+       sse	2.639935
+       std	0.036666
+RPE w.r.t. rotation angle in degrees (deg)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	3.321571
+      mean	0.574030
+    median	0.374185
+       min	0.016763
+      rmse	0.786037
+       sse	184.738528
+       std	0.536977
+RPE w.r.t. translation part (m)
+for delta = 1 (frames) using all pairs
+(with Sim(3) Umeyama alignment)
+
+       max	0.144303
+      mean	0.025412
+    median	0.017100
+       min	0.000963
+      rmse	0.034890
+       sse	0.363967
+       std	0.023907

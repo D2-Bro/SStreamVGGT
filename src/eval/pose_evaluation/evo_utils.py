@@ -99,6 +99,22 @@ def load_sintel_traj(gt_file):  # './data/sintel/training/camdata_left/alley_2'
     return tum_gt_poses, tt
 
 
+def load_7scenes_traj(gt_file):
+    pose_files = sorted(
+        os.path.join(gt_file, name)
+        for name in os.listdir(gt_file)
+        if name.endswith(".pose.txt")
+    )
+    poses = [np.loadtxt(pose_file).astype(np.float64) for pose_file in pose_files]
+    pose_path = PosePath3D(poses_se3=poses)
+    timestamps_mat = np.arange(len(poses)).astype(float)
+    traj = PoseTrajectory3D(poses_se3=pose_path.poses_se3, timestamps=timestamps_mat)
+    xyz = traj.positions_xyz
+    quat = traj.orientations_quat_wxyz
+    traj_tum = np.column_stack((xyz, quat))
+    return traj_tum, timestamps_mat
+
+
 def load_traj(gt_traj_file, traj_format="sintel", skip=0, stride=1, num_frames=None):
     """Read trajectory format. Return in TUM-RGBD format.
     Returns:
@@ -109,6 +125,8 @@ def load_traj(gt_traj_file, traj_format="sintel", skip=0, stride=1, num_frames=N
         traj_tum, timestamps_mat = load_replica_traj(gt_traj_file)
     elif traj_format == "sintel":
         traj_tum, timestamps_mat = load_sintel_traj(gt_traj_file)
+    elif traj_format == "7scenes":
+        traj_tum, timestamps_mat = load_7scenes_traj(gt_traj_file)
     elif traj_format in ["tum", "tartanair"]:
         traj = file_interface.read_tum_trajectory_file(gt_traj_file)
         xyz = traj.positions_xyz

@@ -72,6 +72,8 @@ class Attention(nn.Module):
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
         leverage_feature: str = "key",
+        leverage_projection: str = "random",
+        leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCacheMetadata], float]:
         """
@@ -97,6 +99,8 @@ class Attention(nn.Module):
             leverage_sketch_dim,
             leverage_granularity,
             leverage_feature,
+            leverage_projection,
+            leverage_head_mean_dim,
         )
         eviction = self._eviction_managers.get(manager_key)
         if eviction is None:
@@ -106,6 +110,8 @@ class Attention(nn.Module):
                 leverage_sketch_dim=leverage_sketch_dim,
                 leverage_granularity=leverage_granularity,
                 leverage_feature=leverage_feature,
+                leverage_projection=leverage_projection,
+                leverage_head_mean_dim=leverage_head_mean_dim,
             )
             self._eviction_managers[manager_key] = eviction
         eviction_result = eviction.select(
@@ -174,6 +180,8 @@ class Attention(nn.Module):
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
         leverage_feature: str = "key",
+        leverage_projection: str = "random",
+        leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
@@ -258,6 +266,8 @@ class Attention(nn.Module):
                     leverage_sketch_dim=leverage_sketch_dim,
                     leverage_granularity=leverage_granularity,
                     leverage_feature=leverage_feature,
+                    leverage_projection=leverage_projection,
+                    leverage_head_mean_dim=leverage_head_mean_dim,
                     eviction_protect_recent_frames=eviction_protect_recent_frames,
                 )
 

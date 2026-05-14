@@ -86,6 +86,8 @@ class Block(nn.Module):
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
         leverage_feature: str = "key",
+        leverage_projection: str = "random",
+        leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config=None,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
@@ -115,6 +117,8 @@ class Block(nn.Module):
                     leverage_sketch_dim=leverage_sketch_dim,
                     leverage_granularity=leverage_granularity,
                     leverage_feature=leverage_feature,
+                    leverage_projection=leverage_projection,
+                    leverage_head_mean_dim=leverage_head_mean_dim,
                     eviction_protect_recent_frames=eviction_protect_recent_frames,
                     recent_merge_config=recent_merge_config,
                 )

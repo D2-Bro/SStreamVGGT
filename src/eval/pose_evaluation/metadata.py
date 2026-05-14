@@ -2,8 +2,55 @@ import os
 import glob
 from tqdm import tqdm
 
+
+def _seven_scenes_root():
+    return os.environ.get("SSTREAMVGGT_7SCENES_ROOT", "/home/dongjae/data/7scenes_sfm")
+
+
+def _seven_scenes_seq_from_split_line(line):
+    num_part = "".join(filter(str.isdigit, line))
+    return f"seq-{num_part.zfill(2)}"
+
+
+def _seven_scenes_test_sequences(root=None):
+    root = root or _seven_scenes_root()
+    if not os.path.isdir(root):
+        return []
+
+    seq_list = []
+    for scene in sorted(os.listdir(root)):
+        scene_dir = os.path.join(root, scene)
+        split_file = os.path.join(scene_dir, "TestSplit.txt")
+        if not os.path.isdir(scene_dir) or not os.path.exists(split_file):
+            continue
+        with open(split_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    seq_list.append(f"{scene}/{_seven_scenes_seq_from_split_line(line)}")
+    return seq_list
+
+
+def _seven_scenes_color_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "frame-*.color.png")))
+
+
 # Define the merged dataset metadata dictionary
 dataset_metadata = {
+    "7scenes": {
+        "img_path": _seven_scenes_root(),
+        "anno_path": _seven_scenes_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
+        "filelist_func": _seven_scenes_color_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq),
+        "traj_format": "7scenes",
+        "seq_list": _seven_scenes_test_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
     "davis": {
         "img_path": "data/davis/DAVIS/JPEGImages/480p",
         "mask_path": "data/davis/DAVIS/masked_images/480p",
