@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
-from typing import Union, Tuple, Dict, Optional
+from typing import Union, Tuple, Dict, Optional, Sequence
 
 from streamvggt.utils.cache_analysis import (
     CacheAnalysisConfig,
@@ -184,6 +184,9 @@ class Attention(nn.Module):
         leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
+        voxel_covis_frame_ids: Optional[Sequence[int]] = None,
+        voxel_covis_enabled: bool = False,
+        voxel_covis_fallback_recent: int = 0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -203,6 +206,7 @@ class Attention(nn.Module):
             metadata_needed = (
                 (recent_merge_config is not None and recent_merge_config.enabled)
                 or int(eviction_protect_recent_frames) > 0
+                or bool(voxel_covis_enabled)
             )
             if metadata_needed:
                 metadata = KVCacheMetadata.for_current_frame(
@@ -272,28 +276,49 @@ class Attention(nn.Module):
                 )
 
             new_kv = (k, v, metadata) if metadata is not None else (k, v)
+            if voxel_covis_enabled and metadata is not None and voxel_covis_frame_ids is not None:
+                k_read, v_read, covis_attn_mask = _filter_kv_for_voxel_covis(
+                    k,
+                    v,
+                    metadata,
+                    selected_frame_ids=voxel_covis_frame_ids,
+                    current_frame_id=step_idx if step_idx is not None else 0,
+                    query_len=N,
+                    fallback_recent=voxel_covis_fallback_recent,
+                )
+                k_for_attn = k_read
+                v_for_attn = v_read
+                attn_mask = _merge_attn_masks(attn_mask, covis_attn_mask, q.dtype)
+            else:
+                k_for_attn = k
+                v_for_attn = v
+        else:
+            k_for_attn = k
+            v_for_attn = v
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q,
-                k,
-                v,
+                k_for_attn,
+                v_for_attn,
                 attn_mask=attn_mask,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
             )
 
         else:
             q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
+            attn = q @ k_for_attn.transpose(-2, -1)
             # Mask
             if attn_mask is not None:
-                assert attn_mask.shape[-2:] == (N, N), f"Expected mask shape [..., {N}, {N}], got {attn_mask.shape}"
+                assert attn_mask.shape[-2:] == (N, k_for_attn.shape[2]), (
+                    f"Expected mask shape [..., {N}, {k_for_attn.shape[2]}], got {attn_mask.shape}"
+                )
                 attn = attn + attn_mask
 
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
 
-            x = attn @ v
+            x = attn @ v_for_attn
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -301,6 +326,92 @@ class Attention(nn.Module):
         if use_cache:
                 return x, new_kv, scores
         return x
+
+
+def _filter_kv_for_voxel_covis(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    metadata: KVCacheMetadata,
+    selected_frame_ids: Sequence[int],
+    current_frame_id: int,
+    query_len: int,
+    fallback_recent: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a padded read-only cache containing selected past frames plus current tokens."""
+    B, H, _, D = k.shape
+    frame_ids = metadata.frame_ids
+    selected = torch.as_tensor(list(selected_frame_ids), dtype=torch.long)
+    keep_masks = []
+    max_count = 0
+    for b in range(B):
+        row = []
+        for h in range(H):
+            head_frames = frame_ids[b, h]
+            if selected.numel() > 0:
+                selected_mask = torch.isin(head_frames, selected)
+            else:
+                selected_mask = torch.zeros_like(head_frames, dtype=torch.bool)
+            has_selected_past = bool((selected_mask & (head_frames != int(current_frame_id))).any().item())
+            if not has_selected_past and int(fallback_recent) > 0:
+                fallback_frames = _recent_cached_frame_ids(
+                    head_frames,
+                    int(current_frame_id),
+                    int(fallback_recent),
+                )
+                if fallback_frames:
+                    fallback = torch.as_tensor(fallback_frames, dtype=head_frames.dtype)
+                    selected_mask = selected_mask | torch.isin(head_frames, fallback)
+            mask = selected_mask | (head_frames == int(current_frame_id))
+            count = int(mask.sum().item())
+            max_count = max(max_count, count)
+            row.append(mask)
+        keep_masks.append(row)
+
+    if max_count == 0:
+        return k, v, torch.zeros((B, H, query_len, k.shape[2]), device=k.device, dtype=k.dtype)
+
+    if max_count == k.shape[2] and all(bool(mask.all()) for row in keep_masks for mask in row):
+        return k, v, torch.zeros((B, H, query_len, k.shape[2]), device=k.device, dtype=k.dtype)
+
+    k_read = torch.zeros((B, H, max_count, D), device=k.device, dtype=k.dtype)
+    v_read = torch.zeros((B, H, max_count, D), device=v.device, dtype=v.dtype)
+    valid = torch.zeros((B, H, max_count), device=k.device, dtype=torch.bool)
+
+    for b in range(B):
+        for h in range(H):
+            indices = torch.nonzero(keep_masks[b][h], as_tuple=False).flatten().to(device=k.device)
+            count = int(indices.numel())
+            if count == 0:
+                continue
+            k_read[b, h, :count] = k[b, h].index_select(0, indices)
+            v_read[b, h, :count] = v[b, h].index_select(0, indices)
+            valid[b, h, :count] = True
+
+    min_value = torch.finfo(k.dtype).min
+    mask = torch.zeros((B, H, 1, max_count), device=k.device, dtype=k.dtype)
+    mask = mask.masked_fill(~valid.unsqueeze(2), min_value)
+    mask = mask.expand(B, H, query_len, max_count)
+    return k_read, v_read, mask
+
+
+def _recent_cached_frame_ids(head_frames: torch.Tensor, current_frame_id: int, count: int) -> list[int]:
+    if count <= 0:
+        return []
+    past = head_frames[head_frames < int(current_frame_id)]
+    if past.numel() == 0:
+        return []
+    return sorted({int(fid) for fid in past.tolist()}, reverse=True)[:count]
+
+
+def _merge_attn_masks(
+    existing_mask: Optional[torch.Tensor],
+    covis_mask: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    covis_mask = covis_mask.to(dtype=dtype)
+    if existing_mask is None:
+        return covis_mask
+    return existing_mask.to(device=covis_mask.device, dtype=dtype) + covis_mask
 
 
 class MemEffAttention(Attention):

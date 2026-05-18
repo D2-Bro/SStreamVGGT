@@ -15,6 +15,7 @@ from eval.pose_evaluation.utils import *
 from accelerate import PartialState
 from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.layers.recent_merge import RecentMergeConfig
+from streamvggt.layers.voxel_covis import VoxelCovisConfig
 
 from tqdm import tqdm
 import time
@@ -87,6 +88,23 @@ def validate_streamvggt_args(args):
         raise SystemExit(
             "Error: --merge_recall_debug_max_tokens must be >= 1, "
             f"got {args.merge_recall_debug_max_tokens}."
+        )
+    if args.voxel_size <= 0:
+        raise SystemExit(f"Error: --voxel_size must be > 0, got {args.voxel_size}.")
+    if args.covis_min_shared_voxels < 0:
+        raise SystemExit(
+            "Error: --covis_min_shared_voxels must be >= 0, "
+            f"got {args.covis_min_shared_voxels}."
+        )
+    if not (0.0 <= args.covis_min_overlap <= 1.0):
+        raise SystemExit(
+            "Error: --covis_min_overlap must be in [0, 1], "
+            f"got {args.covis_min_overlap}."
+        )
+    if args.covis_fallback_recent < 0:
+        raise SystemExit(
+            "Error: --covis_fallback_recent must be >= 0, "
+            f"got {args.covis_fallback_recent}."
         )
     return global_attn_idx_ranges
 
@@ -262,6 +280,46 @@ def get_args_parser():
         help="Maximum source tokens sampled per layer/head for recent merge recall diagnostics",
     )
     parser.add_argument(
+        "--use_voxel_covis",
+        action="store_true",
+        help="Enable read-only voxel covisibility filtering for streaming KV cache reads",
+    )
+    parser.add_argument(
+        "--voxel_size",
+        type=float,
+        default=0.05,
+        help="Voxel size in world units for covisibility frame selection",
+    )
+    parser.add_argument(
+        "--covis_min_shared_voxels",
+        type=int,
+        default=20,
+        help="Minimum shared voxels required for a covisible frame",
+    )
+    parser.add_argument(
+        "--covis_min_overlap",
+        type=float,
+        default=0.05,
+        help="Minimum shared/min voxel overlap required for a covisible frame",
+    )
+    parser.add_argument(
+        "--max_covis_frames",
+        type=int,
+        default=8,
+        help="Maximum number of covisible previous frames to read from KV cache; <=0 disables the cap",
+    )
+    parser.add_argument(
+        "--covis_fallback_recent",
+        type=int,
+        default=1,
+        help="Fallback recent frames when covisibility selection is empty",
+    )
+    parser.add_argument(
+        "--covis_debug_log",
+        action="store_true",
+        help="Print per-frame voxel covisibility KV filtering diagnostics",
+    )
+    parser.add_argument(
         "--global_attn_idx_ranges",
         "--global-attn-idx-ranges",
         type=str,
@@ -419,6 +477,15 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             recall_debug=args.merge_recall_debug,
                             recall_debug_max_tokens=args.merge_recall_debug_max_tokens,
                         )
+                        voxel_covis_config = VoxelCovisConfig(
+                            enabled=args.use_voxel_covis,
+                            voxel_size=args.voxel_size,
+                            min_shared_voxels=args.covis_min_shared_voxels,
+                            min_overlap=args.covis_min_overlap,
+                            max_covis_frames=args.max_covis_frames,
+                            fallback_recent=args.covis_fallback_recent,
+                            debug=args.covis_debug_log,
+                        )
                         output = model.inference(
                             frames,
                             eviction_policy=args.eviction_policy,
@@ -429,6 +496,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_head_mean_dim=args.leverage_head_mean_dim,
                             eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                             recent_merge_config=recent_merge_config,
+                            voxel_covis_config=voxel_covis_config,
                             global_attn_idx_ranges=global_attn_idx_ranges,
                             global_attn_debug=args.global_attn_debug,
                         )

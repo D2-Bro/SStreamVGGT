@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
 from streamvggt.layers.recent_merge import RecentMergeConfig, RecentSimilarityMerge
+from streamvggt.layers.voxel_covis import VoxelCovisConfig, VoxelCovisibilityGraph
 
 @dataclass
 class StreamVGGTOutput(ModelOutput):
@@ -131,6 +132,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
+        voxel_covis_config: Optional[VoxelCovisConfig] = None,
+        covis_log_fn: Optional[Callable[[str], None]] = None,
         global_attn_idx_ranges: Optional[Any] = None,
         global_attn_debug: bool = False,
     ):
@@ -144,6 +147,12 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 patch_start_idx=self.aggregator.patch_start_idx,
                 patch_size=self.aggregator.patch_size,
             )
+        voxel_covis_graph = None
+        if voxel_covis_config is not None and voxel_covis_config.enabled:
+            voxel_covis_graph = VoxelCovisibilityGraph(
+                voxel_covis_config,
+                patch_size=self.aggregator.patch_size,
+            )
         
         all_ress = []
         processed_frames = [] 
@@ -151,6 +160,18 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         for i, frame in enumerate(frames):
 
             images = frame["img"].unsqueeze(0) 
+            covis_selection = None
+            voxel_covis_frame_ids = None
+            if voxel_covis_graph is not None:
+                covis_selection = voxel_covis_graph.select_for_frame(i)
+                voxel_covis_frame_ids = covis_selection.selected_frame_ids
+                if voxel_covis_config.debug:
+                    msg = _format_covis_debug(covis_selection, past_key_values)
+                    if covis_log_fn is not None:
+                        covis_log_fn(msg)
+                    else:
+                        print(msg)
+
             aggregator_output = self.aggregator(
                 images, 
                 past_key_values=past_key_values,
@@ -168,6 +189,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 leverage_head_mean_dim=leverage_head_mean_dim,
                 eviction_protect_recent_frames=eviction_protect_recent_frames,
                 recent_merge_config=recent_merge_config,
+                voxel_covis_frame_ids=voxel_covis_frame_ids,
+                voxel_covis_enabled=voxel_covis_graph is not None,
                 global_attn_idx_ranges=global_attn_idx_ranges,
                 global_attn_debug=global_attn_debug,
             )
@@ -232,6 +255,15 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                         )
                         past_key_values[layer_id] = (k_cache, v_cache, metadata)
 
+            if voxel_covis_graph is not None:
+                voxel_covis_graph.record_frame_geometry(
+                    frame_id=i,
+                    depth=depth,
+                    depth_conf=depth_conf,
+                    pose_enc=camera_pose,
+                    image_hw=images.shape[-2:],
+                )
+
             res_gpu = {
                 "pts3d_in_other_view": pts3d,
                 "conf": pts3d_conf,
@@ -265,3 +297,75 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             ress=all_ress if cache_results else None,
             views=processed_frames if cache_results else None,
         )
+
+
+def _format_covis_debug(selection, past_key_values) -> str:
+    cache_before, selected_stats, per_frame_stats = _covis_cache_stats(
+        past_key_values,
+        selection.selected_frame_ids,
+    )
+    score_summary = "none"
+    if selection.scores:
+        shared = [score.shared_voxels for score in selection.scores]
+        overlap = [score.overlap_ratio for score in selection.scores]
+        score_summary = (
+            f"candidates={len(selection.scores)} "
+            f"shared_min/max={min(shared)}/{max(shared)} "
+            f"overlap_min/max={min(overlap):.4f}/{max(overlap):.4f}"
+        )
+    return (
+        "[voxel-covis] "
+        f"frame={selection.current_frame_id} "
+        f"reference={selection.reference_frame_id} "
+        f"retrieved_frames={selection.selected_frame_ids} "
+        f"selected_count={len(selection.selected_frame_ids)} "
+        f"fallback={selection.fallback_used} "
+        f"{score_summary} "
+        f"cache_tokens_before={cache_before} "
+        f"selected_key_cache_tokens={selected_stats} "
+        f"retrieved_key_cache_by_frame={per_frame_stats}"
+    )
+
+
+def _covis_cache_stats(past_key_values, selected_frame_ids) -> tuple[int, str, str]:
+    for layer_kv in past_key_values:
+        if layer_kv is None or len(layer_kv) != 3:
+            continue
+        k_cache, _, metadata = layer_kv
+        selected = torch.as_tensor(list(selected_frame_ids), dtype=torch.long)
+        counts = []
+        per_frame = {}
+        for b in range(metadata.frame_ids.shape[0]):
+            for h in range(metadata.frame_ids.shape[1]):
+                frame_ids = metadata.frame_ids[b, h]
+                if selected.numel() == 0:
+                    count = 0
+                else:
+                    count = int(torch.isin(frame_ids, selected).sum().item())
+                counts.append(count)
+                for frame_id in selected_frame_ids:
+                    per_frame.setdefault(int(frame_id), []).append(
+                        int((frame_ids == int(frame_id)).sum().item())
+                    )
+        if not counts:
+            return int(k_cache.shape[2]), "none", "none"
+        counts_tensor = torch.tensor(counts, dtype=torch.float32)
+        per_frame_parts = []
+        for frame_id in selected_frame_ids:
+            values = per_frame.get(int(frame_id), [])
+            if not values:
+                per_frame_parts.append(f"{int(frame_id)}:0/0.0/0")
+                continue
+            values_tensor = torch.tensor(values, dtype=torch.float32)
+            per_frame_parts.append(
+                f"{int(frame_id)}:"
+                f"{int(values_tensor.min().item())}/"
+                f"{float(values_tensor.mean().item()):.1f}/"
+                f"{int(values_tensor.max().item())}"
+            )
+        return int(k_cache.shape[2]), (
+            f"min/mean/max={int(counts_tensor.min().item())}/"
+            f"{float(counts_tensor.mean().item()):.1f}/"
+            f"{int(counts_tensor.max().item())}"
+        ), "{" + ", ".join(per_frame_parts) + "}"
+    return 0, "none", "none"

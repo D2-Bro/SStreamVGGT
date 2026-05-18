@@ -1,0 +1,89 @@
+7scenes-chess/seq-03     | ATE: 0.03376, RPE trans: 0.01130, RPE rot: 0.33980
+0.03376
+0.01130
+0.33980
+7scenes-chess/seq-03     | ATE: 0.04747, RPE trans: 0.01388, RPE rot: 0.34956
+0.04747
+0.01388
+0.34956
+7scenes-chess/seq-05     | ATE: 0.05097, RPE trans: 0.01205, RPE rot: 0.33833
+0.05097
+0.01205
+0.33833
+7scenes-fire/seq-03      | ATE: 0.03850, RPE trans: 0.01548, RPE rot: 0.31156
+0.03850
+0.01548
+0.31156
+7scenes-fire/seq-04      | ATE: 0.03977, RPE trans: 0.01172, RPE rot: 0.39741
+0.03977
+0.01172
+0.39741
+7scenes-heads/seq-01     | ATE: 0.08223, RPE trans: 0.02406, RPE rot: 1.34018
+0.08223
+0.02406
+1.34018
+7scenes-office/seq-02    | ATE: 0.07027, RPE trans: 0.01094, RPE rot: 0.24652
+0.07027
+0.01094
+0.24652
+7scenes-office/seq-02    | ATE: 0.40083, RPE trans: 0.08299, RPE rot: 4.91385
+0.40083
+0.08299
+4.91385
+7scenes-office/seq-06    | ATE: 0.09306, RPE trans: 0.02657, RPE rot: 0.79468
+0.09306
+0.02657
+0.79468
+7scenes-office/seq-07    | ATE: 0.23552, RPE trans: 0.09492, RPE rot: 2.11436
+0.23552
+0.09492
+2.11436
+7scenes-office/seq-09    | ATE: 0.42955, RPE trans: 0.13654, RPE rot: 13.16092
+0.42955
+0.13654
+13.16092
+7scenes-pumpkin/seq-01   | ATE: 0.14837, RPE trans: 0.01915, RPE rot: 0.27462
+0.14837
+0.01915
+0.27462
+7scenes-pumpkin/seq-07   | ATE: 0.11007, RPE trans: 0.01616, RPE rot: 0.41870
+0.11007
+0.01616
+0.41870
+7scenes-pumpkin/seq-07   | ATE: 0.09971, RPE trans: 0.02046, RPE rot: 0.50383
+0.09971
+0.02046
+0.50383
+7scenes-redkitchen/seq-03 | ATE: 0.11275, RPE trans: 0.02291, RPE rot: 0.44815
+0.11275
+0.02291
+0.44815
+7scenes-redkitchen/seq-04 | ATE: 0.04286, RPE trans: 0.02828, RPE rot: 0.34613
+0.04286
+0.02828
+0.34613
+7scenes-redkitchen/seq-06 | ATE: 0.10418, RPE trans: 0.01820, RPE rot: 0.37464
+0.10418
+0.01820
+0.37464
+7scenes-redkitchen/seq-12 | ATE: 0.10663, RPE trans: 0.02575, RPE rot: 0.69431
+0.10663
+0.02575
+0.69431
+7scenes-redkitchen/seq-12 | ATE: 0.15439, RPE trans: 0.03253, RPE rot: 0.60461
+0.15439
+0.03253
+0.60461
+7scenes-redkitchen/seq-14 | ATE: 0.09387, RPE trans: 0.01591, RPE rot: 0.42023
+0.09387
+0.01591
+0.42023
+7scenes-stairs/seq-01    | ATE: 0.47133, RPE trans: 0.11884, RPE rot: 0.91064
+0.47133
+0.11884
+0.91064
+7scenes-stairs/seq-04    | ATE: 0.04334, RPE trans: 0.01989, RPE rot: 0.44838
+0.04334
+0.01989
+0.44838
+Average ATE: 0.14937, Average RPE trans: 0.03969, Average RPE rot: 1.55845

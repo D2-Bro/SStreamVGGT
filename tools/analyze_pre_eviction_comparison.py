@@ -199,6 +199,102 @@ def evicted_key_coverage_metrics(
     }
 
 
+def evicted_set_normalized_distance_metrics(
+    keys: torch.Tensor,
+    evicted: torch.Tensor,
+    retained_mask: torch.Tensor,
+    *,
+    k: int,
+    chunk_size: int,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    """Compare pre/post key-space distances using only the evicted set scale."""
+    metric_names = (
+        "key64_evicted_pre_knn_dist_mean",
+        "key64_evicted_pre_knn_dist_median",
+        "key64_evicted_pre_knn_dist_p95",
+        "key64_evicted_post_nn_dist_mean",
+        "key64_evicted_post_nn_dist_median",
+        "key64_evicted_post_nn_dist_p95",
+        "key64_evicted_post_knn_dist_mean",
+        "key64_evicted_post_knn_dist_median",
+        "key64_evicted_post_knn_dist_p95",
+        "key64_evicted_norm_post_nn_by_pre_mean",
+        "key64_evicted_norm_post_knn_by_pre_mean",
+        "key64_evicted_norm_gap_nn_by_pre_mean",
+        "key64_evicted_norm_gap_knn_by_pre_mean",
+        "key64_evicted_norm_post_nn_by_pre_median",
+        "key64_evicted_norm_post_knn_by_pre_median",
+        "key64_evicted_norm_gap_nn_by_pre_median",
+        "key64_evicted_norm_gap_knn_by_pre_median",
+    )
+    if evicted.numel() == 0:
+        return {name: float("nan") for name in metric_names}
+
+    retained_count = int(retained_mask.sum().item())
+    if retained_count == 0:
+        return {name: float("nan") for name in metric_names}
+
+    keys_norm = F.normalize(keys.float(), dim=-1)
+    evicted = evicted.long()
+    retained = keys_norm[retained_mask]
+    all_t = keys_norm.T.contiguous()
+    retained_t = retained.T.contiguous()
+    pre_k = max(1, min(int(k), keys_norm.shape[0] - 1))
+    post_k = max(1, min(int(k), retained_count))
+    chunk = max(1, int(chunk_size))
+
+    pre_distances = []
+    post_nn_distances = []
+    post_knn_distances = []
+    for start in range(0, evicted.numel(), chunk):
+        idx = evicted[start : start + chunk]
+        q = keys_norm[idx]
+
+        sim_all = q @ all_t
+        sim_all[torch.arange(idx.numel()), idx] = -float("inf")
+        pre_topk = torch.topk(sim_all, k=pre_k, dim=1).values
+        pre_distances.append((1.0 - pre_topk).clamp_min(0.0).mean(dim=1))
+
+        sim_retained = q @ retained_t
+        post_nn_distances.append((1.0 - sim_retained.max(dim=1).values).clamp_min(0.0))
+        post_topk = torch.topk(sim_retained, k=post_k, dim=1).values
+        post_knn_distances.append((1.0 - post_topk).clamp_min(0.0).mean(dim=1))
+
+    pre = torch.cat(pre_distances).float()
+    post_nn = torch.cat(post_nn_distances).float()
+    post_knn = torch.cat(post_knn_distances).float()
+
+    pre_mean = pre.mean()
+    pre_median = torch.quantile(pre, 0.50)
+    pre_mean_scale = pre_mean.clamp_min(float(eps))
+    pre_median_scale = pre_median.clamp_min(float(eps))
+    post_nn_mean = post_nn.mean()
+    post_knn_mean = post_knn.mean()
+    gap_nn_mean = (post_nn - pre).mean()
+    gap_knn_mean = (post_knn - pre).mean()
+
+    return {
+        "key64_evicted_pre_knn_dist_mean": float(pre_mean.item()),
+        "key64_evicted_pre_knn_dist_median": float(pre_median.item()),
+        "key64_evicted_pre_knn_dist_p95": float(torch.quantile(pre, 0.95).item()),
+        "key64_evicted_post_nn_dist_mean": float(post_nn_mean.item()),
+        "key64_evicted_post_nn_dist_median": float(torch.quantile(post_nn, 0.50).item()),
+        "key64_evicted_post_nn_dist_p95": float(torch.quantile(post_nn, 0.95).item()),
+        "key64_evicted_post_knn_dist_mean": float(post_knn_mean.item()),
+        "key64_evicted_post_knn_dist_median": float(torch.quantile(post_knn, 0.50).item()),
+        "key64_evicted_post_knn_dist_p95": float(torch.quantile(post_knn, 0.95).item()),
+        "key64_evicted_norm_post_nn_by_pre_mean": float((post_nn_mean / pre_mean_scale).item()),
+        "key64_evicted_norm_post_knn_by_pre_mean": float((post_knn_mean / pre_mean_scale).item()),
+        "key64_evicted_norm_gap_nn_by_pre_mean": float((gap_nn_mean / pre_mean_scale).item()),
+        "key64_evicted_norm_gap_knn_by_pre_mean": float((gap_knn_mean / pre_mean_scale).item()),
+        "key64_evicted_norm_post_nn_by_pre_median": float((post_nn_mean / pre_median_scale).item()),
+        "key64_evicted_norm_post_knn_by_pre_median": float((post_knn_mean / pre_median_scale).item()),
+        "key64_evicted_norm_gap_nn_by_pre_median": float((gap_nn_mean / pre_median_scale).item()),
+        "key64_evicted_norm_gap_knn_by_pre_median": float((gap_knn_mean / pre_median_scale).item()),
+    }
+
+
 def effective_rank(keys: torch.Tensor) -> float:
     """Effective rank ``exp(H(p))`` where ``p_i = S_i^2 / sum_j S_j^2``."""
     if keys.shape[0] <= 1:
@@ -398,6 +494,13 @@ def analyze_policy(
         retained_mask,
         cosine_threshold=args.key_uncovered_cosine_threshold,
     )
+    key64_evicted_normalized = evicted_set_normalized_distance_metrics(
+        keys,
+        evicted,
+        retained_mask,
+        k=args.evicted_set_norm_k,
+        chunk_size=args.coverage_chunk_size,
+    )
     eff_before = effective_rank(keys)
     eff_after = effective_rank(keys[retained_mask])
     evicted_top_density_fraction = float((evicted_mask & top_density).sum().item() / max(evicted_mask.sum().item(), 1))
@@ -412,6 +515,7 @@ def analyze_policy(
         "clusters": int(args.clusters),
         "bins": int(args.bins),
         "knn_k": int(args.knn_k),
+        "evicted_set_norm_k": int(args.evicted_set_norm_k),
         "num_evicted": int(evicted.numel()),
         "num_retained": int(retained_mask.sum().item()),
         "cluster_occupancy_distortion": cluster_distortion,
@@ -429,6 +533,7 @@ def analyze_policy(
         **cov,
         **key64_holes,
         **key64_evicted_coverage,
+        **key64_evicted_normalized,
     }
 
     with (policy_dir / "metrics.json").open("w", encoding="utf-8") as f:
@@ -515,6 +620,13 @@ def analyze_comparison(path: Path, args: argparse.Namespace, out_dir: Path) -> t
         "key64_cluster_p05_region_survival",
         "key64_evicted_nearest_retained_cosine_p05",
         "key64_uncovered_evicted_fraction",
+        "key64_evicted_pre_knn_dist_mean",
+        "key64_evicted_post_nn_dist_mean",
+        "key64_evicted_post_knn_dist_mean",
+        "key64_evicted_norm_post_nn_by_pre_mean",
+        "key64_evicted_norm_post_knn_by_pre_mean",
+        "key64_evicted_norm_gap_nn_by_pre_mean",
+        "key64_evicted_norm_gap_knn_by_pre_mean",
         "evicted_top_density_fraction",
         "effective_rank_drop",
         "nearest_retained_cosine",
@@ -649,6 +761,18 @@ def write_outputs(policy_results: list[dict[str, Any]], deltas: list[dict[str, A
         out_dir / "key64_evicted_nearest_cosine_p05_boxplot.png",
         "64D-key evicted nearest-retained cosine p05",
     )
+    plot_policy_boxplot(
+        policy_results,
+        "key64_evicted_norm_post_nn_by_pre_mean",
+        out_dir / "key64_evicted_norm_post_nn_boxplot.png",
+        "64D-key evicted post-NN / evicted pre-kNN",
+    )
+    plot_policy_boxplot(
+        policy_results,
+        "key64_evicted_norm_gap_nn_by_pre_mean",
+        out_dir / "key64_evicted_norm_gap_nn_boxplot.png",
+        "64D-key evicted normalized NN gap",
+    )
     plot_delta_boxplot(
         deltas,
         "cluster_occupancy_distortion_svd_minus_mean",
@@ -677,6 +801,18 @@ def main() -> None:
     parser.add_argument("--clusters", type=int, default=12, help="Number of projected-space k-means clusters")
     parser.add_argument("--bins", type=int, default=8, help="Number of bins per PC axis")
     parser.add_argument("--knn_k", type=int, default=16, help="k for local kNN density")
+    parser.add_argument(
+        "--evicted_set_norm_k",
+        type=int,
+        default=3,
+        help="k for evicted-set pre/post normalized key-space distance metrics",
+    )
+    parser.add_argument(
+        "--coverage_chunk_size",
+        type=int,
+        default=512,
+        help="Chunk size for evicted-token key-space coverage distance computations",
+    )
     parser.add_argument("--top_density_quantile", type=float, default=0.75, help="Quantile for top-density tokens")
     parser.add_argument("--key_clusters", type=int, default=64, help="Number of normalized 64D-key clusters for local hole metrics")
     parser.add_argument(

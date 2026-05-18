@@ -90,6 +90,9 @@ class Block(nn.Module):
         leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config=None,
+        voxel_covis_frame_ids=None,
+        voxel_covis_enabled: bool = False,
+        voxel_covis_fallback_recent: int = 0,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             
         def attn_residual_func(
@@ -121,6 +124,9 @@ class Block(nn.Module):
                     leverage_head_mean_dim=leverage_head_mean_dim,
                     eviction_protect_recent_frames=eviction_protect_recent_frames,
                     recent_merge_config=recent_merge_config,
+                    voxel_covis_frame_ids=voxel_covis_frame_ids,
+                    voxel_covis_enabled=voxel_covis_enabled,
+                    voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                 )
                 return self.ls1(output), new_kv, scores
             else:

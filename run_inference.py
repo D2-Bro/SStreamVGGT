@@ -17,6 +17,7 @@ from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from streamvggt.utils.geometry import FrameDiskCache
 from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
 from streamvggt.layers.recent_merge import RecentMergeConfig
+from streamvggt.layers.voxel_covis import VoxelCovisConfig
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
@@ -122,6 +123,27 @@ def run_inference(args: argparse.Namespace):
             f"got {args.eviction_protect_recent_frames}."
         )
         return
+    if args.voxel_size <= 0:
+        print(f"Error: --voxel_size must be > 0, got {args.voxel_size}.")
+        return
+    if args.covis_min_shared_voxels < 0:
+        print(
+            "Error: --covis_min_shared_voxels must be >= 0, "
+            f"got {args.covis_min_shared_voxels}."
+        )
+        return
+    if not (0.0 <= args.covis_min_overlap <= 1.0):
+        print(
+            "Error: --covis_min_overlap must be in [0, 1], "
+            f"got {args.covis_min_overlap}."
+        )
+        return
+    if args.covis_fallback_recent < 0:
+        print(
+            "Error: --covis_fallback_recent must be >= 0, "
+            f"got {args.covis_fallback_recent}."
+        )
+        return
     try:
         global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
     except ValueError as exc:
@@ -161,6 +183,24 @@ def run_inference(args: argparse.Namespace):
             f"window={recent_merge_config.window}, "
             f"threshold={recent_merge_config.similarity_threshold}, "
             f"voxel_size={recent_merge_config.voxel_size}"
+        )
+    voxel_covis_config = VoxelCovisConfig(
+        enabled=args.use_voxel_covis,
+        voxel_size=args.voxel_size,
+        min_shared_voxels=args.covis_min_shared_voxels,
+        min_overlap=args.covis_min_overlap,
+        max_covis_frames=args.max_covis_frames,
+        fallback_recent=args.covis_fallback_recent,
+        debug=args.covis_debug_log,
+    )
+    if voxel_covis_config.enabled:
+        print(
+            "Voxel covisibility KV filtering enabled: "
+            f"voxel_size={voxel_covis_config.voxel_size}, "
+            f"min_shared={voxel_covis_config.min_shared_voxels}, "
+            f"min_overlap={voxel_covis_config.min_overlap}, "
+            f"max_frames={voxel_covis_config.max_covis_frames}, "
+            f"fallback_recent={voxel_covis_config.fallback_recent}"
         )
     if global_attn_idx_ranges is not None:
         print(f"Global attention index ranges enabled: {global_attn_idx_ranges}")
@@ -242,6 +282,7 @@ def run_inference(args: argparse.Namespace):
                 leverage_feature=args.leverage_feature,
                 eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                 recent_merge_config=recent_merge_config,
+                voxel_covis_config=voxel_covis_config,
                 global_attn_idx_ranges=global_attn_idx_ranges,
                 global_attn_debug=args.global_attn_debug,
             )
@@ -564,6 +605,53 @@ if __name__ == "__main__":
         type=int,
         default=1024,
         help="Maximum source tokens sampled per layer/head for recent merge recall diagnostics",
+    )
+    parser.add_argument(
+        "--use_voxel_covis",
+        "--use-voxel-covis",
+        action="store_true",
+        help="Enable read-only voxel covisibility filtering for streaming KV cache reads",
+    )
+    parser.add_argument(
+        "--voxel_size",
+        "--voxel-size",
+        type=float,
+        default=0.05,
+        help="Voxel size in world units for covisibility frame selection",
+    )
+    parser.add_argument(
+        "--covis_min_shared_voxels",
+        "--covis-min-shared-voxels",
+        type=int,
+        default=20,
+        help="Minimum shared voxels required for a covisible frame",
+    )
+    parser.add_argument(
+        "--covis_min_overlap",
+        "--covis-min-overlap",
+        type=float,
+        default=0.05,
+        help="Minimum shared/min voxel overlap required for a covisible frame",
+    )
+    parser.add_argument(
+        "--max_covis_frames",
+        "--max-covis-frames",
+        type=int,
+        default=8,
+        help="Maximum number of covisible previous frames to read from KV cache; <=0 disables the cap",
+    )
+    parser.add_argument(
+        "--covis_fallback_recent",
+        "--covis-fallback-recent",
+        type=int,
+        default=1,
+        help="Fallback recent frames when covisibility selection is empty",
+    )
+    parser.add_argument(
+        "--covis_debug_log",
+        "--covis-debug-log",
+        action="store_true",
+        help="Print per-frame voxel covisibility KV filtering diagnostics",
     )
     parser.add_argument(
         "--global_attn_idx_ranges",

@@ -559,6 +559,7 @@ class NRGBD(BaseStereoViewDataset):
         rebuttal=False,
         shuffle_seed=-1,
         kf_every=1,
+        max_frames=None,
         *args,
         ROOT,
         **kwargs,
@@ -576,6 +577,7 @@ class NRGBD(BaseStereoViewDataset):
         self.seq_id = seq_id
         self.rebuttal = rebuttal
         self.shuffle_seed = shuffle_seed
+        self.max_frames = max_frames
 
         # load all scenes
         self.load_all_tuples(tuple_list)
@@ -643,6 +645,7 @@ class NRGBD(BaseStereoViewDataset):
             num_files = len(os.listdir(os.path.join(self.ROOT, scene_id, "images")))
             img_idxs = [f"{i}" for i in range(num_files)]
             img_idxs = img_idxs[:: min(self.kf_every, len(img_idxs) // 2)]
+            img_idxs = img_idxs[: self.max_frames]
 
         fx, fy, cx, cy = 554.2562584220408, 554.2562584220408, 320, 240
         intrinsics_ = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)

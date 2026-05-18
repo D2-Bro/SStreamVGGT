@@ -212,6 +212,9 @@ class Aggregator(nn.Module):
         leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
+        voxel_covis_frame_ids: Optional[List[int]] = None,
+        voxel_covis_enabled: bool = False,
+        voxel_covis_fallback_recent: int = 0,
         global_attn_idx_ranges: Optional[Union[str, List[GlobalAttnIdxRange]]] = None,
         global_attn_debug: bool = False,
     ) -> Tuple[List[torch.Tensor], int]:
@@ -350,6 +353,9 @@ class Aggregator(nn.Module):
                             leverage_head_mean_dim=leverage_head_mean_dim,
                             eviction_protect_recent_frames=eviction_protect_recent_frames,
                             recent_merge_config=recent_merge_config,
+                            voxel_covis_frame_ids=voxel_covis_frame_ids,
+                            voxel_covis_enabled=voxel_covis_enabled,
+                            voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                             global_attn_debug=global_attn_debug,
                         )
                     elif use_cache:
@@ -372,6 +378,9 @@ class Aggregator(nn.Module):
                             leverage_head_mean_dim=leverage_head_mean_dim,
                             eviction_protect_recent_frames=eviction_protect_recent_frames,
                             recent_merge_config=recent_merge_config,
+                            voxel_covis_frame_ids=voxel_covis_frame_ids,
+                            voxel_covis_enabled=voxel_covis_enabled,
+                            voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                         )
                         past_key_values[global_idx - 1] = new_kv
                         if current_scores is not None: # pruning happened
@@ -496,6 +505,9 @@ class Aggregator(nn.Module):
         leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
+        voxel_covis_frame_ids: Optional[List[int]] = None,
+        voxel_covis_enabled: bool = False,
+        voxel_covis_fallback_recent: int = 0,
         global_attn_debug: bool = False,
     ):
         intermediates = []
@@ -536,6 +548,9 @@ class Aggregator(nn.Module):
                         leverage_head_mean_dim=leverage_head_mean_dim,
                         eviction_protect_recent_frames=eviction_protect_recent_frames,
                         recent_merge_config=recent_merge_config,
+                        voxel_covis_frame_ids=voxel_covis_frame_ids,
+                        voxel_covis_enabled=voxel_covis_enabled,
+                        voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                         block_count=1,
                     )
                     kv_write = True
@@ -600,6 +615,9 @@ class Aggregator(nn.Module):
         leverage_head_mean_dim: int = 1,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
+        voxel_covis_frame_ids: Optional[List[int]] = None,
+        voxel_covis_enabled: bool = False,
+        voxel_covis_fallback_recent: int = 0,
         block_count: Optional[int] = None,
     ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
         """
@@ -649,6 +667,9 @@ class Aggregator(nn.Module):
                     leverage_head_mean_dim=leverage_head_mean_dim,
                     eviction_protect_recent_frames=eviction_protect_recent_frames,
                     recent_merge_config=recent_merge_config,
+                    voxel_covis_frame_ids=voxel_covis_frame_ids,
+                    voxel_covis_enabled=voxel_covis_enabled,
+                    voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                 )
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)

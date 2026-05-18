@@ -20,6 +20,39 @@ import uuid
 import json
 from collections import defaultdict
 from streamvggt.layers.recent_merge import RecentMergeConfig
+from streamvggt.layers.voxel_covis import VoxelCovisConfig
+
+
+def wait_for_rank_logs(
+    save_path, dataset_name, num_processes, min_mtime, timeout_s=6000, poll_s=2
+):
+    done_dir = osp.join(save_path, ".rank_done")
+    os.makedirs(done_dir, exist_ok=True)
+
+    deadline = time.time() + timeout_s
+    pending = set(range(num_processes))
+    while pending and time.time() < deadline:
+        for rank in list(pending):
+            marker = osp.join(done_dir, f"rank_{rank}.json")
+            if not osp.exists(marker):
+                continue
+            try:
+                if osp.getmtime(marker) < min_mtime:
+                    continue
+                with open(marker, "r") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("dataset") == dataset_name and data.get("rank") == rank:
+                pending.remove(rank)
+        if pending:
+            time.sleep(poll_s)
+
+    if pending:
+        raise TimeoutError(
+            f"Timed out waiting for rank log completion markers in {save_path}: "
+            f"missing ranks {sorted(pending)}"
+        )
 
 
 def resolve_global_attn_idx_ranges(args):
@@ -190,6 +223,46 @@ def get_args_parser():
         help="Maximum source tokens sampled per layer/head for recent merge recall diagnostics",
     )
     parser.add_argument(
+        "--use_voxel_covis",
+        action="store_true",
+        help="Enable read-only voxel covisibility filtering for streaming KV cache reads",
+    )
+    parser.add_argument(
+        "--voxel_size",
+        type=float,
+        default=0.05,
+        help="Voxel size in world units for covisibility frame selection",
+    )
+    parser.add_argument(
+        "--covis_min_shared_voxels",
+        type=int,
+        default=20,
+        help="Minimum shared voxels required for a covisible frame",
+    )
+    parser.add_argument(
+        "--covis_min_overlap",
+        type=float,
+        default=0.05,
+        help="Minimum shared/min voxel overlap required for a covisible frame",
+    )
+    parser.add_argument(
+        "--max_covis_frames",
+        type=int,
+        default=8,
+        help="Maximum number of covisible previous frames to read from KV cache; <=0 disables the cap",
+    )
+    parser.add_argument(
+        "--covis_fallback_recent",
+        type=int,
+        default=1,
+        help="Fallback recent frames when covisibility selection is empty",
+    )
+    parser.add_argument(
+        "--covis_debug_log",
+        action="store_true",
+        help="Print per-frame voxel covisibility KV filtering diagnostics",
+    )
+    parser.add_argument(
         "--global_attn_idx_ranges",
         "--global-attn-idx-ranges",
         type=str,
@@ -270,6 +343,23 @@ def main(args):
             "Error: --merge_recall_debug_max_tokens must be >= 1, "
             f"got {args.merge_recall_debug_max_tokens}."
         )
+    if args.voxel_size <= 0:
+        raise SystemExit(f"Error: --voxel_size must be > 0, got {args.voxel_size}.")
+    if args.covis_min_shared_voxels < 0:
+        raise SystemExit(
+            "Error: --covis_min_shared_voxels must be >= 0, "
+            f"got {args.covis_min_shared_voxels}."
+        )
+    if not (0.0 <= args.covis_min_overlap <= 1.0):
+        raise SystemExit(
+            "Error: --covis_min_overlap must be in [0, 1], "
+            f"got {args.covis_min_overlap}."
+        )
+    if args.covis_fallback_recent < 0:
+        raise SystemExit(
+            "Error: --covis_fallback_recent must be >= 0, "
+            f"got {args.covis_fallback_recent}."
+        )
 
     add_path_to_dust3r(args.weights)
     from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D
@@ -285,34 +375,43 @@ def main(args):
     else:
         raise NotImplementedError
     datasets_all = {
-        "7scenes": SevenScenes(
+        # "7scenes": SevenScenes(
+        #     split="test",
+        #     ROOT="/home/dongjae/data/7scenes_sfm",
+        #     # ROOT="/data2/dongjae/datasets/7scenes_sfm",
+        #     resolution=resolution,
+        #     num_seq=1,
+        #     full_video=True,
+        #     kf_every=2,
+        #     max_frames=args.max_frames,
+        # ),
+        # "ETH3D": ETH3D
+            # 20),
+        "NRGBD": NRGBD(
             split="test",
-            ROOT="/home/dongjae/data/7scenes_sfm",
-            # ROOT="/data2/dongjae/datasets/7scenes_sfm",
+            ROOT="/home/dongjae/data/neural_rgbd_data",
             resolution=resolution,
             num_seq=1,
             full_video=True,
             kf_every=2,
             max_frames=args.max_frames,
         ),
-        # "ETH3D": ETH3D
-            # 20),
-        # "NRGBD": NRGBD(
-        #     split="test",
-        #     ROOT="/home/ma-user/work/dataset/3D_Reconstruction/neural_rgbd_data",
-        #     resolution=resolution,
-        #     num_seq=1,
-        #     full_video=True,
-        #     kf_every=500,
-        # ),
     }
 
     accelerator = Accelerator(
         kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(seconds=6000))]
     )
+    run_started_at = time.time()
     device = accelerator.device
     if device.type == "cuda":
-        torch.cuda.set_device(device)
+        device_index = device.index
+        if device_index is None:
+            device_index = accelerator.local_process_index
+            if device_index >= torch.cuda.device_count():
+                device_index = 0
+            device = torch.device("cuda", device_index)
+
+        torch.cuda.set_device(device_index)
     model_name = args.model_name
     if model_name == "StreamVGGT":
         # from streamvggt.models.streamvggt import StreamVGGT
@@ -455,6 +554,20 @@ def main(args):
                                     recall_debug=args.merge_recall_debug,
                                     recall_debug_max_tokens=args.merge_recall_debug_max_tokens,
                                 )
+                                voxel_covis_config = VoxelCovisConfig(
+                                    enabled=args.use_voxel_covis,
+                                    voxel_size=args.voxel_size,
+                                    min_shared_voxels=args.covis_min_shared_voxels,
+                                    min_overlap=args.covis_min_overlap,
+                                    max_covis_frames=args.max_covis_frames,
+                                    fallback_recent=args.covis_fallback_recent,
+                                    debug=args.covis_debug_log,
+                                )
+                                covis_log_fn = None
+                                if args.covis_debug_log:
+                                    def covis_log_fn(msg):
+                                        print(msg)
+
                                 results = model.inference(
                                     batch,
                                     eviction_policy=args.eviction_policy,
@@ -465,6 +578,8 @@ def main(args):
                                     leverage_head_mean_dim=args.leverage_head_mean_dim,
                                     eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                                     recent_merge_config=recent_merge_config,
+                                    voxel_covis_config=voxel_covis_config,
+                                    covis_log_fn=covis_log_fn,
                                     global_attn_idx_ranges=global_attn_idx_ranges,
                                     global_attn_debug=args.global_attn_debug,
                                 )
@@ -705,7 +820,26 @@ def main(args):
                     # release cuda memory
                     torch.cuda.empty_cache()
 
-            accelerator.wait_for_everyone()
+            done_dir = osp.join(save_path, ".rank_done")
+            os.makedirs(done_dir, exist_ok=True)
+            with open(
+                osp.join(done_dir, f"rank_{accelerator.process_index}.json"), "w"
+            ) as f_done:
+                json.dump(
+                    {"dataset": name_data, "rank": accelerator.process_index}, f_done
+                )
+
+            # The eval loop only needs synchronization before log aggregation. Avoid
+            # a late NCCL barrier here because this script does not use DDP collectives,
+            # and initializing NCCL at shutdown can timeout if one rank exits early.
+            if accelerator.is_main_process:
+                wait_for_rank_logs(
+                    save_path,
+                    name_data,
+                    accelerator.num_processes,
+                    min_mtime=run_started_at,
+                    timeout_s=6000,
+                )
             # Get depth from pcd and run TSDFusion
             if accelerator.is_main_process:
                 to_write = ""
