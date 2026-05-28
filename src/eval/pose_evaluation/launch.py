@@ -15,6 +15,7 @@ from eval.pose_evaluation.utils import *
 from accelerate import PartialState
 from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.layers.recent_merge import RecentMergeConfig
+from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig
 
 from tqdm import tqdm
@@ -61,6 +62,20 @@ def validate_streamvggt_args(args):
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
+    if args.svd_eviction_merge_candidate_axes < 1:
+        raise SystemExit("Error: --svd_eviction_merge_candidate_axes must be >= 1.")
+    if args.svd_eviction_merge_reps_per_axis < 1:
+        raise SystemExit("Error: --svd_eviction_merge_reps_per_axis must be >= 1.")
+    if not (0.0 <= args.svd_eviction_merge_similarity_threshold <= 1.0):
+        raise SystemExit("Error: --svd_eviction_merge_similarity_threshold must be in [0, 1].")
+    if args.svd_eviction_merge_voxel_neighbor_radius < 0:
+        raise SystemExit("Error: --svd_eviction_merge_voxel_neighbor_radius must be >= 0.")
+    if not (0.0 <= args.svd_eviction_merge_ema_decay <= 1.0):
+        raise SystemExit("Error: --svd_eviction_merge_ema_decay must be in [0, 1].")
+    if args.svd_eviction_merge_max_candidates_per_token < 1:
+        raise SystemExit("Error: --svd_eviction_merge_max_candidates_per_token must be >= 1.")
+    if args.svd_eviction_merge_chunk_size < 1:
+        raise SystemExit("Error: --svd_eviction_merge_chunk_size must be >= 1.")
     if args.merge_window < 1:
         raise SystemExit(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
     if not (0.0 <= args.merge_similarity_threshold <= 1.0):
@@ -188,6 +203,51 @@ def get_args_parser():
             "including them in SVD leverage computation."
         ),
     )
+    parser.add_argument(
+        "--enable_svd_eviction_merge",
+        "--enable-svd-eviction-merge",
+        action="store_true",
+        help="Enable feature-first SVD-guided merge for tokens selected by svd_leverage eviction",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_mode",
+        "--svd-eviction-merge-mode",
+        choices=("head", "layer_candidates", "layer"),
+        default="head",
+    )
+    parser.add_argument("--svd_eviction_merge_candidate_axes", "--svd-eviction-merge-candidate-axes", type=int, default=2)
+    parser.add_argument("--svd_eviction_merge_reps_per_axis", "--svd-eviction-merge-reps-per-axis", type=int, default=8)
+    parser.add_argument("--svd_eviction_merge_similarity_threshold", "--svd-eviction-merge-similarity-threshold", type=float, default=0.9)
+    parser.add_argument(
+        "--svd_eviction_merge_use_u_sigma",
+        "--svd-eviction-merge-use-u-sigma",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_geometry_gate",
+        "--svd-eviction-merge-geometry-gate",
+        choices=("none", "voxel_neighbor"),
+        default="voxel_neighbor",
+    )
+    parser.add_argument("--svd_eviction_merge_voxel_neighbor_radius", "--svd-eviction-merge-voxel-neighbor-radius", type=int, default=1)
+    parser.add_argument(
+        "--svd_eviction_merge_allow_missing_geometry",
+        "--svd-eviction-merge-allow-missing-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--svd_eviction_merge_ema_decay", "--svd-eviction-merge-ema-decay", type=float, default=0.5)
+    parser.add_argument(
+        "--svd_eviction_merge_use_depth_confidence",
+        "--svd-eviction-merge-use-depth-confidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--svd_eviction_merge_max_candidates_per_token", "--svd-eviction-merge-max-candidates-per-token", type=int, default=32)
+    parser.add_argument("--svd_eviction_merge_chunk_size", "--svd-eviction-merge-chunk-size", type=int, default=512)
+    parser.add_argument("--svd_eviction_merge_debug", "--svd-eviction-merge-debug", action="store_true")
+    parser.add_argument("--svd_eviction_merge_profile", "--svd-eviction-merge-profile", action="store_true")
     parser.add_argument(
         "--enable_recent_merge",
         action="store_true",
@@ -477,6 +537,23 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             recall_debug=args.merge_recall_debug,
                             recall_debug_max_tokens=args.merge_recall_debug_max_tokens,
                         )
+                        svd_eviction_merge_config = SvdEvictionMergeConfig(
+                            enabled=args.enable_svd_eviction_merge,
+                            mode=args.svd_eviction_merge_mode,
+                            candidate_axes=args.svd_eviction_merge_candidate_axes,
+                            reps_per_axis=args.svd_eviction_merge_reps_per_axis,
+                            similarity_threshold=args.svd_eviction_merge_similarity_threshold,
+                            use_u_sigma=args.svd_eviction_merge_use_u_sigma,
+                            geometry_gate=args.svd_eviction_merge_geometry_gate,
+                            voxel_neighbor_radius=args.svd_eviction_merge_voxel_neighbor_radius,
+                            allow_missing_geometry=args.svd_eviction_merge_allow_missing_geometry,
+                            ema_decay=args.svd_eviction_merge_ema_decay,
+                            use_depth_confidence=args.svd_eviction_merge_use_depth_confidence,
+                            max_candidates_per_token=args.svd_eviction_merge_max_candidates_per_token,
+                            chunk_size=args.svd_eviction_merge_chunk_size,
+                            debug=args.svd_eviction_merge_debug,
+                            profile=args.svd_eviction_merge_profile,
+                        )
                         voxel_covis_config = VoxelCovisConfig(
                             enabled=args.use_voxel_covis,
                             voxel_size=args.voxel_size,
@@ -496,6 +573,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_head_mean_dim=args.leverage_head_mean_dim,
                             eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                             recent_merge_config=recent_merge_config,
+                            svd_eviction_merge_config=svd_eviction_merge_config,
                             voxel_covis_config=voxel_covis_config,
                             global_attn_idx_ranges=global_attn_idx_ranges,
                             global_attn_debug=args.global_attn_debug,

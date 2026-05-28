@@ -17,6 +17,7 @@ from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from streamvggt.utils.geometry import FrameDiskCache
 from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
 from streamvggt.layers.recent_merge import RecentMergeConfig
+from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -123,6 +124,27 @@ def run_inference(args: argparse.Namespace):
             f"got {args.eviction_protect_recent_frames}."
         )
         return
+    if args.svd_eviction_merge_candidate_axes < 1:
+        print("Error: --svd_eviction_merge_candidate_axes must be >= 1.")
+        return
+    if args.svd_eviction_merge_reps_per_axis < 1:
+        print("Error: --svd_eviction_merge_reps_per_axis must be >= 1.")
+        return
+    if not (0.0 <= args.svd_eviction_merge_similarity_threshold <= 1.0):
+        print("Error: --svd_eviction_merge_similarity_threshold must be in [0, 1].")
+        return
+    if args.svd_eviction_merge_voxel_neighbor_radius < 0:
+        print("Error: --svd_eviction_merge_voxel_neighbor_radius must be >= 0.")
+        return
+    if not (0.0 <= args.svd_eviction_merge_ema_decay <= 1.0):
+        print("Error: --svd_eviction_merge_ema_decay must be in [0, 1].")
+        return
+    if args.svd_eviction_merge_max_candidates_per_token < 1:
+        print("Error: --svd_eviction_merge_max_candidates_per_token must be >= 1.")
+        return
+    if args.svd_eviction_merge_chunk_size < 1:
+        print("Error: --svd_eviction_merge_chunk_size must be >= 1.")
+        return
     if args.voxel_size <= 0:
         print(f"Error: --voxel_size must be > 0, got {args.voxel_size}.")
         return
@@ -183,6 +205,32 @@ def run_inference(args: argparse.Namespace):
             f"window={recent_merge_config.window}, "
             f"threshold={recent_merge_config.similarity_threshold}, "
             f"voxel_size={recent_merge_config.voxel_size}"
+        )
+    svd_eviction_merge_config = SvdEvictionMergeConfig(
+        enabled=args.enable_svd_eviction_merge,
+        mode=args.svd_eviction_merge_mode,
+        candidate_axes=args.svd_eviction_merge_candidate_axes,
+        reps_per_axis=args.svd_eviction_merge_reps_per_axis,
+        similarity_threshold=args.svd_eviction_merge_similarity_threshold,
+        use_u_sigma=args.svd_eviction_merge_use_u_sigma,
+        geometry_gate=args.svd_eviction_merge_geometry_gate,
+        voxel_neighbor_radius=args.svd_eviction_merge_voxel_neighbor_radius,
+        allow_missing_geometry=args.svd_eviction_merge_allow_missing_geometry,
+        ema_decay=args.svd_eviction_merge_ema_decay,
+        use_depth_confidence=args.svd_eviction_merge_use_depth_confidence,
+        max_candidates_per_token=args.svd_eviction_merge_max_candidates_per_token,
+        chunk_size=args.svd_eviction_merge_chunk_size,
+        debug=args.svd_eviction_merge_debug,
+        profile=args.svd_eviction_merge_profile,
+    )
+    if svd_eviction_merge_config.enabled:
+        print(
+            "SVD eviction merge enabled: "
+            f"mode={svd_eviction_merge_config.mode}, "
+            f"axes={svd_eviction_merge_config.candidate_axes}, "
+            f"reps_per_axis={svd_eviction_merge_config.reps_per_axis}, "
+            f"threshold={svd_eviction_merge_config.similarity_threshold}, "
+            f"geometry_gate={svd_eviction_merge_config.geometry_gate}"
         )
     voxel_covis_config = VoxelCovisConfig(
         enabled=args.use_voxel_covis,
@@ -282,6 +330,7 @@ def run_inference(args: argparse.Namespace):
                 leverage_feature=args.leverage_feature,
                 eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                 recent_merge_config=recent_merge_config,
+                svd_eviction_merge_config=svd_eviction_merge_config,
                 voxel_covis_config=voxel_covis_config,
                 global_attn_idx_ranges=global_attn_idx_ranges,
                 global_attn_debug=args.global_attn_debug,
@@ -498,6 +547,108 @@ if __name__ == "__main__":
             "Protect tokens from the most recent N processed frames from eviction while still "
             "including them in SVD leverage computation."
         ),
+    )
+    parser.add_argument(
+        "--enable_svd_eviction_merge",
+        "--enable-svd-eviction-merge",
+        action="store_true",
+        help="Enable feature-first SVD-guided merge for tokens selected by svd_leverage eviction",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_mode",
+        "--svd-eviction-merge-mode",
+        choices=("head", "layer_candidates", "layer"),
+        default="head",
+        help="SVD eviction merge mode: per-head, shared layer candidates, or shared layer merge pairs",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_candidate_axes",
+        "--svd-eviction-merge-candidate-axes",
+        type=int,
+        default=2,
+        help="Number of low-rank leverage axes used for SVD eviction merge candidate generation",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_reps_per_axis",
+        "--svd-eviction-merge-reps-per-axis",
+        type=int,
+        default=8,
+        help="Nearest retained representatives sampled per leverage axis",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_similarity_threshold",
+        "--svd-eviction-merge-similarity-threshold",
+        type=float,
+        default=0.9,
+        help="Minimum full-key cosine similarity for SVD eviction merge",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_use_u_sigma",
+        "--svd-eviction-merge-use-u-sigma",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Scale leverage coordinates by the QR diagonal proxy before candidate generation",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_geometry_gate",
+        "--svd-eviction-merge-geometry-gate",
+        choices=("none", "voxel_neighbor"),
+        default="voxel_neighbor",
+        help="Optional soft geometry gate for SVD eviction merge",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_voxel_neighbor_radius",
+        "--svd-eviction-merge-voxel-neighbor-radius",
+        type=int,
+        default=1,
+        help="Chebyshev voxel radius accepted by SVD eviction merge geometry gate",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_allow_missing_geometry",
+        "--svd-eviction-merge-allow-missing-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow feature-only SVD eviction merge when voxel metadata is unavailable",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_ema_decay",
+        "--svd-eviction-merge-ema-decay",
+        type=float,
+        default=0.5,
+        help="EMA retained-token weight when confidence weighting is disabled",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_use_depth_confidence",
+        "--svd-eviction-merge-use-depth-confidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use accumulated depth confidence to weight SVD eviction merges",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_max_candidates_per_token",
+        "--svd-eviction-merge-max-candidates-per-token",
+        type=int,
+        default=32,
+        help="Maximum retained candidates checked per evicted token",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_chunk_size",
+        "--svd-eviction-merge-chunk-size",
+        type=int,
+        default=512,
+        help="Evicted-token chunk size for SVD eviction merge",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_debug",
+        "--svd-eviction-merge-debug",
+        action="store_true",
+        help="Print per-layer SVD eviction merge diagnostics",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_profile",
+        "--svd-eviction-merge-profile",
+        action="store_true",
+        help="Print SVD eviction merge profiling timings",
     )
     parser.add_argument(
         "--enable_recent_merge",

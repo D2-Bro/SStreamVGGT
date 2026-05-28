@@ -13,7 +13,7 @@ merge_similarity_threshold='0.9'
 merge_voxel_size='0.05'
 
 
-output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${ckpt_name}_layerSVD_headmean4"
+output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_layerSVD_headmean4"
 echo "$output_dir"
 
 # --merge_candidate_mode = [spatial, voxel, voxel_spatial]

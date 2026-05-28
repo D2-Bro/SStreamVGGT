@@ -44,6 +44,69 @@ def get_args_parser():
         choices=list(dataset_metadata.keys()),
     )
     parser.add_argument("--size", type=int, default="224")
+    parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
+    parser.add_argument(
+        "--eviction_policy",
+        type=str,
+        default="mean",
+        help="Cache eviction policy",
+    )
+    parser.add_argument(
+        "--leverage_sketch_dim",
+        type=int,
+        default=0,
+        help="Right sketch dimension for svd_leverage eviction; set 0 for exact full-space QR",
+    )
+    parser.add_argument(
+        "--leverage_granularity",
+        type=str,
+        default="head",
+        choices=("head", "layer"),
+        help="Granularity for svd_leverage eviction: per-head or one shared layer-wise score vector",
+    )
+    parser.add_argument(
+        "--leverage_feature",
+        type=str,
+        default="key",
+        choices=("key", "key_value"),
+        help="Feature tensor for svd_leverage eviction: keys only or concatenated keys and values",
+    )
+    parser.add_argument(
+        "--leverage_projection",
+        type=str,
+        default="random",
+        choices=("random", "head_mean"),
+        help="Projection mode for svd_leverage eviction: random right sketch or deterministic per-head means",
+    )
+    parser.add_argument(
+        "--leverage_head_mean_dim",
+        type=int,
+        default=1,
+        help="Number of mean-pooled channel groups per head for leverage_projection='head_mean'",
+    )
+    parser.add_argument(
+        "--leverage_normalize_rows",
+        "--leverage-normalize-rows",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
+    )
+    parser.add_argument(
+        "--eviction_protect_recent_frames",
+        "--eviction-protect-recent-frames",
+        type=int,
+        default=0,
+        help=(
+            "Protect tokens from the most recent N processed frames from eviction while still "
+            "including them in SVD leverage computation."
+        ),
+    )
+    parser.add_argument(
+        "--budget",
+        type=int,
+        default=500000,
+        help="Total token budget for StreamVGGT inference",
+    )
 
     parser.add_argument(
         "--pose_eval_stride", default=1, type=int, help="stride for pose evaluation"
@@ -75,8 +138,6 @@ def eval_pose_estimation(args, model, save_dir=None):
 
 
 def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=None):
-    from dust3r.inference import loss_of_one_batch
-
     metadata = dataset_metadata.get(args.eval_dataset)
     anno_path = metadata.get("anno_path", None)
 
@@ -127,6 +188,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 ]
                 filelist.sort()
                 filelist = filelist[:: args.pose_eval_stride]
+                if args.max_frames is not None:
+                    filelist = filelist[: args.max_frames]
 
                 views = prepare_input(
                     filelist,
@@ -137,7 +200,20 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 for view in views:
                     view["img"] = (view["img"] + 1.0) / 2.0
                 start = time.time()
-                outputs = loss_of_one_batch(views, model, None, None, inference=True)
+                dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                with torch.cuda.amp.autocast(dtype=dtype):
+                    output = model.inference(
+                        views,
+                        eviction_policy=args.eviction_policy,
+                        leverage_sketch_dim=args.leverage_sketch_dim,
+                        leverage_granularity=args.leverage_granularity,
+                        leverage_feature=args.leverage_feature,
+                        leverage_projection=args.leverage_projection,
+                        leverage_head_mean_dim=args.leverage_head_mean_dim,
+                        leverage_normalize_rows=args.leverage_normalize_rows,
+                        eviction_protect_recent_frames=args.eviction_protect_recent_frames,
+                    )
+                    outputs = dict(views=output.views, pred=output.ress)
                 end = time.time()
                 # fps = len(filelist) / (end - start)
                 with torch.cuda.amp.autocast(dtype=torch.float32):
@@ -173,6 +249,30 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
+    if args.max_frames is not None and args.max_frames < 1:
+        raise SystemExit(f"Error: --max_frames must be >= 1, got {args.max_frames}.")
+    if args.leverage_head_mean_dim < 1:
+        raise SystemExit(
+            "Error: --leverage_head_mean_dim must be >= 1, "
+            f"got {args.leverage_head_mean_dim}."
+        )
+    if args.eviction_protect_recent_frames < 0:
+        raise SystemExit(
+            "Error: --eviction_protect_recent_frames must be >= 0, "
+            f"got {args.eviction_protect_recent_frames}."
+        )
+    if args.eviction_policy == "svd_leverage":
+        sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
+        print(
+            "Using SVD leverage eviction: "
+            f"sketch_dim={sketch_label}, "
+            f"granularity={args.leverage_granularity}, "
+            f"feature={args.leverage_feature}, "
+            f"projection={args.leverage_projection}, "
+            f"head_mean_dim={args.leverage_head_mean_dim}, "
+            f"normalize_rows={args.leverage_normalize_rows}, "
+            f"protect_recent_frames={args.eviction_protect_recent_frames}"
+        )
     add_path_to_dust3r(args.weights)
     from dust3r.utils.image import load_images_for_eval as load_images
     from dust3r.post_process import estimate_focal_knowing_depth
@@ -301,7 +401,7 @@ if __name__ == "__main__":
             conf_self,
         )
 
-    model = StreamVGGT()
+    model = StreamVGGT(total_budget=args.budget)
     ckpt = torch.load(args.weights, map_location=args.device)
     model.load_state_dict(ckpt, strict=True)
     model.eval()

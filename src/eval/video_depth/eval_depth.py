@@ -287,7 +287,7 @@ def main(args):
                 f.write(json.dumps(average_metrics))
 
         get_video_results()
-    elif args.eval_dataset == "kitti":
+    elif args.eval_dataset == "kitti_s1_500":
 
         def depth_read(filename):
             # loads depth map D from png file
@@ -303,7 +303,7 @@ def main(args):
             return depth
 
         depth_pathes = glob.glob(
-            "../data/eval/kitti/depth_selection/val_selection_cropped/groundtruth_depth_gathered/*/*.png"
+            "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/groundtruth_depth_gathered_500/*/*.png"
         )
         depth_pathes = sorted(depth_pathes)
         pred_pathes = glob.glob(

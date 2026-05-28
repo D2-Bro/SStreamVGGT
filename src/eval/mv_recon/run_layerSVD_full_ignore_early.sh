@@ -25,6 +25,6 @@ accelerate launch --num_processes 4 --main_process_port 29602 ./eval/mv_recon/la
     --eviction_policy "$eviction_policy" \
     --leverage_granularity layer \
     --leverage_sketch_dim 0 \
-    --global-attn-idx-ranges 9: \
+    --global-attn-idx-ranges 9:
 
     

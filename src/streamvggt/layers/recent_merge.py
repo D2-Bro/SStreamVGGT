@@ -50,6 +50,15 @@ class KVCacheMetadata:
     accumulated_confidence: torch.Tensor
     merge_counts: torch.Tensor
     last_updated_frame: torch.Tensor
+    voxel_ids: Optional[torch.Tensor] = None
+    voxel_valid: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        shape = self.frame_ids.shape
+        if self.voxel_ids is None:
+            self.voxel_ids = torch.full((*shape, 3), _INVALID_VOXEL, dtype=torch.int32)
+        if self.voxel_valid is None:
+            self.voxel_valid = torch.zeros(shape, dtype=torch.bool)
 
     @classmethod
     def for_current_frame(
@@ -67,6 +76,8 @@ class KVCacheMetadata:
             accumulated_confidence=torch.ones(shape, dtype=torch.float32),
             merge_counts=torch.zeros(shape, dtype=torch.int16),
             last_updated_frame=torch.full(shape, int(frame_id), dtype=torch.int32),
+            voxel_ids=torch.full((*shape, 3), _INVALID_VOXEL, dtype=torch.int32),
+            voxel_valid=torch.zeros(shape, dtype=torch.bool),
         )
 
     def concat(self, other: "KVCacheMetadata") -> "KVCacheMetadata":
@@ -78,6 +89,8 @@ class KVCacheMetadata:
             ),
             merge_counts=torch.cat([self.merge_counts, other.merge_counts], dim=2),
             last_updated_frame=torch.cat([self.last_updated_frame, other.last_updated_frame], dim=2),
+            voxel_ids=torch.cat([self.voxel_ids, other.voxel_ids], dim=2),
+            voxel_valid=torch.cat([self.voxel_valid, other.voxel_valid], dim=2),
         )
 
     def gather(self, indices: torch.Tensor) -> "KVCacheMetadata":
@@ -88,6 +101,12 @@ class KVCacheMetadata:
             accumulated_confidence=torch.gather(self.accumulated_confidence, 2, indices),
             merge_counts=torch.gather(self.merge_counts, 2, indices),
             last_updated_frame=torch.gather(self.last_updated_frame, 2, indices),
+            voxel_ids=torch.gather(
+                self.voxel_ids,
+                2,
+                indices.unsqueeze(-1).expand(*indices.shape, 3),
+            ),
+            voxel_valid=torch.gather(self.voxel_valid, 2, indices),
         )
 
     def prune_after_eviction(self, kept_candidate_indices: torch.Tensor, num_anchor_tokens: int) -> "KVCacheMetadata":
@@ -112,6 +131,24 @@ class KVCacheMetadata:
         values = torch.ones_like(self.accumulated_confidence)
         values[valid] = token_confidence[batch_ids[valid], token_ids[valid]]
         self.accumulated_confidence[mask] = values[mask]
+
+    def update_frame_geometry(self, frame_id: int, geom: "FrameGeometry") -> None:
+        if geom is None:
+            return
+        B, H, _ = self.frame_ids.shape
+        max_tokens = geom.valid.shape[1]
+        mask = self.frame_ids == int(frame_id)
+        if not bool(mask.any()):
+            return
+
+        batch_ids = torch.arange(B, dtype=torch.long).view(B, 1, 1).expand(B, H, self.frame_ids.shape[2])
+        token_ids = self.token_indices.long()
+        valid_rows = mask & (token_ids >= 0) & (token_ids < max_tokens)
+        if not bool(valid_rows.any()):
+            return
+
+        self.voxel_ids[valid_rows] = geom.voxel_ids[batch_ids[valid_rows], token_ids[valid_rows]]
+        self.voxel_valid[valid_rows] = geom.valid[batch_ids[valid_rows], token_ids[valid_rows]]
 
 
 @dataclass
@@ -300,6 +337,7 @@ class RecentSimilarityMerge:
         geom = self._geometry.get(int(frame_id))
         if geom is not None:
             metadata.update_frame_confidence(frame_id, geom.confidence)
+            metadata.update_frame_geometry(frame_id, geom)
 
     def merge_layer(
         self,

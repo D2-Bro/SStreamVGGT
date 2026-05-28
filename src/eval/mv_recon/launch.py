@@ -20,6 +20,7 @@ import uuid
 import json
 from collections import defaultdict
 from streamvggt.layers.recent_merge import RecentMergeConfig
+from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig
 
 
@@ -91,7 +92,7 @@ def get_args_parser():
     parser.add_argument(
         "--leverage_sketch_dim",
         type=int,
-        default=16,
+        default=0,
         help="Right sketch dimension for svd_leverage eviction; set 0 for exact full-space QR",
     )
     parser.add_argument(
@@ -122,6 +123,13 @@ def get_args_parser():
         help="Number of mean-pooled channel groups per head for leverage_projection='head_mean'",
     )
     parser.add_argument(
+        "--leverage_normalize_rows",
+        "--leverage-normalize-rows",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
+    )
+    parser.add_argument(
         "--eviction_protect_recent_frames",
         "--eviction-protect-recent-frames",
         type=int,
@@ -131,6 +139,51 @@ def get_args_parser():
             "including them in SVD leverage computation."
         ),
     )
+    parser.add_argument(
+        "--enable_svd_eviction_merge",
+        "--enable-svd-eviction-merge",
+        action="store_true",
+        help="Enable feature-first SVD-guided merge for tokens selected by svd_leverage eviction",
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_mode",
+        "--svd-eviction-merge-mode",
+        choices=("head", "layer_candidates", "layer"),
+        default="head",
+    )
+    parser.add_argument("--svd_eviction_merge_candidate_axes", "--svd-eviction-merge-candidate-axes", type=int, default=2)
+    parser.add_argument("--svd_eviction_merge_reps_per_axis", "--svd-eviction-merge-reps-per-axis", type=int, default=8)
+    parser.add_argument("--svd_eviction_merge_similarity_threshold", "--svd-eviction-merge-similarity-threshold", type=float, default=0.9)
+    parser.add_argument(
+        "--svd_eviction_merge_use_u_sigma",
+        "--svd-eviction-merge-use-u-sigma",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--svd_eviction_merge_geometry_gate",
+        "--svd-eviction-merge-geometry-gate",
+        choices=("none", "voxel_neighbor"),
+        default="voxel_neighbor",
+    )
+    parser.add_argument("--svd_eviction_merge_voxel_neighbor_radius", "--svd-eviction-merge-voxel-neighbor-radius", type=int, default=1)
+    parser.add_argument(
+        "--svd_eviction_merge_allow_missing_geometry",
+        "--svd-eviction-merge-allow-missing-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--svd_eviction_merge_ema_decay", "--svd-eviction-merge-ema-decay", type=float, default=0.5)
+    parser.add_argument(
+        "--svd_eviction_merge_use_depth_confidence",
+        "--svd-eviction-merge-use-depth-confidence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--svd_eviction_merge_max_candidates_per_token", "--svd-eviction-merge-max-candidates-per-token", type=int, default=32)
+    parser.add_argument("--svd_eviction_merge_chunk_size", "--svd-eviction-merge-chunk-size", type=int, default=512)
+    parser.add_argument("--svd_eviction_merge_debug", "--svd-eviction-merge-debug", action="store_true")
+    parser.add_argument("--svd_eviction_merge_profile", "--svd-eviction-merge-profile", action="store_true")
     parser.add_argument(
         "--enable_recent_merge",
         action="store_true",
@@ -313,8 +366,23 @@ def main(args):
             f"feature={args.leverage_feature}, "
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
+            f"normalize_rows={args.leverage_normalize_rows}, "
             f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
+    if args.svd_eviction_merge_candidate_axes < 1:
+        raise SystemExit("Error: --svd_eviction_merge_candidate_axes must be >= 1.")
+    if args.svd_eviction_merge_reps_per_axis < 1:
+        raise SystemExit("Error: --svd_eviction_merge_reps_per_axis must be >= 1.")
+    if not (0.0 <= args.svd_eviction_merge_similarity_threshold <= 1.0):
+        raise SystemExit("Error: --svd_eviction_merge_similarity_threshold must be in [0, 1].")
+    if args.svd_eviction_merge_voxel_neighbor_radius < 0:
+        raise SystemExit("Error: --svd_eviction_merge_voxel_neighbor_radius must be >= 0.")
+    if not (0.0 <= args.svd_eviction_merge_ema_decay <= 1.0):
+        raise SystemExit("Error: --svd_eviction_merge_ema_decay must be in [0, 1].")
+    if args.svd_eviction_merge_max_candidates_per_token < 1:
+        raise SystemExit("Error: --svd_eviction_merge_max_candidates_per_token must be >= 1.")
+    if args.svd_eviction_merge_chunk_size < 1:
+        raise SystemExit("Error: --svd_eviction_merge_chunk_size must be >= 1.")
     if args.merge_window < 1:
         raise SystemExit(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
     if not (0.0 <= args.merge_similarity_threshold <= 1.0):
@@ -375,16 +443,16 @@ def main(args):
     else:
         raise NotImplementedError
     datasets_all = {
-        # "7scenes": SevenScenes(
-        #     split="test",
-        #     ROOT="/home/dongjae/data/7scenes_sfm",
-        #     # ROOT="/data2/dongjae/datasets/7scenes_sfm",
-        #     resolution=resolution,
-        #     num_seq=1,
-        #     full_video=True,
-        #     kf_every=2,
-        #     max_frames=args.max_frames,
-        # ),
+        "7scenes": SevenScenes(
+            split="test",
+            ROOT="/home/dongjae/data/7scenes_sfm",
+            # ROOT="/data2/dongjae/datasets/7scenes_sfm",
+            resolution=resolution,
+            num_seq=1,
+            full_video=True,
+            kf_every=2,
+            max_frames=args.max_frames,
+        ),
         # "ETH3D": ETH3D
             # 20),
         "NRGBD": NRGBD(
@@ -554,6 +622,23 @@ def main(args):
                                     recall_debug=args.merge_recall_debug,
                                     recall_debug_max_tokens=args.merge_recall_debug_max_tokens,
                                 )
+                                svd_eviction_merge_config = SvdEvictionMergeConfig(
+                                    enabled=args.enable_svd_eviction_merge,
+                                    mode=args.svd_eviction_merge_mode,
+                                    candidate_axes=args.svd_eviction_merge_candidate_axes,
+                                    reps_per_axis=args.svd_eviction_merge_reps_per_axis,
+                                    similarity_threshold=args.svd_eviction_merge_similarity_threshold,
+                                    use_u_sigma=args.svd_eviction_merge_use_u_sigma,
+                                    geometry_gate=args.svd_eviction_merge_geometry_gate,
+                                    voxel_neighbor_radius=args.svd_eviction_merge_voxel_neighbor_radius,
+                                    allow_missing_geometry=args.svd_eviction_merge_allow_missing_geometry,
+                                    ema_decay=args.svd_eviction_merge_ema_decay,
+                                    use_depth_confidence=args.svd_eviction_merge_use_depth_confidence,
+                                    max_candidates_per_token=args.svd_eviction_merge_max_candidates_per_token,
+                                    chunk_size=args.svd_eviction_merge_chunk_size,
+                                    debug=args.svd_eviction_merge_debug,
+                                    profile=args.svd_eviction_merge_profile,
+                                )
                                 voxel_covis_config = VoxelCovisConfig(
                                     enabled=args.use_voxel_covis,
                                     voxel_size=args.voxel_size,
@@ -576,8 +661,10 @@ def main(args):
                                     leverage_feature=args.leverage_feature,
                                     leverage_projection=args.leverage_projection,
                                     leverage_head_mean_dim=args.leverage_head_mean_dim,
+                                    leverage_normalize_rows=args.leverage_normalize_rows,
                                     eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                                     recent_merge_config=recent_merge_config,
+                                    svd_eviction_merge_config=svd_eviction_merge_config,
                                     voxel_covis_config=voxel_covis_config,
                                     covis_log_fn=covis_log_fn,
                                     global_attn_idx_ranges=global_attn_idx_ranges,

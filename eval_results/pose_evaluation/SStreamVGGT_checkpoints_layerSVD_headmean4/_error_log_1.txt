@@ -1,0 +1,20 @@
+7scenes-office/seq-02    | ATE: 0.13939, RPE trans: 0.04628, RPE rot: 1.62458
+0.13939
+0.04628
+1.62458
+7scenes-office/seq-06    | ATE: 0.11179, RPE trans: 0.02253, RPE rot: 0.69978
+0.11179
+0.02253
+0.69978
+7scenes-office/seq-07    | ATE: 0.19379, RPE trans: 0.03450, RPE rot: 0.50197
+0.19379
+0.03450
+0.50197
+7scenes-office/seq-09    | ATE: 0.29268, RPE trans: 0.11101, RPE rot: 4.48894
+0.29268
+0.11101
+4.48894
+7scenes-pumpkin/seq-01   | ATE: 0.06872, RPE trans: 0.01826, RPE rot: 0.28583
+0.06872
+0.01826
+0.28583

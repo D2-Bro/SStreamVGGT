@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
 from streamvggt.layers.recent_merge import RecentMergeConfig, RecentSimilarityMerge
+from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig, VoxelCovisibilityGraph
 
 @dataclass
@@ -130,8 +131,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_feature: str = "key",
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
+        leverage_normalize_rows: bool = False,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
+        svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
         voxel_covis_config: Optional[VoxelCovisConfig] = None,
         covis_log_fn: Optional[Callable[[str], None]] = None,
         global_attn_idx_ranges: Optional[Any] = None,
@@ -141,9 +144,24 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         past_key_values_camera = [None] * self.camera_head.trunk_depth
         total_budget = self.total_budget
         recent_merger = None
-        if recent_merge_config is not None and recent_merge_config.enabled:
+        run_recent_merge = recent_merge_config is not None and recent_merge_config.enabled
+        svd_needs_geometry = (
+            svd_eviction_merge_config is not None
+            and svd_eviction_merge_config.enabled
+            and eviction_policy == "svd_leverage"
+            and svd_eviction_merge_config.geometry_gate == "voxel_neighbor"
+        )
+        if run_recent_merge or svd_needs_geometry:
+            geometry_config = recent_merge_config if recent_merge_config is not None else RecentMergeConfig()
+            if not geometry_config.enabled:
+                geometry_config = RecentMergeConfig(
+                    enabled=True,
+                    voxel_size=geometry_config.voxel_size,
+                    use_depth_confidence=geometry_config.use_depth_confidence,
+                    debug=geometry_config.debug,
+                )
             recent_merger = RecentSimilarityMerge(
-                recent_merge_config,
+                geometry_config,
                 patch_start_idx=self.aggregator.patch_start_idx,
                 patch_size=self.aggregator.patch_size,
             )
@@ -187,8 +205,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 leverage_feature=leverage_feature,
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
+                leverage_normalize_rows=leverage_normalize_rows,
                 eviction_protect_recent_frames=eviction_protect_recent_frames,
                 recent_merge_config=recent_merge_config,
+                svd_eviction_merge_config=svd_eviction_merge_config,
                 voxel_covis_frame_ids=voxel_covis_frame_ids,
                 voxel_covis_enabled=voxel_covis_graph is not None,
                 global_attn_idx_ranges=global_attn_idx_ranges,
@@ -246,13 +266,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                             continue
                         k_cache, v_cache, metadata = layer_kv
                         recent_merger.update_metadata_for_frame(metadata, i)
-                        k_cache, v_cache, metadata, _ = recent_merger.merge_layer(
-                            k_cache,
-                            v_cache,
-                            metadata,
-                            layer_id=layer_id,
-                            frame_id=i,
-                        )
+                        if run_recent_merge:
+                            k_cache, v_cache, metadata, _ = recent_merger.merge_layer(
+                                k_cache,
+                                v_cache,
+                                metadata,
+                                layer_id=layer_id,
+                                frame_id=i,
+                            )
                         past_key_values[layer_id] = (k_cache, v_cache, metadata)
 
             if voxel_covis_graph is not None:

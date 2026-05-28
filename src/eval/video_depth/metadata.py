@@ -17,7 +17,7 @@ dataset_metadata = {
         "process_func": None,  # Not used in mono depth estimation
     },
     "kitti": {
-        "img_path": "../data/eval/kitti/depth_selection/val_selection_cropped/image_gathered",  # Default path
+        "img_path": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered",  # Default path
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
         "gt_traj_func": lambda img_path, anno_path, seq: None,
@@ -110,7 +110,7 @@ dataset_metadata = {
 kitti_numbers = [50, 100, 110, 150, 200, 250, 300, 350, 400, 450, 500]
 kitti_configs = {
     f"kitti_s1_{num}": {
-        "img_path": f"data/long_kitti_s1/depth_selection/val_selection_cropped/image_gathered_{num}",  # Default path
+        "img_path": f"/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_{num}",  # Default path
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
         "gt_traj_func": lambda img_path, anno_path, seq: None,

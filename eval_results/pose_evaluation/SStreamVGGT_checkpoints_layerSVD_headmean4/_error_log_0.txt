@@ -1,0 +1,20 @@
+7scenes-chess/seq-03     | ATE: 0.04535, RPE trans: 0.01425, RPE rot: 0.37169
+0.04535
+0.01425
+0.37169
+7scenes-chess/seq-05     | ATE: 0.05583, RPE trans: 0.01288, RPE rot: 0.34052
+0.05583
+0.01288
+0.34052
+7scenes-fire/seq-03      | ATE: 0.04138, RPE trans: 0.01661, RPE rot: 0.33442
+0.04138
+0.01661
+0.33442
+7scenes-fire/seq-04      | ATE: 0.02865, RPE trans: 0.01237, RPE rot: 0.40299
+0.02865
+0.01237
+0.40299
+7scenes-heads/seq-01     | ATE: 0.06093, RPE trans: 0.01693, RPE rot: 0.66347
+0.06093
+0.01693
+0.66347

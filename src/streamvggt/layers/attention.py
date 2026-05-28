@@ -16,6 +16,7 @@ from streamvggt.utils.cache_analysis import (
 )
 from streamvggt.layers.eviction import EvictionManager
 from streamvggt.layers.recent_merge import KVCacheMetadata, RecentMergeConfig
+from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig, SvdEvictionMerger
 
 XFORMERS_AVAILABLE = False
 
@@ -74,7 +75,9 @@ class Attention(nn.Module):
         leverage_feature: str = "key",
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
+        leverage_normalize_rows: bool = False,
         eviction_protect_recent_frames: int = 0,
+        svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCacheMetadata], float]:
         """
         Evicts tokens from the key-value cache based on key cosine similarity.
@@ -101,6 +104,7 @@ class Attention(nn.Module):
             leverage_feature,
             leverage_projection,
             leverage_head_mean_dim,
+            leverage_normalize_rows,
         )
         eviction = self._eviction_managers.get(manager_key)
         if eviction is None:
@@ -112,6 +116,7 @@ class Attention(nn.Module):
                 leverage_feature=leverage_feature,
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
+                leverage_normalize_rows=leverage_normalize_rows,
             )
             self._eviction_managers[manager_key] = eviction
         eviction_result = eviction.select(
@@ -129,9 +134,22 @@ class Attention(nn.Module):
                 if metadata is not None
                 else None
             ),
+            need_leverage_basis=(
+                svd_eviction_merge_config is not None
+                and svd_eviction_merge_config.enabled
+                and eviction_policy == "svd_leverage"
+            ),
         )
         top_indices = eviction_result.kept_candidate_indices
         avg_scores = eviction_result.summary_score
+
+        if (
+            svd_eviction_merge_config is not None
+            and svd_eviction_merge_config.enabled
+            and eviction_policy == "svd_leverage"
+        ):
+            merger = SvdEvictionMerger(svd_eviction_merge_config, num_anchor_tokens=num_anchor_tokens)
+            merger.merge(k, v, metadata, eviction_result, layer_id=layer_id, step_idx=step_idx)
 
         if cache_analysis_config is not None and layer_id is not None and step_idx is not None:
             dump_eviction_snapshot(
@@ -182,8 +200,10 @@ class Attention(nn.Module):
         leverage_feature: str = "key",
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
+        leverage_normalize_rows: bool = False,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
+        svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
         voxel_covis_frame_ids: Optional[Sequence[int]] = None,
         voxel_covis_enabled: bool = False,
         voxel_covis_fallback_recent: int = 0,
@@ -205,6 +225,7 @@ class Attention(nn.Module):
             metadata = None
             metadata_needed = (
                 (recent_merge_config is not None and recent_merge_config.enabled)
+                or (svd_eviction_merge_config is not None and svd_eviction_merge_config.enabled and eviction_policy == "svd_leverage")
                 or int(eviction_protect_recent_frames) > 0
                 or bool(voxel_covis_enabled)
             )
@@ -255,24 +276,30 @@ class Attention(nn.Module):
                 and step_idx <= pre_eviction_snapshot_config.target_step_idx
             )
             if cache_budget is not None and k.shape[2] > cache_budget and not eviction_deferred_for_snapshot:
+                eviction_kwargs = {
+                    "cache_analysis_config": cache_analysis_config,
+                    "layer_id": layer_id,
+                    "step_idx": step_idx,
+                    "tokens_per_frame": tokens_per_frame,
+                    "eviction_policy": eviction_policy,
+                    "eviction_debug": eviction_debug,
+                    "leverage_sketch_dim": leverage_sketch_dim,
+                    "leverage_granularity": leverage_granularity,
+                    "leverage_feature": leverage_feature,
+                    "leverage_projection": leverage_projection,
+                    "leverage_head_mean_dim": leverage_head_mean_dim,
+                    "eviction_protect_recent_frames": eviction_protect_recent_frames,
+                    "svd_eviction_merge_config": svd_eviction_merge_config,
+                }
+                if leverage_normalize_rows:
+                    eviction_kwargs["leverage_normalize_rows"] = leverage_normalize_rows
                 k, v, metadata, scores = self.eviction(
                     k,
                     v,
                     metadata,
                     cache_budget,
                     self.num_anchor_tokens,
-                    cache_analysis_config=cache_analysis_config,
-                    layer_id=layer_id,
-                    step_idx=step_idx,
-                    tokens_per_frame=tokens_per_frame,
-                    eviction_policy=eviction_policy,
-                    eviction_debug=eviction_debug,
-                    leverage_sketch_dim=leverage_sketch_dim,
-                    leverage_granularity=leverage_granularity,
-                    leverage_feature=leverage_feature,
-                    leverage_projection=leverage_projection,
-                    leverage_head_mean_dim=leverage_head_mean_dim,
-                    eviction_protect_recent_frames=eviction_protect_recent_frames,
+                    **eviction_kwargs,
                 )
 
             new_kv = (k, v, metadata) if metadata is not None else (k, v)

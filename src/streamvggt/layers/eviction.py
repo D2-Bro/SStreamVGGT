@@ -19,6 +19,16 @@ class EvictionResult:
     policy_scores: torch.Tensor
     mean_scores: torch.Tensor
     summary_score: float
+    leverage_basis: Optional["SvdLeverageBasis"] = None
+
+
+@dataclass
+class SvdLeverageBasis:
+    """Reusable low-rank coordinates from the QR leverage computation."""
+
+    q: torch.Tensor
+    r_diag: torch.Tensor
+    granularity: str
 
 
 class EvictionManager:
@@ -35,6 +45,7 @@ class EvictionManager:
         leverage_feature: str = "key",
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
+        leverage_normalize_rows: bool = False,
     ) -> None:
         if policy not in self.VALID_POLICIES:
             raise ValueError(f"Unknown eviction policy '{policy}'. Valid policies: {self.VALID_POLICIES}")
@@ -62,6 +73,7 @@ class EvictionManager:
         self.leverage_feature = leverage_feature
         self.leverage_projection = leverage_projection
         self.leverage_head_mean_dim = int(leverage_head_mean_dim)
+        self.leverage_normalize_rows = bool(leverage_normalize_rows)
         self._leverage_right_sketch_cache = {}
         self._last_leverage_profile: Dict[str, float] = {}
         self._last_layer_feature_shape: Optional[tuple[int, int]] = None
@@ -79,6 +91,7 @@ class EvictionManager:
         current_frame_idx: Optional[int] = None,
         protect_recent_frames: int = 0,
         candidate_frame_ids: Optional[torch.Tensor] = None,
+        need_leverage_basis: bool = False,
     ) -> EvictionResult:
         """Select candidate-local indices to retain.
 
@@ -111,6 +124,7 @@ class EvictionManager:
         need_mean_scores = self.policy in ("mean", "baseline_mean") or need_summary or self.debug
         mean_scores = self._mean_scores(candidate_k) if need_mean_scores else None
 
+        leverage_basis = None
         if self.policy in ("mean", "baseline_mean"):
             policy_scores = mean_scores
             if protect_recent_frames > 0:
@@ -128,7 +142,10 @@ class EvictionManager:
                 protection_debug = None
         elif self.policy == "svd_leverage":
             if self.leverage_granularity == "head":
-                policy_scores = self._svd_leverage_scores(candidate_k)
+                if need_leverage_basis:
+                    policy_scores, leverage_basis = self._svd_leverage_scores(candidate_k, return_basis=True)
+                else:
+                    policy_scores = self._svd_leverage_scores(candidate_k)
                 if protect_recent_frames > 0:
                     kept, protection_debug = self._keep_with_recent_protection(
                         policy_scores,
@@ -143,7 +160,14 @@ class EvictionManager:
                     kept = self._keep_highest_scores(policy_scores, num_to_keep)
                     protection_debug = None
             else:
-                policy_scores = self._layer_svd_leverage_scores(candidate_k, candidate_v)
+                if need_leverage_basis:
+                    policy_scores, leverage_basis = self._layer_svd_leverage_scores(
+                        candidate_k,
+                        candidate_v,
+                        return_basis=True,
+                    )
+                else:
+                    policy_scores = self._layer_svd_leverage_scores(candidate_k, candidate_v)
                 if protect_recent_frames > 0:
                     kept, protection_debug = self._keep_with_recent_protection(
                         policy_scores,
@@ -197,6 +221,7 @@ class EvictionManager:
                     f"leverage_granularity={self.leverage_granularity} leverage_feature={self.leverage_feature} "
                     f"leverage_projection={self.leverage_projection} "
                     f"leverage_head_mean_dim={self.leverage_head_mean_dim} "
+                    f"leverage_normalize_rows={self.leverage_normalize_rows} "
                     f"num_heads={H} num_tokens={num_candidates} head_dim={D} feature_dim={feature_dim}"
                 )
             print(msg)
@@ -217,6 +242,7 @@ class EvictionManager:
             if mean_scores is not None
             else torch.empty(B, H, 0, device=k.device, dtype=torch.float32),
             summary_score=summary_score,
+            leverage_basis=leverage_basis,
         )
 
     @staticmethod
@@ -367,18 +393,32 @@ class EvictionManager:
         if tensor.is_cuda and torch.cuda.is_available():
             torch.cuda.synchronize(tensor.device)
 
+    def _maybe_normalize_rows(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.leverage_normalize_rows:
+            return x
+        return F.normalize(x, p=2, dim=-1, eps=1e-12)
+
     def compute_svd_leverage_scores(
         self,
         x: torch.Tensor,
         sketch_dim: Optional[int] = None,
         eps: float = 1e-6,
-    ) -> torch.Tensor:
+        *,
+        return_basis: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
         """Compute row leverage scores for a 2D token-feature matrix."""
         if x.ndim != 2:
             raise ValueError(f"Expected a 2D token-feature matrix, got shape {tuple(x.shape)}")
         num_tokens, feature_dim = x.shape
         if num_tokens <= 0:
-            return torch.empty(0, device=x.device, dtype=torch.float32)
+            scores = torch.empty(0, device=x.device, dtype=torch.float32)
+            if return_basis:
+                return scores, SvdLeverageBasis(
+                    q=torch.empty(0, 0, device=x.device, dtype=torch.float32),
+                    r_diag=torch.empty(0, device=x.device, dtype=torch.float32),
+                    granularity="layer",
+                )
+            return scores
         if feature_dim <= 0:
             raise ValueError(f"feature_dim must be > 0 for SVD leverage, got {feature_dim}")
 
@@ -391,6 +431,7 @@ class EvictionManager:
         total_start = time.perf_counter() if do_profile else 0.0
         with torch.cuda.amp.autocast(enabled=False):
             mat = torch.nan_to_num(x.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            mat = self._maybe_normalize_rows(mat)
             if active_sketch_dim in (None, 0):
                 leverage_matrix = mat
                 if do_profile:
@@ -414,12 +455,18 @@ class EvictionManager:
                     self._sync_for_timing(q)
                     profile["qr"] = time.perf_counter() - qr_start
             except RuntimeError:
-                scores = mat.square().sum(dim=-1)
+                scores = torch.nan_to_num(mat.square().sum(dim=-1), nan=0.0, posinf=0.0, neginf=0.0)
                 if do_profile:
                     self._sync_for_timing(scores)
                     profile["total"] = time.perf_counter() - total_start
                     self._last_leverage_profile = profile
-                return torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+                if return_basis:
+                    return scores, SvdLeverageBasis(
+                        q=torch.empty(num_tokens, 0, device=x.device, dtype=torch.float32),
+                        r_diag=torch.empty(0, device=x.device, dtype=torch.float32),
+                        granularity="layer",
+                    )
+                return scores
 
         score_start = time.perf_counter() if do_profile else 0.0
         diag = torch.abs(torch.diagonal(r, dim1=-2, dim2=-1))
@@ -432,22 +479,27 @@ class EvictionManager:
             profile["scoring"] = time.perf_counter() - score_start
             profile["total"] = time.perf_counter() - total_start
             self._last_leverage_profile = profile
+        if return_basis:
+            return scores_sq, SvdLeverageBasis(q=q.detach(), r_diag=diag.detach(), granularity="layer")
         return scores_sq
 
-    def _svd_leverage_scores(self, candidate_k: torch.Tensor) -> torch.Tensor:
-        """Compute row leverage scores per batch/head.
-
-        With ``leverage_sketch_dim > 0``, each head matrix ``K_h`` shaped
-        ``[tokens, features]`` is projected with a fixed random right sketch
-        ``Omega`` before QR, and row norms in ``Q`` are used as approximate
-        leverage scores. With ``leverage_sketch_dim`` set to ``0`` or ``None``,
-        QR is applied to the original key matrix for exact row leverage scores
-        in the full column space. The output stays ``[B, H, N]`` so each head
-        evicts independently.
-        """
+    def _svd_leverage_scores(
+        self,
+        candidate_k: torch.Tensor,
+        *,
+        return_basis: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
+        """Compute row leverage scores per batch/head."""
         B, H, N, D = candidate_k.shape
         if N <= 0:
-            return torch.empty(B, H, 0, device=candidate_k.device, dtype=torch.float32)
+            scores = torch.empty(B, H, 0, device=candidate_k.device, dtype=torch.float32)
+            if return_basis:
+                return scores, SvdLeverageBasis(
+                    q=torch.empty(B, H, 0, 0, device=candidate_k.device, dtype=torch.float32),
+                    r_diag=torch.empty(B, H, 0, device=candidate_k.device, dtype=torch.float32),
+                    granularity="head",
+                )
+            return scores
 
         profile: Dict[str, float] = {}
         do_profile = self.debug
@@ -455,7 +507,8 @@ class EvictionManager:
             self._sync_for_timing(candidate_k)
         total_start = time.perf_counter() if do_profile else 0.0
         with torch.cuda.amp.autocast(enabled=False):
-            mat = candidate_k.to(dtype=torch.float32)
+            mat = torch.nan_to_num(candidate_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            mat = self._maybe_normalize_rows(mat)
             sketch_dim = self.leverage_sketch_dim
             if sketch_dim in (None, 0):
                 leverage_matrix = mat
@@ -464,11 +517,7 @@ class EvictionManager:
             else:
                 sketch_start = time.perf_counter() if do_profile else 0.0
                 sketch_dim = min(int(sketch_dim), int(D), int(N))
-                omega = self._get_leverage_right_sketch(
-                    D,
-                    sketch_dim,
-                    device=mat.device,
-                )
+                omega = self._get_leverage_right_sketch(D, sketch_dim, device=mat.device)
                 leverage_matrix = mat @ omega
                 if do_profile:
                     self._sync_for_timing(leverage_matrix)
@@ -485,6 +534,12 @@ class EvictionManager:
                     self._sync_for_timing(scores)
                     profile["total"] = time.perf_counter() - total_start
                     self._last_leverage_profile = profile
+                if return_basis:
+                    return scores, SvdLeverageBasis(
+                        q=torch.empty(B, H, N, 0, device=candidate_k.device, dtype=torch.float32),
+                        r_diag=torch.empty(B, H, 0, device=candidate_k.device, dtype=torch.float32),
+                        granularity="head",
+                    )
                 return scores
 
         score_start = time.perf_counter() if do_profile else 0.0
@@ -497,21 +552,32 @@ class EvictionManager:
             profile["scoring"] = time.perf_counter() - score_start
             profile["total"] = time.perf_counter() - total_start
             self._last_leverage_profile = profile
+        if return_basis:
+            return scores_sq, SvdLeverageBasis(q=q.detach(), r_diag=diag.detach(), granularity="head")
         return scores_sq
 
     def _layer_svd_leverage_scores(
         self,
         candidate_k: torch.Tensor,
         candidate_v: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        *,
+        return_basis: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
         """Compute one leverage-score vector per batch by concatenating heads."""
         B, H, N, D = candidate_k.shape
         if N <= 0:
-            return torch.empty(B, 0, device=candidate_k.device, dtype=torch.float32)
+            scores = torch.empty(B, 0, device=candidate_k.device, dtype=torch.float32)
+            if return_basis:
+                return scores, SvdLeverageBasis(
+                    q=torch.empty(B, 0, 0, device=candidate_k.device, dtype=torch.float32),
+                    r_diag=torch.empty(B, 0, device=candidate_k.device, dtype=torch.float32),
+                    granularity="layer",
+                )
+            return scores
         if D <= 0:
             raise ValueError(f"head_dim must be > 0 for layer-wise SVD leverage, got {D}")
         if self.leverage_projection == "head_mean":
-            return self._layer_svd_leverage_scores_head_mean(candidate_k)
+            return self._layer_svd_leverage_scores_head_mean(candidate_k, return_basis=return_basis)
         feature_dim = H * D * (2 if self.leverage_feature == "key_value" else 1)
         self._last_layer_feature_shape = (int(N), int(feature_dim))
         if self.leverage_feature == "key_value":
@@ -524,9 +590,16 @@ class EvictionManager:
                 )
 
         if self.leverage_sketch_dim not in (None, 0):
-            return self._layer_svd_leverage_scores_sketched(candidate_k, candidate_v, feature_dim)
+            return self._layer_svd_leverage_scores_sketched(
+                candidate_k,
+                candidate_v,
+                feature_dim,
+                return_basis=return_basis,
+            )
 
         scores = []
+        qs = []
+        diags = []
         aggregate_profile: Dict[str, float] = {"feature": 0.0, "sketch": 0.0, "qr": 0.0, "scoring": 0.0, "total": 0.0}
         for batch_idx in range(B):
             feature_start = time.perf_counter() if self.debug else 0.0
@@ -540,7 +613,16 @@ class EvictionManager:
             if self.debug:
                 self._sync_for_timing(x_layer)
             feature_time = time.perf_counter() - feature_start if self.debug else 0.0
-            score = self.compute_svd_leverage_scores(x_layer, self.leverage_sketch_dim)
+            if return_basis:
+                score, basis = self.compute_svd_leverage_scores(
+                    x_layer,
+                    self.leverage_sketch_dim,
+                    return_basis=True,
+                )
+                qs.append(basis.q)
+                diags.append(basis.r_diag)
+            else:
+                score = self.compute_svd_leverage_scores(x_layer, self.leverage_sketch_dim)
             scores.append(score)
             if self.debug:
                 aggregate_profile["feature"] += feature_time
@@ -548,9 +630,17 @@ class EvictionManager:
                     aggregate_profile[name] = aggregate_profile.get(name, 0.0) + value
         if self.debug:
             self._last_leverage_profile = aggregate_profile
-        return torch.stack(scores, dim=0)
+        stacked = torch.stack(scores, dim=0)
+        if return_basis:
+            return stacked, SvdLeverageBasis(q=torch.stack(qs, dim=0), r_diag=torch.stack(diags, dim=0), granularity="layer")
+        return stacked
 
-    def _layer_svd_leverage_scores_head_mean(self, candidate_k: torch.Tensor) -> torch.Tensor:
+    def _layer_svd_leverage_scores_head_mean(
+        self,
+        candidate_k: torch.Tensor,
+        *,
+        return_basis: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
         """Layer-wise leverage from deterministic per-head mean features."""
         B, H, N, D = candidate_k.shape
         if self.leverage_head_mean_dim > D:
@@ -573,6 +663,7 @@ class EvictionManager:
             head_chunks = torch.tensor_split(mat_k, self.leverage_head_mean_dim, dim=-1)
             head_features = torch.stack([chunk.mean(dim=-1) for chunk in head_chunks], dim=-1)
             leverage_matrix = head_features.permute(0, 2, 1, 3).reshape(B, N, feature_dim).contiguous()
+            leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
             if do_profile:
                 self._sync_for_timing(leverage_matrix)
                 profile["feature"] = time.perf_counter() - feature_start
@@ -585,12 +676,17 @@ class EvictionManager:
                     self._sync_for_timing(q)
                     profile["qr"] = time.perf_counter() - qr_start
             except RuntimeError:
-                scores = leverage_matrix.square().sum(dim=-1)
-                scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+                scores = torch.nan_to_num(leverage_matrix.square().sum(dim=-1), nan=0.0, posinf=0.0, neginf=0.0)
                 if do_profile:
                     self._sync_for_timing(scores)
                     profile["total"] = time.perf_counter() - total_start
                     self._last_leverage_profile = profile
+                if return_basis:
+                    return scores, SvdLeverageBasis(
+                        q=torch.empty(B, N, 0, device=candidate_k.device, dtype=torch.float32),
+                        r_diag=torch.empty(B, 0, device=candidate_k.device, dtype=torch.float32),
+                        granularity="layer",
+                    )
                 return scores
 
         score_start = time.perf_counter() if do_profile else 0.0
@@ -604,6 +700,8 @@ class EvictionManager:
             profile["scoring"] = time.perf_counter() - score_start
             profile["total"] = time.perf_counter() - total_start
             self._last_leverage_profile = profile
+        if return_basis:
+            return scores_sq, SvdLeverageBasis(q=q.detach(), r_diag=diag.detach(), granularity="layer")
         return scores_sq
 
     def _layer_svd_leverage_scores_sketched(
@@ -611,12 +709,21 @@ class EvictionManager:
         candidate_k: torch.Tensor,
         candidate_v: Optional[torch.Tensor],
         feature_dim: int,
-    ) -> torch.Tensor:
+        *,
+        return_basis: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
         """Layer-wise sketched leverage without materializing ``[B, N, H * D]``."""
         B, H, N, D = candidate_k.shape
         sketch_dim = min(int(self.leverage_sketch_dim), int(feature_dim), int(N))
         if sketch_dim <= 0:
-            return torch.empty(B, N, device=candidate_k.device, dtype=torch.float32)
+            scores = torch.empty(B, N, device=candidate_k.device, dtype=torch.float32)
+            if return_basis:
+                return scores, SvdLeverageBasis(
+                    q=torch.empty(B, N, 0, device=candidate_k.device, dtype=torch.float32),
+                    r_diag=torch.empty(B, 0, device=candidate_k.device, dtype=torch.float32),
+                    granularity="layer",
+                )
+            return scores
 
         profile: Dict[str, float] = {}
         do_profile = self.debug
@@ -633,16 +740,17 @@ class EvictionManager:
             )
 
             sketch_start = time.perf_counter() if do_profile else 0.0
-            omega = self._get_leverage_right_sketch(
-                feature_dim,
-                sketch_dim,
-                device=mat_k.device,
-            )
+            omega = self._get_leverage_right_sketch(feature_dim, sketch_dim, device=mat_k.device)
             omega_key = omega[: H * D].view(H, D, sketch_dim)
             leverage_matrix = torch.einsum("bhnd,hds->bns", mat_k, omega_key)
             if mat_v is not None:
                 omega_value = omega[H * D :].view(H, D, sketch_dim)
                 leverage_matrix = leverage_matrix + torch.einsum("bhnd,hds->bns", mat_v, omega_value)
+            if self.leverage_normalize_rows:
+                row_norm_sq = mat_k.square().sum(dim=(1, 3))
+                if mat_v is not None:
+                    row_norm_sq = row_norm_sq + mat_v.square().sum(dim=(1, 3))
+                leverage_matrix = leverage_matrix / row_norm_sq.sqrt().clamp_min(1e-12).unsqueeze(-1)
             if do_profile:
                 self._sync_for_timing(leverage_matrix)
                 profile["feature"] = 0.0
@@ -658,11 +766,19 @@ class EvictionManager:
                 scores = mat_k.square().sum(dim=(1, 3))
                 if mat_v is not None:
                     scores = scores + mat_v.square().sum(dim=(1, 3))
+                if self.leverage_normalize_rows:
+                    scores = (scores > 1e-24).to(dtype=torch.float32)
                 scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
                 if do_profile:
                     self._sync_for_timing(scores)
                     profile["total"] = time.perf_counter() - total_start
                     self._last_leverage_profile = profile
+                if return_basis:
+                    return scores, SvdLeverageBasis(
+                        q=torch.empty(B, N, 0, device=candidate_k.device, dtype=torch.float32),
+                        r_diag=torch.empty(B, 0, device=candidate_k.device, dtype=torch.float32),
+                        granularity="layer",
+                    )
                 return scores
 
         score_start = time.perf_counter() if do_profile else 0.0
@@ -676,4 +792,6 @@ class EvictionManager:
             profile["scoring"] = time.perf_counter() - score_start
             profile["total"] = time.perf_counter() - total_start
             self._last_leverage_profile = profile
+        if return_basis:
+            return scores_sq, SvdLeverageBasis(q=q.detach(), r_diag=diag.detach(), granularity="layer")
         return scores_sq
