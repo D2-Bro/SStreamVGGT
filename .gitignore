@@ -3,3 +3,7 @@ cache_*/
 .vscode/
 pre_*/
 ckpt/
+eval_result/video_depth/*/*.npy
+headwise_subspace_experiment/
+normalized_svd_cause_analysis/
+demo_tmp/
