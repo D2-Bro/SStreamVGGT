@@ -89,7 +89,7 @@ def main(args):
                 "temple_3",
             ]
             depth_pathes_folder = [
-                f"/home/ma-user/work/datasets/sintel/training/depth/{seq}" for seq in seq_list
+                f"/home/dongjae/data/datasets/sintel/training/depth/{seq}" for seq in seq_list
             ]
             depth_pathes = []
             for depth_pathes_folder_i in depth_pathes_folder:
@@ -192,7 +192,7 @@ def main(args):
             bonn_number = "110"  # default value
 
         img_pathes_folder = [
-            f"/home/ma-user/work/dataset/3D_Reconstruction/bonn/rgbd_bonn_{seq}/rgb_{bonn_number}/*.png"
+            f"/home/dongjae/data/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/rgb_{bonn_number}/*.png"
             for seq in seq_list
         ]
         img_pathes = []
@@ -200,7 +200,7 @@ def main(args):
             img_pathes += glob.glob(img_pathes_folder_i)
         img_pathes = sorted(img_pathes)
         depth_pathes_folder = [
-            f"/home/ma-user/work/dataset/3D_Reconstruction/bonn/rgbd_bonn_{seq}/depth_{bonn_number}/*.png"
+            f"/home/dongjae/data/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/depth_{bonn_number}/*.png"
             for seq in seq_list
         ]
         depth_pathes = []

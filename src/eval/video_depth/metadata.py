@@ -78,7 +78,7 @@ dataset_metadata = {
         "process_func": None,
     },
     "sintel": {
-        "img_path": "/home/ma-user/work/datasets/sintel/training/final",
+        "img_path": "/home/dongjae/data/datasets/sintel/training/final",
         "anno_path": "../data/eval/sintel/training/camdata_left",
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
@@ -129,7 +129,7 @@ dataset_metadata.update(kitti_configs)
 bonn_numbers = [50, 100, 110, 150, 200, 250, 300, 350, 400, 450, 500]
 bonn_configs = {
     f"bonn_{num}": {
-        "img_path": "/home/ma-user/work/dataset/3D_Reconstruction/bonn",
+        "img_path": "/home/dongjae/data/bonn/rgbd_bonn_dataset",
         "mask_path": None,
         "dir_path_func": lambda img_path, seq, num=num: os.path.join(
             img_path, f"rgbd_bonn_{seq}", f"rgb_{num}"

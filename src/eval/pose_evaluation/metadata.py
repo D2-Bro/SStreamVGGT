@@ -35,6 +35,18 @@ def _seven_scenes_color_files(dir_path):
     return sorted(glob.glob(os.path.join(dir_path, "frame-*.color.png")))
 
 
+def _kitti_odometry_root():
+    return os.environ.get("SSTREAMVGGT_KITTI_ODOMETRY_ROOT", "/home/dongjae/data/kitti/dataset")
+
+
+def _kitti_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "*.png")))
+
+
+KITTI_ODOMETRY_GT_SEQS = [f"{i:02d}" for i in range(11)]
+KITTI_ODOMETRY_TEST_SEQS = [f"{i:02d}" for i in range(11, 22)]
+
+
 # Define the merged dataset metadata dictionary
 dataset_metadata = {
     "7scenes": {
@@ -74,6 +86,34 @@ dataset_metadata = {
         "mask_path_seq_func": lambda mask_path, seq: None,
         "skip_condition": None,
         "process_func": lambda args, img_path: process_kitti(args, img_path),
+    },
+    "kitti_trajectory": {
+        "img_path": os.path.join(_kitti_odometry_root(), "sequences"),
+        "anno_path": os.path.join(_kitti_odometry_root(), "poses"),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "image_2"),
+        "filelist_func": _kitti_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, f"{seq}.txt"),
+        "traj_format": "kitti",
+        "seq_list": KITTI_ODOMETRY_GT_SEQS,
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "kitti_trajectory_test": {
+        "img_path": os.path.join(_kitti_odometry_root(), "sequences"),
+        "anno_path": None,
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "image_2"),
+        "filelist_func": _kitti_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: None,
+        "traj_format": None,
+        "seq_list": KITTI_ODOMETRY_TEST_SEQS,
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
     },
     "bonn": {
         "img_path": "data/bonn/rgbd_bonn_dataset",

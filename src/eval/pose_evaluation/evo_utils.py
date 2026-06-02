@@ -99,6 +99,27 @@ def load_sintel_traj(gt_file):  # './data/sintel/training/camdata_left/alley_2'
     return tum_gt_poses, tt
 
 
+def load_kitti_traj(gt_file):
+    traj_w_c = np.loadtxt(gt_file)
+    if traj_w_c.ndim == 1:
+        traj_w_c = traj_w_c[None, :]
+    assert traj_w_c.shape[1] == 12 or traj_w_c.shape[1] == 16
+    poses = []
+    for row in traj_w_c:
+        pose = row.reshape(3, 4) if row.shape[0] == 12 else row.reshape(4, 4)
+        if pose.shape == (3, 4):
+            pose = np.vstack([pose, [0, 0, 0, 1]])
+        poses.append(pose)
+
+    pose_path = PosePath3D(poses_se3=poses)
+    timestamps_mat = np.arange(traj_w_c.shape[0]).astype(float)
+    traj = PoseTrajectory3D(poses_se3=pose_path.poses_se3, timestamps=timestamps_mat)
+    xyz = traj.positions_xyz
+    quat = traj.orientations_quat_wxyz
+    traj_tum = np.column_stack((xyz, quat))
+    return traj_tum, timestamps_mat
+
+
 def load_7scenes_traj(gt_file):
     pose_files = sorted(
         os.path.join(gt_file, name)
@@ -127,6 +148,8 @@ def load_traj(gt_traj_file, traj_format="sintel", skip=0, stride=1, num_frames=N
         traj_tum, timestamps_mat = load_sintel_traj(gt_traj_file)
     elif traj_format == "7scenes":
         traj_tum, timestamps_mat = load_7scenes_traj(gt_traj_file)
+    elif traj_format == "kitti":
+        traj_tum, timestamps_mat = load_kitti_traj(gt_traj_file)
     elif traj_format in ["tum", "tartanair"]:
         traj = file_interface.read_tum_trajectory_file(gt_traj_file)
         xyz = traj.positions_xyz

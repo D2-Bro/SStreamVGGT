@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 import warnings
 
 import torch
@@ -10,7 +11,9 @@ from typing import Union, Tuple, Dict, Optional, Sequence
 
 from streamvggt.utils.cache_analysis import (
     CacheAnalysisConfig,
+    EvictionNNAnalysisConfig,
     PreEvictionSnapshotConfig,
+    dump_eviction_nn_analysis,
     dump_eviction_snapshot,
     dump_pre_eviction_snapshot,
 )
@@ -65,6 +68,7 @@ class Attention(nn.Module):
         num_anchor_tokens: int,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
@@ -76,7 +80,17 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_approx_method: str = "right_sketch",
+        leverage_left_sketch_dim: Optional[int] = 2048,
+        leverage_right_jl_dim: Optional[int] = 64,
+        leverage_random_seed: int = 0,
+        leverage_eviction_selector: str = "topk",
+        leverage_dpp_candidate_multiplier: int = 2,
+        leverage_dpp_greedy_block_size: int = 32,
+        layer_budget_strategy: str = "uniform",
+        layer_budget_eps: float = 1e-12,
         eviction_protect_recent_frames: int = 0,
+        window_token_count: int = 0,
         svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCacheMetadata], float]:
         """
@@ -92,9 +106,37 @@ class Attention(nn.Module):
             A tuple of pruned key and value tensors.
         """
         B, H, N, D = k.shape
+        num_anchor_tokens = max(0, min(int(num_anchor_tokens), N))
 
         if N <= cache_budget:
             return k, v, metadata, 0.0
+
+        window_token_count = 0 if window_token_count is None else int(window_token_count)
+        window_token_count = max(window_token_count, 0)
+        max_tail = max(N - num_anchor_tokens, 0)
+        tail_count = min(window_token_count, max(cache_budget - num_anchor_tokens, 0), max_tail)
+        tail_start = N - tail_count if tail_count > 0 else N
+
+        if cache_budget <= num_anchor_tokens:
+            keep_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
+            keep_indices = keep_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
+            expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, num_anchor_tokens, D)
+            final_metadata = metadata.gather(keep_indices.detach().cpu()) if metadata is not None else None
+            return torch.gather(k, 2, expanded_indices), torch.gather(v, 2, expanded_indices), final_metadata, 0.0
+
+        select_k = k[:, :, :tail_start, :]
+        select_v = v[:, :, :tail_start, :]
+        select_metadata = metadata
+        if metadata is not None and tail_count > 0:
+            prefix_indices = torch.arange(tail_start, dtype=torch.long).view(1, 1, tail_start)
+            prefix_indices = prefix_indices.expand(B, H, tail_start)
+            select_metadata = metadata.gather(prefix_indices)
+        select_budget = cache_budget - tail_count
+
+        profile_eviction = bool(eviction_debug)
+        if profile_eviction and k.is_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize(k.device)
+        eviction_total_start = time.perf_counter() if profile_eviction else 0.0
 
         manager_key = (
             eviction_policy,
@@ -105,6 +147,15 @@ class Attention(nn.Module):
             leverage_projection,
             leverage_head_mean_dim,
             leverage_normalize_rows,
+            leverage_approx_method,
+            leverage_left_sketch_dim,
+            leverage_right_jl_dim,
+            leverage_random_seed,
+            leverage_eviction_selector,
+            leverage_dpp_candidate_multiplier,
+            leverage_dpp_greedy_block_size,
+            layer_budget_strategy,
+            layer_budget_eps,
         )
         eviction = self._eviction_managers.get(manager_key)
         if eviction is None:
@@ -117,31 +168,64 @@ class Attention(nn.Module):
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
                 leverage_normalize_rows=leverage_normalize_rows,
+                leverage_approx_method=leverage_approx_method,
+                leverage_left_sketch_dim=leverage_left_sketch_dim,
+                leverage_right_jl_dim=leverage_right_jl_dim,
+                leverage_random_seed=leverage_random_seed,
+                leverage_eviction_selector=leverage_eviction_selector,
+                leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
+                leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                layer_budget_strategy=layer_budget_strategy,
+                layer_budget_eps=layer_budget_eps,
             )
             self._eviction_managers[manager_key] = eviction
+        selection_start = time.perf_counter() if profile_eviction else 0.0
         eviction_result = eviction.select(
-            k,
-            cache_budget,
+            select_k,
+            select_budget,
             num_anchor_tokens,
-            v=v,
+            v=select_v,
             need_summary=cache_analysis_config is not None or eviction_debug,
             layer_id=layer_id,
             step_idx=step_idx,
             current_frame_idx=step_idx,
             protect_recent_frames=eviction_protect_recent_frames,
             candidate_frame_ids=(
-                metadata.frame_ids[:, :, num_anchor_tokens:]
-                if metadata is not None
+                select_metadata.frame_ids[:, :, num_anchor_tokens:]
+                if select_metadata is not None
                 else None
             ),
             need_leverage_basis=(
-                svd_eviction_merge_config is not None
+                (svd_eviction_merge_config is not None
                 and svd_eviction_merge_config.enabled
-                and eviction_policy == "svd_leverage"
+                and eviction_policy == "svd_leverage")
+                or (eviction_nn_analysis_config is not None and eviction_nn_analysis_config.wants_svd_coord())
             ),
         )
+        if profile_eviction and k.is_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize(k.device)
+        selection_time = time.perf_counter() - selection_start if profile_eviction else 0.0
         top_indices = eviction_result.kept_candidate_indices
         avg_scores = eviction_result.summary_score
+        layer_budget_score = eviction_result.layer_budget_score
+
+        if eviction_nn_analysis_config is not None and layer_id is not None and step_idx is not None:
+            dump_eviction_nn_analysis(
+                eviction_nn_analysis_config,
+                k_before=select_k,
+                v_before=select_v,
+                kept_candidate_indices=top_indices,
+                policy_scores=eviction_result.policy_scores,
+                leverage_basis=eviction_result.leverage_basis,
+                metadata=select_metadata,
+                layer_id=layer_id,
+                step_idx=step_idx,
+                cache_budget=select_budget,
+                num_anchor_tokens=num_anchor_tokens,
+                eviction_policy=eviction_policy,
+                leverage_granularity=leverage_granularity,
+                leverage_feature=leverage_feature,
+            )
 
         if (
             svd_eviction_merge_config is not None
@@ -149,36 +233,55 @@ class Attention(nn.Module):
             and eviction_policy == "svd_leverage"
         ):
             merger = SvdEvictionMerger(svd_eviction_merge_config, num_anchor_tokens=num_anchor_tokens)
-            merger.merge(k, v, metadata, eviction_result, layer_id=layer_id, step_idx=step_idx)
+            merger.merge(select_k, select_v, select_metadata, eviction_result, layer_id=layer_id, step_idx=step_idx)
 
         if cache_analysis_config is not None and layer_id is not None and step_idx is not None:
             dump_eviction_snapshot(
                 cache_analysis_config,
-                k_before=k,
+                k_before=select_k,
                 scores=eviction_result.mean_scores,
                 kept_candidate_indices=top_indices,
                 layer_id=layer_id,
                 step_idx=step_idx,
-                cache_budget=cache_budget,
+                cache_budget=select_budget,
                 num_anchor_tokens=num_anchor_tokens,
                 tokens_per_frame=tokens_per_frame,
                 eviction_policy=eviction_policy,
                 leverage_sketch_dim=leverage_sketch_dim,
             )
         
+        index_update_start = time.perf_counter() if profile_eviction else 0.0
         anchor_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
         anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
-        keep_indices = torch.cat([anchor_indices, top_indices + int(num_anchor_tokens)], dim=2)
+        keep_parts = [anchor_indices, top_indices + int(num_anchor_tokens)]
+        if tail_count > 0:
+            tail_indices = torch.arange(tail_start, N, device=k.device, dtype=torch.long)
+            tail_indices = tail_indices.view(1, 1, tail_count).expand(B, H, tail_count)
+            keep_parts.append(tail_indices)
+        keep_indices = torch.cat(keep_parts, dim=2)
         final_cache_size = keep_indices.shape[2]
         expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, final_cache_size, D)
         final_k = torch.gather(k, 2, expanded_indices)
         final_v = torch.gather(v, 2, expanded_indices)
         final_metadata = (
-            metadata.prune_after_eviction(top_indices, num_anchor_tokens)
+            metadata.gather(keep_indices.detach().cpu())
             if metadata is not None
             else None
         )
+        if profile_eviction:
+            if final_k.is_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize(final_k.device)
+            index_update_time = time.perf_counter() - index_update_start
+            total_time = time.perf_counter() - eviction_total_start
+            print(
+                f"[Attention] eviction_profile layer={layer_id} step={step_idx} "
+                f"manager_select={selection_time * 1000.0:.3f}ms "
+                f"metadata_index_update={index_update_time * 1000.0:.3f}ms "
+                f"total_eviction={total_time * 1000.0:.3f}ms"
+            )
 
+        if layer_budget_score is not None:
+            return final_k, final_v, final_metadata, (avg_scores, layer_budget_score)
         return final_k, final_v, final_metadata, avg_scores
 
     def forward(self, 
@@ -190,6 +293,7 @@ class Attention(nn.Module):
         cache_budget = None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
@@ -201,7 +305,18 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_approx_method: str = "right_sketch",
+        leverage_left_sketch_dim: Optional[int] = 2048,
+        leverage_right_jl_dim: Optional[int] = 64,
+        leverage_random_seed: int = 0,
+        leverage_eviction_selector: str = "topk",
+        leverage_dpp_candidate_multiplier: int = 2,
+        leverage_dpp_greedy_block_size: int = 32,
+        layer_budget_strategy: str = "uniform",
+        layer_budget_eps: float = 1e-12,
         eviction_protect_recent_frames: int = 0,
+        anchor_token_count: Optional[int] = None,
+        window_token_count: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
         svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
         voxel_covis_frame_ids: Optional[Sequence[int]] = None,
@@ -226,6 +341,7 @@ class Attention(nn.Module):
             metadata_needed = (
                 (recent_merge_config is not None and recent_merge_config.enabled)
                 or (svd_eviction_merge_config is not None and svd_eviction_merge_config.enabled and eviction_policy == "svd_leverage")
+                or eviction_nn_analysis_config is not None
                 or int(eviction_protect_recent_frames) > 0
                 or bool(voxel_covis_enabled)
             )
@@ -267,7 +383,11 @@ class Attention(nn.Module):
                     layer_id=layer_id,
                     step_idx=step_idx,
                     cache_budget=cache_budget,
-                    num_anchor_tokens=self.num_anchor_tokens,
+                    num_anchor_tokens=(
+                        int(anchor_token_count)
+                        if anchor_token_count is not None
+                        else self.num_anchor_tokens
+                    ),
                     tokens_per_frame=tokens_per_frame,
                 )
             eviction_deferred_for_snapshot = (
@@ -278,6 +398,7 @@ class Attention(nn.Module):
             if cache_budget is not None and k.shape[2] > cache_budget and not eviction_deferred_for_snapshot:
                 eviction_kwargs = {
                     "cache_analysis_config": cache_analysis_config,
+                    "eviction_nn_analysis_config": eviction_nn_analysis_config,
                     "layer_id": layer_id,
                     "step_idx": step_idx,
                     "tokens_per_frame": tokens_per_frame,
@@ -288,17 +409,32 @@ class Attention(nn.Module):
                     "leverage_feature": leverage_feature,
                     "leverage_projection": leverage_projection,
                     "leverage_head_mean_dim": leverage_head_mean_dim,
+                    "leverage_approx_method": leverage_approx_method,
+                    "leverage_left_sketch_dim": leverage_left_sketch_dim,
+                    "leverage_right_jl_dim": leverage_right_jl_dim,
+                    "leverage_random_seed": leverage_random_seed,
+                    "leverage_eviction_selector": leverage_eviction_selector,
+                    "leverage_dpp_candidate_multiplier": leverage_dpp_candidate_multiplier,
+                    "leverage_dpp_greedy_block_size": leverage_dpp_greedy_block_size,
+                    "layer_budget_strategy": layer_budget_strategy,
+                    "layer_budget_eps": layer_budget_eps,
                     "eviction_protect_recent_frames": eviction_protect_recent_frames,
+                    "window_token_count": window_token_count,
                     "svd_eviction_merge_config": svd_eviction_merge_config,
                 }
                 if leverage_normalize_rows:
                     eviction_kwargs["leverage_normalize_rows"] = leverage_normalize_rows
+                effective_anchor_count = (
+                    int(anchor_token_count)
+                    if anchor_token_count is not None
+                    else self.num_anchor_tokens
+                )
                 k, v, metadata, scores = self.eviction(
                     k,
                     v,
                     metadata,
                     cache_budget,
-                    self.num_anchor_tokens,
+                    effective_anchor_count,
                     **eviction_kwargs,
                 )
 

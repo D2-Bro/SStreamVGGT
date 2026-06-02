@@ -15,7 +15,12 @@ from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.utils.load_fn import load_and_preprocess_images
 from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from streamvggt.utils.geometry import FrameDiskCache
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
+from streamvggt.utils.cache_analysis import (
+    CacheAnalysisConfig,
+    PreEvictionSnapshotConfig,
+    add_eviction_nn_analysis_args,
+    eviction_nn_config_from_args,
+)
 from streamvggt.layers.recent_merge import RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig
@@ -72,6 +77,7 @@ def run_inference(args: argparse.Namespace):
             heads=args.snapshot_heads,
             max_snapshots=args.snapshot_max_snapshots,
         )
+        eviction_nn_analysis_config = eviction_nn_config_from_args(args)
     except ValueError as exc:
         print(f"Error: {exc}")
         return
@@ -82,6 +88,8 @@ def run_inference(args: argparse.Namespace):
             "Pre-eviction common cache snapshot enabled: "
             f"{pre_eviction_snapshot_config.output_dir} at frame_count={pre_eviction_snapshot_config.frame_count}"
         )
+    if eviction_nn_analysis_config is not None:
+        print(f"Eviction NN analysis enabled: {eviction_nn_analysis_config.output_dir}")
     if args.merge_window < 1:
         print(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
         return
@@ -166,6 +174,27 @@ def run_inference(args: argparse.Namespace):
             f"got {args.covis_fallback_recent}."
         )
         return
+    if args.total_budget < 1:
+        print(f"Error: --total_budget must be >= 1, got {args.total_budget}.")
+        return
+    if args.leverage_head_mean_dim < 1:
+        print(
+            "Error: --leverage_head_mean_dim must be >= 1, "
+            f"got {args.leverage_head_mean_dim}."
+        )
+        return
+    if args.leverage_dpp_candidate_multiplier < 1:
+        print(
+            "Error: --leverage_dpp_candidate_multiplier must be >= 1, "
+            f"got {args.leverage_dpp_candidate_multiplier}."
+        )
+        return
+    if args.leverage_dpp_greedy_block_size < 1:
+        print(
+            "Error: --leverage_dpp_greedy_block_size must be >= 1, "
+            f"got {args.leverage_dpp_greedy_block_size}."
+        )
+        return
     try:
         global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
     except ValueError as exc:
@@ -176,8 +205,20 @@ def run_inference(args: argparse.Namespace):
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
         print(f"Using SVD leverage sketch dim: {sketch_label}")
         print(
+            "Using SVD leverage approximation: "
+            f"{args.leverage_approx_method} (r1={args.leverage_left_sketch_dim}, "
+            f"r2={args.leverage_right_jl_dim}, seed={args.leverage_random_seed})"
+        )
+        print(
             "Using SVD leverage granularity: "
-            f"{args.leverage_granularity} (feature={args.leverage_feature})"
+            f"{args.leverage_granularity} (feature={args.leverage_feature}, "
+            f"projection={args.leverage_projection}, head_mean_dim={args.leverage_head_mean_dim})"
+        )
+        print(
+            "Using SVD leverage selector: "
+            f"{args.leverage_eviction_selector} "
+            f"(dpp_candidate_multiplier={args.leverage_dpp_candidate_multiplier}, "
+            f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size})"
         )
         print(f"Using SVD leverage recent-frame protection: {args.eviction_protect_recent_frames}")
     recent_merge_config = RecentMergeConfig(
@@ -253,7 +294,8 @@ def run_inference(args: argparse.Namespace):
     if global_attn_idx_ranges is not None:
         print(f"Global attention index ranges enabled: {global_attn_idx_ranges}")
 
-    model = StreamVGGT(total_budget=1200000)
+    print(f"Using total KV cache budget: {args.total_budget}")
+    model = StreamVGGT(total_budget=args.total_budget)
     ckpt = torch.load(args.checkpoint_path, map_location="cpu")
 
     model.load_state_dict(ckpt, strict=True)
@@ -323,17 +365,28 @@ def run_inference(args: argparse.Namespace):
                 cache_results=cache_results,
                 cache_analysis_config=cache_analysis_config,
                 pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                eviction_nn_analysis_config=eviction_nn_analysis_config,
                 eviction_policy=args.eviction_policy,
-                eviction_debug=args.eviction_debug,
+                eviction_debug=args.eviction_debug or args.profile_eviction,
                 leverage_sketch_dim=args.leverage_sketch_dim,
                 leverage_granularity=args.leverage_granularity,
                 leverage_feature=args.leverage_feature,
+                leverage_projection=args.leverage_projection,
+                leverage_head_mean_dim=args.leverage_head_mean_dim,
+                leverage_approx_method=args.leverage_approx_method,
+                leverage_left_sketch_dim=args.leverage_left_sketch_dim,
+                leverage_right_jl_dim=args.leverage_right_jl_dim,
+                leverage_random_seed=args.leverage_random_seed,
+                leverage_eviction_selector=args.leverage_eviction_selector,
+                leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
+                leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
                 eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                 recent_merge_config=recent_merge_config,
                 svd_eviction_merge_config=svd_eviction_merge_config,
                 voxel_covis_config=voxel_covis_config,
                 global_attn_idx_ranges=global_attn_idx_ranges,
                 global_attn_debug=args.global_attn_debug,
+                leverage_normalize_rows=args.leverage_normalize_rows
             )
 
     torch.cuda.synchronize()
@@ -431,6 +484,13 @@ if __name__ == "__main__":
         help="Maximum number of frames to process after applying frame_stride",
     )
     parser.add_argument(
+        "--total_budget",
+        "--total-budget",
+        type=int,
+        default=1200000,
+        help="Total KV cache token budget distributed across streaming global attention layers",
+    )
+    parser.add_argument(
         "--cache_analysis_dir",
         type=str,
         default=None,
@@ -460,6 +520,7 @@ if __name__ == "__main__":
         default=None,
         help="Optional global cap on the number of per-head snapshots written",
     )
+    add_eviction_nn_analysis_args(parser)
     parser.add_argument(
         "--snapshot_before_eviction",
         "--snapshot-before-eviction",
@@ -516,6 +577,12 @@ if __name__ == "__main__":
         help="Print lightweight eviction policy shape/count diagnostics",
     )
     parser.add_argument(
+        "--profile_eviction",
+        "--profile-eviction",
+        action="store_true",
+        help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior",
+    )
+    parser.add_argument(
         "--leverage_sketch_dim",
         "--leverage-sketch-dim",
         type=int,
@@ -537,6 +604,72 @@ if __name__ == "__main__":
         default="key",
         choices=("key", "key_value"),
         help="Feature tensor for svd_leverage eviction: keys only or concatenated keys and values",
+    )
+    parser.add_argument(
+        "--leverage_projection",
+        "--leverage-projection",
+        type=str,
+        default="random",
+        choices=("random", "head_mean"),
+        help="Projection mode for svd_leverage eviction: random/full feature path or deterministic per-head means",
+    )
+    parser.add_argument(
+        "--leverage_head_mean_dim",
+        "--leverage-head-mean-dim",
+        type=int,
+        default=1,
+        help="Number of mean-pooled channel groups per head for leverage_projection=head_mean",
+    )
+    parser.add_argument(
+        "--leverage_approx_method",
+        "--leverage-approx-method",
+        type=str,
+        default="right_sketch",
+        choices=("exact_qr", "right_sketch", "drineas_srht"),
+        help="Leverage approximation: exact QR, right-sketched/Compactor-style, or Drineas left SRHT",
+    )
+    parser.add_argument(
+        "--leverage_left_sketch_dim",
+        "--leverage-left-sketch-dim",
+        type=int,
+        default=2048,
+        help="Left SRHT row count r1 for leverage_approx_method=drineas_srht",
+    )
+    parser.add_argument(
+        "--leverage_right_jl_dim",
+        "--leverage-right-jl-dim",
+        type=int,
+        default=64,
+        help="Right JL dimension r2 for leverage_approx_method=drineas_srht; <=0 uses no right JL",
+    )
+    parser.add_argument(
+        "--leverage_random_seed",
+        "--leverage-random-seed",
+        type=int,
+        default=0,
+        help="Random seed for leverage sketches",
+    )
+    parser.add_argument(
+        "--leverage_eviction_selector",
+        "--leverage-eviction-selector",
+        type=str,
+        default="topk",
+        choices=("topk", "fast_dpp"),
+        help="Eviction selector for svd_leverage scores: topk or low-score Fast DPP",
+    )
+    parser.add_argument(
+        "--leverage_dpp_candidate_multiplier",
+        "--leverage-dpp-candidate-multiplier",
+        type=int,
+        default=2,
+        help="Fast DPP low-score candidate pool multiplier relative to eviction count",
+    )
+    parser.add_argument(
+        "--leverage_dpp_greedy_block_size",
+        "--leverage-dpp-greedy-block-size",
+        type=int,
+        default=32,
+        help="Fast DPP greedy selection block size; 1 is quality-oriented, larger values favor speed",
     )
     parser.add_argument(
         "--eviction_protect_recent_frames",
@@ -828,6 +961,12 @@ if __name__ == "__main__":
         type=str,
         default="./inference_results",
         help="Path to the directory containing the complete results"
+    )
+    parser.add_argument(
+        "--leverage_normalize_rows",
+        "--leverage-normalize-rows",
+        action="store_true",
+        help="L2 normalize leverage score rows before SVD eviction candidate generation",
     )
     
     args = parser.parse_args()

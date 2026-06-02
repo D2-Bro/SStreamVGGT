@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from streamvggt.models.aggregator import Aggregator
@@ -10,7 +11,8 @@ from transformers.file_utils import ModelOutput
 from typing import Optional, Tuple, List, Any, Callable
 from dataclasses import dataclass
 
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig, EvictionNNAnalysisConfig, PreEvictionSnapshotConfig
+from streamvggt.utils.history_anchor import HistoryAnchorConfig, HistoryAnchorManager
 from streamvggt.layers.recent_merge import RecentMergeConfig, RecentSimilarityMerge
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig, VoxelCovisibilityGraph
@@ -121,9 +123,17 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         past_key_values=None, 
         frame_writer: Optional[Callable[[int, dict, dict], None]] = None,
         cache_results: bool = True,
+        history_anchor_strategy: str = "coverage",
+        anchor_interval: int = 250,
+        min_anchor_interval: Optional[int] = 100,
+        window_protect_frames: int = 0,
+        max_anchors: int = 3,
+        coverage_threshold: float = 0.2,
+        anchor_keep_ratio: float = 0.05,
         total_budget=None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         eviction_policy: str = "mean",
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
@@ -132,6 +142,19 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_approx_method: str = "right_sketch",
+        leverage_left_sketch_dim: Optional[int] = 2048,
+        leverage_right_jl_dim: Optional[int] = 64,
+        leverage_random_seed: int = 0,
+        leverage_eviction_selector: str = "topk",
+        leverage_dpp_candidate_multiplier: int = 2,
+        leverage_dpp_greedy_block_size: int = 32,
+        layer_budget_strategy: str = "uniform",
+        layer_budget_alpha: float = 0.5,
+        layer_budget_min_tokens: int = 0,
+        layer_budget_eps: float = 1e-12,
+        layer_budget_debug: bool = False,
+        layer_budget_log_path: Optional[str] = None,
         eviction_protect_recent_frames: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
         svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
@@ -171,11 +194,80 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 voxel_covis_config,
                 patch_size=self.aggregator.patch_size,
             )
-        
+
+        img_h, img_w = 392, 518
+        if len(frames) > 0 and "img" in frames[0]:
+            sample_img = frames[0]["img"]
+            if sample_img.dim() == 3:
+                img_h, img_w = sample_img.shape[1], sample_img.shape[2]
+            elif sample_img.dim() == 4:
+                img_h, img_w = sample_img.shape[2], sample_img.shape[3]
+        patch_size = self.aggregator.patch_size
+        patch_h = img_h // patch_size
+        patch_w = img_w // patch_size
+        tokens_per_frame = 1 + 4 + patch_h * patch_w
+        window_token_count = max(int(window_protect_frames), 0) * tokens_per_frame
+
+        anchor_manager = None
+        if history_anchor_strategy != "none":
+            anchor_config = HistoryAnchorConfig(
+                strategy=history_anchor_strategy,
+                interval=anchor_interval,
+                min_anchor_interval=min_anchor_interval,
+                max_anchors=max_anchors,
+                coverage_threshold=coverage_threshold,
+                anchor_keep_ratio=anchor_keep_ratio,
+            )
+            anchor_manager = HistoryAnchorManager(anchor_config, tokens_per_frame)
+            anchor_manager.image_size_hw = (img_h, img_w)
+
+        def _select_anchor_token_indices(conf_map: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if conf_map is None:
+                return None
+
+            special_count = self.aggregator.patch_start_idx
+            anchor_chunk = max(int(tokens_per_frame * anchor_keep_ratio), 1)
+            if anchor_chunk <= special_count:
+                return torch.arange(anchor_chunk, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
+
+            keep_patches = anchor_chunk - special_count
+            if conf_map.dim() == 4:
+                conf_map = conf_map.squeeze(1)
+            if conf_map.dim() != 3:
+                return None
+
+            pooled = F.adaptive_avg_pool2d(conf_map.unsqueeze(1), (patch_h, patch_w)).squeeze(1)
+            flat = pooled.reshape(conf_map.shape[0], -1)
+            keep_patches = min(keep_patches, flat.shape[1])
+            if keep_patches <= 0:
+                return torch.arange(anchor_chunk, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
+
+            topk = torch.topk(flat, k=keep_patches, dim=1).indices
+            special_indices = torch.arange(special_count, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
+            return torch.cat([special_indices, topk + special_count], dim=1)
+
         all_ress = []
         processed_frames = [] 
 
         for i, frame in enumerate(frames):
+
+            fixed_interval_registered = False
+            fixed_interval_is_fifo = False
+            if anchor_manager is not None and history_anchor_strategy == "fixed_interval":
+                should_register, is_fifo, reason = anchor_manager.should_become_anchor(frame_idx=i)
+                if should_register:
+                    anchor_manager.register_anchor(i)
+                    fixed_interval_registered = True
+                    fixed_interval_is_fifo = is_fifo
+                    fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
+                    print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
+
+            anchor_token_count = (
+                anchor_manager.get_protected_token_count()
+                if anchor_manager is not None
+                else None
+            )
+            effective_window_token_count = window_token_count if anchor_manager is not None else 0
 
             images = frame["img"].unsqueeze(0) 
             covis_selection = None
@@ -198,6 +290,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 total_budget=total_budget,
                 cache_analysis_config=cache_analysis_config,
                 pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                eviction_nn_analysis_config=eviction_nn_analysis_config,
                 eviction_policy=eviction_policy,
                 eviction_debug=eviction_debug,
                 leverage_sketch_dim=leverage_sketch_dim,
@@ -206,7 +299,22 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
                 leverage_normalize_rows=leverage_normalize_rows,
+                leverage_approx_method=leverage_approx_method,
+                leverage_left_sketch_dim=leverage_left_sketch_dim,
+                leverage_right_jl_dim=leverage_right_jl_dim,
+                leverage_random_seed=leverage_random_seed,
+                leverage_eviction_selector=leverage_eviction_selector,
+                leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
+                leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                layer_budget_strategy=layer_budget_strategy,
+                layer_budget_alpha=layer_budget_alpha,
+                layer_budget_min_tokens=layer_budget_min_tokens,
+                layer_budget_eps=layer_budget_eps,
+                layer_budget_debug=layer_budget_debug,
+                layer_budget_log_path=layer_budget_log_path,
                 eviction_protect_recent_frames=eviction_protect_recent_frames,
+                anchor_token_count=anchor_token_count,
+                window_token_count=effective_window_token_count,
                 recent_merge_config=recent_merge_config,
                 svd_eviction_merge_config=svd_eviction_merge_config,
                 voxel_covis_frame_ids=voxel_covis_frame_ids,
@@ -249,6 +357,42 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     query_points = track
                     vis = vis[:, 0]
                     track_conf = conf[:, 0]
+
+            if fixed_interval_registered:
+                anchor_token_indices = _select_anchor_token_indices(
+                    pts3d_conf if self.point_head is not None else None
+                )
+                past_key_values = self.aggregator.sync_anchor_change(
+                    past_key_values,
+                    anchor_token_count=anchor_token_count,
+                    tokens_per_frame=tokens_per_frame,
+                    anchor_keep_ratio=anchor_keep_ratio,
+                    anchor_token_indices=anchor_token_indices,
+                    is_fifo=fixed_interval_is_fifo,
+                )
+
+            if anchor_manager is not None and history_anchor_strategy == "coverage":
+                should_register, is_fifo, reason, coverage = anchor_manager.should_become_anchor_coverage(
+                    frame_idx=i,
+                    current_depth=depth[0],
+                    current_pose=camera_pose[0],
+                )
+                if should_register:
+                    anchor_manager.register_anchor_coverage(i, depth[0], camera_pose[0])
+                    fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
+                    print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
+
+                    anchor_token_indices = _select_anchor_token_indices(
+                        pts3d_conf if self.point_head is not None else None
+                    )
+                    past_key_values = self.aggregator.sync_anchor_change(
+                        past_key_values,
+                        anchor_token_count=anchor_manager.get_protected_token_count(),
+                        tokens_per_frame=tokens_per_frame,
+                        anchor_keep_ratio=anchor_keep_ratio,
+                        anchor_token_indices=anchor_token_indices,
+                        is_fifo=is_fifo,
+                    )
 
             if recent_merger is not None:
                 tokens_per_frame = int(aggregated_tokens[-1].shape[2])

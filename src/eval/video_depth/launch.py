@@ -14,7 +14,10 @@ from eval.video_depth.utils import save_depth_maps
 from accelerate import PartialState
 from add_ckpt_path import add_path_to_dust3r
 import time
+import subprocess
+from pathlib import Path
 from tqdm import tqdm
+from streamvggt.utils.cache_analysis import add_eviction_nn_analysis_args, eviction_nn_config_from_args
 
 def get_args_parser():
     parser = argparse.ArgumentParser()
@@ -49,7 +52,7 @@ def get_args_parser():
         "--eviction_policy",
         type=str,
         default="mean",
-        help="Cache eviction policy",
+        help="Cache eviction policy: mean, baseline_mean, svd_leverage, or dpp",
     )
     parser.add_argument(
         "--leverage_sketch_dim",
@@ -92,6 +95,69 @@ def get_args_parser():
         help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
     )
     parser.add_argument(
+        "--leverage_approx_method",
+        "--leverage-approx-method",
+        type=str,
+        default="right_sketch",
+        choices=("exact_qr", "right_sketch", "drineas_srht"),
+        help="Leverage approximation: exact QR, right-sketched/Compactor-style, or Drineas left SRHT",
+    )
+    parser.add_argument("--leverage_left_sketch_dim", "--leverage-left-sketch-dim", type=int, default=2048)
+    parser.add_argument("--leverage_right_jl_dim", "--leverage-right-jl-dim", type=int, default=64)
+    parser.add_argument("--leverage_random_seed", "--leverage-random-seed", type=int, default=0)
+    parser.add_argument(
+        "--leverage_eviction_selector",
+        "--leverage-eviction-selector",
+        type=str,
+        default="topk",
+        choices=("topk", "fast_dpp"),
+        help="Eviction selector for svd_leverage scores: topk or low-score Fast DPP",
+    )
+    parser.add_argument(
+        "--leverage_dpp_candidate_multiplier",
+        "--leverage-dpp-candidate-multiplier",
+        type=int,
+        default=2,
+        help="Fast DPP low-score candidate pool multiplier relative to eviction count",
+    )
+    parser.add_argument(
+        "--leverage_dpp_greedy_block_size",
+        "--leverage-dpp-greedy-block-size",
+        type=int,
+        default=32,
+        help="Fast DPP greedy selection block size; 1 is quality-oriented, larger values favor speed",
+    )
+    parser.add_argument(
+        "--layer_budget_strategy",
+        "--layer-budget-strategy",
+        type=str,
+        default="uniform",
+        choices=("uniform", "leverage_pr", "leverage_entropy"),
+        help="Layer-wise KV budget allocation strategy",
+    )
+    parser.add_argument("--layer_budget_alpha", "--layer-budget-alpha", type=float, default=0.5)
+    parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=0)
+    parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
+    parser.add_argument(
+        "--layer_budget_debug",
+        "--layer-budget-debug",
+        action="store_true",
+        help="Print layer-wise budget allocation details",
+    )
+    parser.add_argument(
+        "--layer_budget_log_scores",
+        "--layer-budget-log-scores",
+        action="store_true",
+        help="Write per-step layer budget scores to layer_budget_scores.csv under each sequence output directory",
+    )
+    parser.add_argument(
+        "--layer_budget_log_path",
+        "--layer-budget-log-path",
+        type=str,
+        default=None,
+        help="Optional explicit CSV path for layer budget score logs",
+    )
+    parser.add_argument(
         "--eviction_protect_recent_frames",
         "--eviction-protect-recent-frames",
         type=int,
@@ -102,9 +168,30 @@ def get_args_parser():
         ),
     )
     parser.add_argument(
+        "--history_anchor_strategy",
+        "--history-anchor-strategy",
+        type=str,
+        default="none",
+        choices=("none", "fixed_interval", "coverage"),
+        help="History Anchor selection strategy",
+    )
+    parser.add_argument("--anchor_interval", "--anchor-interval", type=int, default=250)
+    parser.add_argument("--min_anchor_interval", "--min-anchor-interval", type=int, default=100)
+    parser.add_argument("--window_protect_frames", "--window-protect-frames", type=int, default=0)
+    parser.add_argument("--max_anchors", "--max-anchors", type=int, default=0)
+    parser.add_argument("--coverage_threshold", "--coverage-threshold", type=float, default=0.2)
+    parser.add_argument("--anchor_keep_ratio", "--anchor-keep-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--profile_eviction",
+        "--profile-eviction",
+        action="store_true",
+        help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior",
+    )
+    add_eviction_nn_analysis_args(parser)
+    parser.add_argument(
         "--budget",
         type=int,
-        default=500000,
+        default=200000,
         help="Total token budget for StreamVGGT inference",
     )
 
@@ -124,6 +211,22 @@ def get_args_parser():
         help="list of sequences for pose evaluation",
     )
     return parser
+
+
+def summarize_layer_budget_log(log_path):
+    if not log_path or not os.path.exists(log_path):
+        return
+    script_path = Path(__file__).resolve().parents[3] / "tools" / "summarize_layer_budget_scores.py"
+    if not script_path.exists():
+        print(f"[LayerBudget] summary script not found: {script_path}")
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(script_path), str(log_path)],
+            check=True,
+        )
+    except Exception as exc:
+        print(f"[LayerBudget] failed to summarize {log_path}: {exc}")
 
 
 def eval_pose_estimation(args, model, save_dir=None):
@@ -200,6 +303,22 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 for view in views:
                     view["img"] = (view["img"] + 1.0) / 2.0
                 start = time.time()
+                eviction_nn_analysis_config = None
+                if args.eviction_nn_analysis_dir:
+                    safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                    nn_dir = os.path.join(
+                        args.eviction_nn_analysis_dir,
+                        args.eval_dataset,
+                        f"rank_{distributed_state.process_index}",
+                        safe_seq,
+                    )
+                    eviction_nn_analysis_config = eviction_nn_config_from_args(args, output_dir=nn_dir)
+                layer_budget_log_path = None
+                if args.layer_budget_log_path:
+                    layer_budget_log_path = args.layer_budget_log_path
+                elif args.layer_budget_log_scores:
+                    safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                    layer_budget_log_path = os.path.join(save_dir, safe_seq, "layer_budget_scores.csv")
                 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
                 with torch.cuda.amp.autocast(dtype=dtype):
                     output = model.inference(
@@ -211,7 +330,29 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_projection=args.leverage_projection,
                         leverage_head_mean_dim=args.leverage_head_mean_dim,
                         leverage_normalize_rows=args.leverage_normalize_rows,
+                        leverage_approx_method=args.leverage_approx_method,
+                        leverage_left_sketch_dim=args.leverage_left_sketch_dim,
+                        leverage_right_jl_dim=args.leverage_right_jl_dim,
+                        leverage_random_seed=args.leverage_random_seed,
+                        leverage_eviction_selector=args.leverage_eviction_selector,
+                        leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
+                        leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
+                        layer_budget_strategy=args.layer_budget_strategy,
+                        layer_budget_alpha=args.layer_budget_alpha,
+                        layer_budget_min_tokens=args.layer_budget_min_tokens,
+                        layer_budget_eps=args.layer_budget_eps,
+                        layer_budget_debug=args.layer_budget_debug,
+                        layer_budget_log_path=layer_budget_log_path,
                         eviction_protect_recent_frames=args.eviction_protect_recent_frames,
+                        history_anchor_strategy=args.history_anchor_strategy,
+                        anchor_interval=args.anchor_interval,
+                        min_anchor_interval=args.min_anchor_interval,
+                        window_protect_frames=args.window_protect_frames,
+                        max_anchors=args.max_anchors,
+                        coverage_threshold=args.coverage_threshold,
+                        anchor_keep_ratio=args.anchor_keep_ratio,
+                        eviction_debug=args.profile_eviction,
+                        eviction_nn_analysis_config=eviction_nn_analysis_config,
                     )
                     outputs = dict(views=output.views, pred=output.ress)
                 end = time.time()
@@ -224,6 +365,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 
                     os.makedirs(f"{save_dir}/{seq}", exist_ok=True)
                     save_depth_maps(pts3ds_self, f"{save_dir}/{seq}", conf_self=conf_self)
+                    summarize_layer_budget_log(layer_budget_log_path)
 
             except Exception as e:
                 if "out of memory" in str(e):
@@ -256,11 +398,71 @@ if __name__ == "__main__":
             "Error: --leverage_head_mean_dim must be >= 1, "
             f"got {args.leverage_head_mean_dim}."
         )
+    if args.leverage_dpp_candidate_multiplier < 1:
+        raise SystemExit(
+            "Error: --leverage_dpp_candidate_multiplier must be >= 1, "
+            f"got {args.leverage_dpp_candidate_multiplier}."
+        )
+    if args.leverage_dpp_greedy_block_size < 1:
+        raise SystemExit(
+            "Error: --leverage_dpp_greedy_block_size must be >= 1, "
+            f"got {args.leverage_dpp_greedy_block_size}."
+        )
+    if args.layer_budget_alpha < 0:
+        raise SystemExit(
+            "Error: --layer_budget_alpha must be >= 0, "
+            f"got {args.layer_budget_alpha}."
+        )
+    if args.layer_budget_min_tokens < 0:
+        raise SystemExit(
+            "Error: --layer_budget_min_tokens must be >= 0, "
+            f"got {args.layer_budget_min_tokens}."
+        )
+    if args.layer_budget_eps <= 0:
+        raise SystemExit(
+            "Error: --layer_budget_eps must be > 0, "
+            f"got {args.layer_budget_eps}."
+        )
+    if args.layer_budget_strategy != "uniform" and (
+        args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
+    ):
+        raise SystemExit(
+            "Error: --layer_budget_strategy leverage_pr/leverage_entropy requires "
+            "--eviction_policy svd_leverage and --leverage_granularity layer."
+        )
     if args.eviction_protect_recent_frames < 0:
         raise SystemExit(
             "Error: --eviction_protect_recent_frames must be >= 0, "
             f"got {args.eviction_protect_recent_frames}."
         )
+    if args.anchor_interval < 1:
+        raise SystemExit(f"Error: --anchor_interval must be >= 1, got {args.anchor_interval}.")
+    if args.min_anchor_interval is not None and args.min_anchor_interval < 0:
+        raise SystemExit(
+            "Error: --min_anchor_interval must be >= 0, "
+            f"got {args.min_anchor_interval}."
+        )
+    if args.window_protect_frames < 0:
+        raise SystemExit(
+            "Error: --window_protect_frames must be >= 0, "
+            f"got {args.window_protect_frames}."
+        )
+    if args.max_anchors < 0:
+        raise SystemExit(f"Error: --max_anchors must be >= 0, got {args.max_anchors}.")
+    if not (0.0 <= args.coverage_threshold <= 1.0):
+        raise SystemExit(
+            "Error: --coverage_threshold must be in [0, 1], "
+            f"got {args.coverage_threshold}."
+        )
+    if not (0.0 <= args.anchor_keep_ratio <= 1.0):
+        raise SystemExit(
+            "Error: --anchor_keep_ratio must be in [0, 1], "
+            f"got {args.anchor_keep_ratio}."
+        )
+    try:
+        eviction_nn_config_from_args(args, output_dir=args.eviction_nn_analysis_dir)
+    except ValueError as exc:
+        raise SystemExit(f"Error: {exc}") from exc
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
         print(
@@ -268,9 +470,27 @@ if __name__ == "__main__":
             f"sketch_dim={sketch_label}, "
             f"granularity={args.leverage_granularity}, "
             f"feature={args.leverage_feature}, "
+            f"approx={args.leverage_approx_method}, "
+            f"r1={args.leverage_left_sketch_dim}, r2={args.leverage_right_jl_dim}, "
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
+            f"selector={args.leverage_eviction_selector}, "
+            f"dpp_candidate_multiplier={args.leverage_dpp_candidate_multiplier}, "
+            f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
+            f"layer_budget_strategy={args.layer_budget_strategy}, "
+            f"layer_budget_alpha={args.layer_budget_alpha}, "
+            f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
+            f"protect_recent_frames={args.eviction_protect_recent_frames}"
+        )
+    elif args.eviction_policy == "dpp":
+        print(
+            "Using DPP-only eviction: "
+            f"granularity={args.leverage_granularity}, "
+            f"feature={args.leverage_feature}, "
+            f"projection={args.leverage_projection}, "
+            f"head_mean_dim={args.leverage_head_mean_dim}, "
+            f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
             f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
     add_path_to_dust3r(args.weights)

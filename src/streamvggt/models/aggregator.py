@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,11 +13,15 @@ from typing import Optional, Tuple, Union, List, Dict, Any
 
 from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
-from streamvggt.layers.recent_merge import RecentMergeConfig
+from streamvggt.layers.recent_merge import KVCacheMetadata, RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
+from streamvggt.layers.eviction import (
+    VALID_LAYER_BUDGET_STRATEGIES,
+    _allocate_layer_budgets_from_scores,
+)
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig, PreEvictionSnapshotConfig
+from streamvggt.utils.cache_analysis import CacheAnalysisConfig, EvictionNNAnalysisConfig, PreEvictionSnapshotConfig
 from streamvggt.utils.global_attn_ranges import (
     GlobalAttnIdxRange,
     is_global_idx_enabled,
@@ -151,6 +156,7 @@ class Aggregator(nn.Module):
                 persistent=False,
             )
         self.last_scores = torch.zeros(self.depth)
+        self.last_layer_budget_scores = torch.zeros(self.depth)
         self.last_global_attn_debug_trace = []
 
 
@@ -204,6 +210,7 @@ class Aggregator(nn.Module):
         total_budget=0,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         eviction_policy: str = "mean",
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
@@ -212,7 +219,22 @@ class Aggregator(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_approx_method: str = "right_sketch",
+        leverage_left_sketch_dim: Optional[int] = 2048,
+        leverage_right_jl_dim: Optional[int] = 64,
+        leverage_random_seed: int = 0,
+        leverage_eviction_selector: str = "topk",
+        leverage_dpp_candidate_multiplier: int = 2,
+        leverage_dpp_greedy_block_size: int = 32,
+        layer_budget_strategy: str = "uniform",
+        layer_budget_alpha: float = 0.5,
+        layer_budget_min_tokens: int = 0,
+        layer_budget_eps: float = 1e-12,
+        layer_budget_debug: bool = False,
+        layer_budget_log_path: Optional[str] = None,
         eviction_protect_recent_frames: int = 0,
+        anchor_token_count: Optional[int] = None,
+        window_token_count: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
         svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
         voxel_covis_frame_ids: Optional[List[int]] = None,
@@ -232,6 +254,18 @@ class Aggregator(nn.Module):
                 and the patch_start_idx indicating where patch tokens begin.
         """
         B, S, C_in, H, W = images.shape
+        if layer_budget_strategy not in VALID_LAYER_BUDGET_STRATEGIES:
+            raise ValueError(
+                "layer_budget_strategy must be one of "
+                f"{VALID_LAYER_BUDGET_STRATEGIES}, got {layer_budget_strategy!r}"
+            )
+        if layer_budget_strategy != "uniform" and (
+            eviction_policy != "svd_leverage" or leverage_granularity != "layer"
+        ):
+            raise ValueError(
+                "layer_budget_strategy requires eviction_policy='svd_leverage' "
+                "and leverage_granularity='layer'"
+            )
         parsed_global_attn_idx_ranges = self._normalize_global_attn_idx_ranges(global_attn_idx_ranges)
         range_mode_enabled = parsed_global_attn_idx_ranges is not None
 
@@ -298,9 +332,20 @@ class Aggregator(nn.Module):
         current_budgets = self._calculate_dynamic_budgets(
             total_budget,
             enabled_global_idx_ranges=parsed_global_attn_idx_ranges,
+            layer_budget_strategy=layer_budget_strategy,
+            layer_budget_alpha=layer_budget_alpha,
+            layer_budget_min_tokens=layer_budget_min_tokens,
+            layer_budget_eps=layer_budget_eps,
+            layer_budget_debug=layer_budget_debug,
+            layer_budget_log_path=layer_budget_log_path,
+            layer_budget_step_idx=past_frame_idx,
+            past_key_values=past_key_values,
+            current_token_count=S * P,
         )
         scores = []
+        layer_budget_scores = []
         updated_scores = self.last_scores.clone()
+        updated_layer_budget_scores = self.last_layer_budget_scores.clone()
         self.last_global_attn_debug_trace = []
         raw_block_idx = 0
 
@@ -329,6 +374,7 @@ class Aggregator(nn.Module):
                             global_idx,
                             global_intermediates,
                             updated_scores,
+                            updated_layer_budget_scores,
                             raw_block_idx,
                         ) = self._process_global_attention_with_ranges(
                             tokens,
@@ -344,9 +390,11 @@ class Aggregator(nn.Module):
                             past_frame_idx=past_frame_idx,
                             current_budgets=current_budgets,
                             updated_scores=updated_scores,
+                            updated_layer_budget_scores=updated_layer_budget_scores,
                             raw_block_idx=raw_block_idx,
                             cache_analysis_config=cache_analysis_config,
                             pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                            eviction_nn_analysis_config=eviction_nn_analysis_config,
                             eviction_policy=eviction_policy,
                             eviction_debug=eviction_debug,
                             leverage_sketch_dim=leverage_sketch_dim,
@@ -355,7 +403,18 @@ class Aggregator(nn.Module):
                             leverage_projection=leverage_projection,
                             leverage_head_mean_dim=leverage_head_mean_dim,
                             leverage_normalize_rows=leverage_normalize_rows,
+                            leverage_approx_method=leverage_approx_method,
+                            leverage_left_sketch_dim=leverage_left_sketch_dim,
+                            leverage_right_jl_dim=leverage_right_jl_dim,
+                            leverage_random_seed=leverage_random_seed,
+                            leverage_eviction_selector=leverage_eviction_selector,
+                            leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
+                            leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                            layer_budget_strategy=layer_budget_strategy,
+                            layer_budget_eps=layer_budget_eps,
                             eviction_protect_recent_frames=eviction_protect_recent_frames,
+                            anchor_token_count=anchor_token_count,
+                            window_token_count=window_token_count,
                             recent_merge_config=recent_merge_config,
                             svd_eviction_merge_config=svd_eviction_merge_config,
                             voxel_covis_frame_ids=voxel_covis_frame_ids,
@@ -374,6 +433,7 @@ class Aggregator(nn.Module):
                             cache_budget=current_budgets[global_idx].item(),
                             cache_analysis_config=cache_analysis_config,
                             pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                            eviction_nn_analysis_config=eviction_nn_analysis_config,
                             eviction_policy=eviction_policy,
                             eviction_debug=eviction_debug,
                             leverage_sketch_dim=leverage_sketch_dim,
@@ -382,7 +442,18 @@ class Aggregator(nn.Module):
                             leverage_projection=leverage_projection,
                             leverage_head_mean_dim=leverage_head_mean_dim,
                             leverage_normalize_rows=leverage_normalize_rows,
+                            leverage_approx_method=leverage_approx_method,
+                            leverage_left_sketch_dim=leverage_left_sketch_dim,
+                            leverage_right_jl_dim=leverage_right_jl_dim,
+                            leverage_random_seed=leverage_random_seed,
+                            leverage_eviction_selector=leverage_eviction_selector,
+                            leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
+                            leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                            layer_budget_strategy=layer_budget_strategy,
+                            layer_budget_eps=layer_budget_eps,
                             eviction_protect_recent_frames=eviction_protect_recent_frames,
+                            anchor_token_count=anchor_token_count,
+                            window_token_count=window_token_count,
                             recent_merge_config=recent_merge_config,
                             svd_eviction_merge_config=svd_eviction_merge_config,
                             voxel_covis_frame_ids=voxel_covis_frame_ids,
@@ -390,10 +461,15 @@ class Aggregator(nn.Module):
                             voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                         )
                         past_key_values[global_idx - 1] = new_kv
-                        if current_scores is not None: # pruning happened
-                            scores.append(current_scores)
+                        current_score, current_layer_budget_score = self._split_score_payload(current_scores)
+                        if current_score is not None: # pruning happened
+                            scores.append(current_score)
                         else:
                             scores.append(self.last_scores[global_idx-1].item())
+                        if current_layer_budget_score is not None:
+                            layer_budget_scores.append(float(torch.as_tensor(current_layer_budget_score).detach().float().item()))
+                        else:
+                            layer_budget_scores.append(self.last_layer_budget_scores[global_idx-1].item())
                         self._record_global_attn_debug(
                             enabled=global_attn_debug,
                             raw_block_idx=raw_block_idx,
@@ -430,8 +506,17 @@ class Aggregator(nn.Module):
         assert len(output_list) == self.depth, f"Expected {self.depth} outputs, got {len(output_list)}"
         if range_mode_enabled and use_cache:
             self.last_scores = updated_scores.to(device=self.last_scores.device, dtype=self.last_scores.dtype)
+            self.last_layer_budget_scores = updated_layer_budget_scores.to(
+                device=self.last_layer_budget_scores.device,
+                dtype=self.last_layer_budget_scores.dtype,
+            )
         elif scores: # update scores
             self.last_scores = torch.tensor(scores, device=self.last_scores.device, dtype=self.last_scores.dtype)
+            self.last_layer_budget_scores = torch.tensor(
+                layer_budget_scores,
+                device=self.last_layer_budget_scores.device,
+                dtype=self.last_layer_budget_scores.dtype,
+            )
         if global_attn_debug:
             self._print_global_attn_debug_trace()
 
@@ -500,9 +585,11 @@ class Aggregator(nn.Module):
         past_frame_idx=0,
         current_budgets=None,
         updated_scores=None,
+        updated_layer_budget_scores=None,
         raw_block_idx=0,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         eviction_policy: str = "mean",
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
@@ -511,7 +598,21 @@ class Aggregator(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_approx_method: str = "right_sketch",
+        leverage_left_sketch_dim: Optional[int] = 2048,
+        leverage_right_jl_dim: Optional[int] = 64,
+        leverage_random_seed: int = 0,
+        leverage_eviction_selector: str = "topk",
+        leverage_dpp_candidate_multiplier: int = 2,
+        leverage_dpp_greedy_block_size: int = 32,
+        layer_budget_strategy: str = "uniform",
+        layer_budget_alpha: float = 0.5,
+        layer_budget_min_tokens: int = 0,
+        layer_budget_eps: float = 1e-12,
+        layer_budget_debug: bool = False,
         eviction_protect_recent_frames: int = 0,
+        anchor_token_count: Optional[int] = None,
+        window_token_count: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
         svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
         voxel_covis_frame_ids: Optional[List[int]] = None,
@@ -548,6 +649,7 @@ class Aggregator(nn.Module):
                         cache_budget=current_budgets[current_global_idx].item(),
                         cache_analysis_config=cache_analysis_config,
                         pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                        eviction_nn_analysis_config=eviction_nn_analysis_config,
                         eviction_policy=eviction_policy,
                         eviction_debug=eviction_debug,
                         leverage_sketch_dim=leverage_sketch_dim,
@@ -556,7 +658,18 @@ class Aggregator(nn.Module):
                         leverage_projection=leverage_projection,
                         leverage_head_mean_dim=leverage_head_mean_dim,
                         leverage_normalize_rows=leverage_normalize_rows,
+                        leverage_approx_method=leverage_approx_method,
+                        leverage_left_sketch_dim=leverage_left_sketch_dim,
+                        leverage_right_jl_dim=leverage_right_jl_dim,
+                        leverage_random_seed=leverage_random_seed,
+                        leverage_eviction_selector=leverage_eviction_selector,
+                        leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
+                        leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                        layer_budget_strategy=layer_budget_strategy,
+                        layer_budget_eps=layer_budget_eps,
                         eviction_protect_recent_frames=eviction_protect_recent_frames,
+                        anchor_token_count=anchor_token_count,
+                        window_token_count=window_token_count,
                         recent_merge_config=recent_merge_config,
                         svd_eviction_merge_config=svd_eviction_merge_config,
                         voxel_covis_frame_ids=voxel_covis_frame_ids,
@@ -567,11 +680,18 @@ class Aggregator(nn.Module):
                     kv_write = True
                     past_key_values[current_global_idx] = new_kv
                     self._assert_enabled_cache_compatible(before_cache_shape, new_kv, current_global_idx)
-                    if current_scores is not None:
+                    current_score, current_layer_budget_score = self._split_score_payload(current_scores)
+                    if current_score is not None:
                         updated_scores[current_global_idx] = torch.as_tensor(
-                            current_scores,
+                            current_score,
                             device=updated_scores.device,
                             dtype=updated_scores.dtype,
+                        )
+                    if current_layer_budget_score is not None and updated_layer_budget_scores is not None:
+                        updated_layer_budget_scores[current_global_idx] = torch.as_tensor(
+                            current_layer_budget_score,
+                            device=updated_layer_budget_scores.device,
+                            dtype=updated_layer_budget_scores.dtype,
                         )
                 else:
                     tokens, global_idx, block_intermediates = self._process_global_attention(
@@ -600,7 +720,7 @@ class Aggregator(nn.Module):
             )
             raw_block_idx += 1
 
-        return tokens, global_idx, intermediates, updated_scores, raw_block_idx
+        return tokens, global_idx, intermediates, updated_scores, updated_layer_budget_scores, raw_block_idx
 
     def _process_global_attention(
         self,
@@ -617,6 +737,7 @@ class Aggregator(nn.Module):
         cache_budget=None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
+        eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         eviction_policy: str = "mean",
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
@@ -625,7 +746,21 @@ class Aggregator(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_approx_method: str = "right_sketch",
+        leverage_left_sketch_dim: Optional[int] = 2048,
+        leverage_right_jl_dim: Optional[int] = 64,
+        leverage_random_seed: int = 0,
+        leverage_eviction_selector: str = "topk",
+        leverage_dpp_candidate_multiplier: int = 2,
+        leverage_dpp_greedy_block_size: int = 32,
+        layer_budget_strategy: str = "uniform",
+        layer_budget_alpha: float = 0.5,
+        layer_budget_min_tokens: int = 0,
+        layer_budget_eps: float = 1e-12,
+        layer_budget_debug: bool = False,
         eviction_protect_recent_frames: int = 0,
+        anchor_token_count: Optional[int] = None,
+        window_token_count: int = 0,
         recent_merge_config: Optional[RecentMergeConfig] = None,
         svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
         voxel_covis_frame_ids: Optional[List[int]] = None,
@@ -668,6 +803,7 @@ class Aggregator(nn.Module):
                     cache_budget=cache_budget,
                     cache_analysis_config=cache_analysis_config,
                     pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                    eviction_nn_analysis_config=eviction_nn_analysis_config,
                     layer_id=global_idx,
                     step_idx=past_frame_idx,
                     tokens_per_frame=P,
@@ -679,7 +815,18 @@ class Aggregator(nn.Module):
                     leverage_projection=leverage_projection,
                     leverage_head_mean_dim=leverage_head_mean_dim,
                     leverage_normalize_rows=leverage_normalize_rows,
+                    leverage_approx_method=leverage_approx_method,
+                    leverage_left_sketch_dim=leverage_left_sketch_dim,
+                    leverage_right_jl_dim=leverage_right_jl_dim,
+                    leverage_random_seed=leverage_random_seed,
+                    leverage_eviction_selector=leverage_eviction_selector,
+                    leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
+                    leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                    layer_budget_strategy=layer_budget_strategy,
+                    layer_budget_eps=layer_budget_eps,
                     eviction_protect_recent_frames=eviction_protect_recent_frames,
+                    anchor_token_count=anchor_token_count,
+                    window_token_count=window_token_count,
                     recent_merge_config=recent_merge_config,
                     svd_eviction_merge_config=svd_eviction_merge_config,
                     voxel_covis_frame_ids=voxel_covis_frame_ids,
@@ -771,36 +918,290 @@ class Aggregator(nn.Module):
                 f"before={before_cache_shape}, after={after_cache_shape}"
             )
         
-    def _calculate_dynamic_budgets(self, total_budget, enabled_global_idx_ranges=None):
+
+    def sync_anchor_change(
+        self,
+        past_key_values,
+        anchor_token_count: int,
+        tokens_per_frame: int,
+        anchor_keep_ratio: float,
+        anchor_token_indices: Optional[torch.Tensor] = None,
+        is_fifo: bool = False,
+    ):
+        """Promote newest-frame tokens into the protected anchor zone."""
+        if past_key_values is None or anchor_token_count is None:
+            return past_key_values
+
+        anchor_token_count = int(anchor_token_count)
+        tokens_per_frame = int(tokens_per_frame)
+        if tokens_per_frame <= 0 or anchor_token_count <= tokens_per_frame:
+            return past_key_values
+
+        if anchor_token_indices is not None:
+            anchor_chunk = int(anchor_token_indices.shape[-1])
+        else:
+            anchor_chunk = max(int(tokens_per_frame * anchor_keep_ratio), 1)
+        anchor_chunk = min(anchor_chunk, tokens_per_frame)
+        if anchor_chunk <= 0:
+            return past_key_values
+
+        global_anchor_end = tokens_per_frame
+
+        for idx in range(self.depth):
+            if past_key_values[idx] is None:
+                continue
+
+            layer_kv = past_key_values[idx]
+            if len(layer_kv) == 3:
+                k, v, metadata = layer_kv
+            else:
+                k, v = layer_kv
+                metadata = None
+
+            B, H, N, D = k.shape
+            if N <= anchor_token_count:
+                continue
+
+            new_frame_start = N - tokens_per_frame
+            if new_frame_start < 0 or new_frame_start < anchor_token_count:
+                continue
+
+            frame_indices = torch.arange(tokens_per_frame, device=k.device, dtype=torch.long)
+            if anchor_token_indices is None:
+                selected_by_batch = frame_indices[:anchor_chunk].view(1, anchor_chunk).expand(B, anchor_chunk)
+            else:
+                selected_by_batch = anchor_token_indices.to(device=k.device, dtype=torch.long)
+                if selected_by_batch.dim() == 1:
+                    selected_by_batch = selected_by_batch.view(1, -1).expand(B, -1)
+                selected_by_batch = selected_by_batch[:, :anchor_chunk]
+
+            batch_orders = []
+            for b in range(B):
+                selected = selected_by_batch[b]
+                selected = selected[(selected >= 0) & (selected < tokens_per_frame)]
+                if selected.numel() != anchor_chunk:
+                    fallback = frame_indices[:anchor_chunk]
+                    selected = fallback
+                mask = torch.ones(tokens_per_frame, device=k.device, dtype=torch.bool)
+                mask[selected] = False
+                remaining = frame_indices[mask]
+                selected_abs = selected + new_frame_start
+                remaining_abs = remaining + new_frame_start
+
+                if is_fifo:
+                    demote_start = global_anchor_end
+                    demote_end = min(global_anchor_end + anchor_chunk, anchor_token_count)
+                    if demote_end <= demote_start:
+                        break
+                    order = torch.cat(
+                        [
+                            torch.arange(0, demote_start, device=k.device, dtype=torch.long),
+                            torch.arange(demote_end, anchor_token_count, device=k.device, dtype=torch.long),
+                            selected_abs,
+                            torch.arange(anchor_token_count, new_frame_start, device=k.device, dtype=torch.long),
+                            remaining_abs,
+                            torch.arange(new_frame_start + tokens_per_frame, N, device=k.device, dtype=torch.long),
+                            torch.arange(demote_start, demote_end, device=k.device, dtype=torch.long),
+                        ],
+                        dim=0,
+                    )
+                else:
+                    old_anchor_end = max(anchor_token_count - anchor_chunk, global_anchor_end)
+                    if old_anchor_end > new_frame_start:
+                        break
+                    order = torch.cat(
+                        [
+                            torch.arange(0, old_anchor_end, device=k.device, dtype=torch.long),
+                            selected_abs,
+                            torch.arange(old_anchor_end, new_frame_start, device=k.device, dtype=torch.long),
+                            remaining_abs,
+                            torch.arange(new_frame_start + tokens_per_frame, N, device=k.device, dtype=torch.long),
+                        ],
+                        dim=0,
+                    )
+
+                if order.numel() != N:
+                    break
+                batch_orders.append(order)
+
+            if len(batch_orders) != B:
+                continue
+
+            gather_indices = torch.stack(batch_orders, dim=0).view(B, 1, N).expand(B, H, N)
+            expanded_indices = gather_indices.unsqueeze(-1).expand(B, H, N, D)
+            k_new = torch.gather(k, 2, expanded_indices)
+            v_new = torch.gather(v, 2, expanded_indices)
+            if metadata is not None:
+                metadata = metadata.gather(gather_indices.detach().cpu())
+                past_key_values[idx] = (k_new, v_new, metadata)
+            else:
+                past_key_values[idx] = (k_new, v_new)
+
+        return past_key_values
+
+    @staticmethod
+    def _split_score_payload(score_payload):
+        if isinstance(score_payload, tuple):
+            if len(score_payload) != 2:
+                raise ValueError(f"Unexpected score payload length: {len(score_payload)}")
+            return score_payload
+        return score_payload, None
+
+    def _layer_budget_capacities(self, past_key_values, current_token_count, enabled_global_idx_ranges=None):
+        capacities = {}
+        current_token_count = max(int(current_token_count or 0), 0)
+        for idx in range(self.depth):
+            if enabled_global_idx_ranges is not None and not is_global_idx_enabled(idx, enabled_global_idx_ranges):
+                capacities[idx] = 0
+                continue
+            past_tokens = 0
+            if past_key_values is not None and idx < len(past_key_values) and past_key_values[idx] is not None:
+                shape = _cache_shape(past_key_values[idx])
+                past_tokens = 0 if shape is None else int(shape[2])
+            capacities[idx] = past_tokens + current_token_count
+        return capacities
+
+    def _print_layer_budget_debug(self, strategy, total_budget, alpha, min_tokens, capacities, budgets, details):
+        active_layers = [layer for layer, cap in capacities.items() if cap > 0]
+        print(
+            f"[LayerBudget/{strategy}] "
+            f"total_budget={int(total_budget)} "
+            f"assigned_budget={details.get('assigned_budget', sum(budgets.values()))} "
+            f"active_layers={len(active_layers)} alpha={alpha} min_tokens={min_tokens}"
+        )
+        for event in details.get("events", []):
+            print(f"[LayerBudget/{strategy}] {event}")
+        for layer in active_layers:
+            print(
+                f"[LayerBudget/{strategy}] "
+                f"layer={layer:02d} N={capacities[layer]} "
+                f"score={details.get('scores', {}).get(layer, 0.0):.6g} "
+                f"weight={details.get('weights', {}).get(layer, 0.0):.6g} "
+                f"raw_budget={details.get('raw_budgets', {}).get(layer, 0.0):.3f} "
+                f"final_budget={budgets.get(layer, 0)}"
+            )
+
+    def _append_layer_budget_log(
+        self,
+        log_path,
+        step_idx,
+        strategy,
+        total_budget,
+        capacities,
+        budgets,
+        details,
+    ):
+        if not log_path:
+            return
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+        events = "|".join(details.get("events", []))
+        active_layers = [layer for layer, cap in capacities.items() if cap > 0]
+        with open(log_path, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write(
+                    "step,strategy,total_budget,assigned_budget,total_capacity,"
+                    "active_layers,layer,capacity,score,weight,raw_budget,final_budget,events\n"
+                )
+            for layer in active_layers:
+                f.write(
+                    f"{int(step_idx)},{strategy},{int(total_budget)},"
+                    f"{details.get('assigned_budget', sum(budgets.values()))},"
+                    f"{details.get('total_capacity', sum(capacities.values()))},"
+                    f"{len(active_layers)},{layer},{capacities[layer]},"
+                    f"{details.get('scores', {}).get(layer, 0.0):.9g},"
+                    f"{details.get('weights', {}).get(layer, 0.0):.9g},"
+                    f"{details.get('raw_budgets', {}).get(layer, 0.0):.9g},"
+                    f"{budgets.get(layer, 0)},{events}\n"
+                )
+
+    def _calculate_dynamic_budgets(
+        self,
+        total_budget,
+        enabled_global_idx_ranges=None,
+        layer_budget_strategy: str = "uniform",
+        layer_budget_alpha: float = 0.5,
+        layer_budget_min_tokens: int = 0,
+        layer_budget_eps: float = 1e-12,
+        layer_budget_debug: bool = False,
+        layer_budget_log_path: Optional[str] = None,
+        layer_budget_step_idx: int = 0,
+        past_key_values=None,
+        current_token_count: int = 0,
+    ):
 
         with torch.no_grad():
             if total_budget < 0:
                 total_budget = 0
-            if enabled_global_idx_ranges is None:
-                diversity_scores = 1.0 - self.last_scores
-                scaled_scores = diversity_scores / 0.5
-                proportions = torch.softmax(scaled_scores, dim=0)
-                budgets = proportions * total_budget
-            else:
-                budgets = torch.zeros_like(self.last_scores)
-                enabled_indices = [
-                    idx
-                    for idx in range(len(self.last_scores))
-                    if is_global_idx_enabled(idx, enabled_global_idx_ranges)
-                ]
-                if enabled_indices:
-                    enabled_idx_tensor = torch.tensor(
-                        enabled_indices,
-                        device=self.last_scores.device,
-                        dtype=torch.long,
-                    )
-                    enabled_scores = self.last_scores.index_select(0, enabled_idx_tensor)
-                    diversity_scores = 1.0 - enabled_scores
+            if layer_budget_strategy == "uniform":
+                if enabled_global_idx_ranges is None:
+                    diversity_scores = 1.0 - self.last_scores
                     scaled_scores = diversity_scores / 0.5
                     proportions = torch.softmax(scaled_scores, dim=0)
-                    budgets[enabled_idx_tensor] = proportions * total_budget
+                    budgets = proportions * total_budget
+                else:
+                    budgets = torch.zeros_like(self.last_scores)
+                    enabled_indices = [
+                        idx
+                        for idx in range(len(self.last_scores))
+                        if is_global_idx_enabled(idx, enabled_global_idx_ranges)
+                    ]
+                    if enabled_indices:
+                        enabled_idx_tensor = torch.tensor(
+                            enabled_indices,
+                            device=self.last_scores.device,
+                            dtype=torch.long,
+                        )
+                        enabled_scores = self.last_scores.index_select(0, enabled_idx_tensor)
+                        diversity_scores = 1.0 - enabled_scores
+                        scaled_scores = diversity_scores / 0.5
+                        proportions = torch.softmax(scaled_scores, dim=0)
+                        budgets[enabled_idx_tensor] = proportions * total_budget
+                return budgets.int()
 
-        return budgets.int()
+            capacities = self._layer_budget_capacities(
+                past_key_values,
+                current_token_count,
+                enabled_global_idx_ranges=enabled_global_idx_ranges,
+            )
+            score_dict = {
+                idx: self.last_layer_budget_scores[idx]
+                for idx in range(len(self.last_layer_budget_scores))
+            }
+            budget_dict, details = _allocate_layer_budgets_from_scores(
+                score_dict,
+                capacities,
+                total_budget,
+                alpha=layer_budget_alpha,
+                min_tokens=layer_budget_min_tokens,
+                eps=layer_budget_eps,
+                return_debug=True,
+            )
+            budgets = torch.zeros_like(self.last_scores, dtype=torch.int32)
+            for idx, budget in budget_dict.items():
+                budgets[idx] = int(budget)
+            if layer_budget_debug:
+                self._print_layer_budget_debug(
+                    layer_budget_strategy,
+                    total_budget,
+                    layer_budget_alpha,
+                    layer_budget_min_tokens,
+                    capacities,
+                    budget_dict,
+                    details,
+                )
+            self._append_layer_budget_log(
+                layer_budget_log_path,
+                layer_budget_step_idx,
+                layer_budget_strategy,
+                total_budget,
+                capacities,
+                budget_dict,
+                details,
+            )
+            return budgets.int()
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

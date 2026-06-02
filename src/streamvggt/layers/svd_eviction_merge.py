@@ -417,7 +417,8 @@ class SvdEvictionMerger:
             q = basis.q[b]
             diag = basis.r_diag[b]
         coords = torch.nan_to_num(q.to(device=device, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        if self.config.use_u_sigma and diag.numel() > 0:
+        basis_kind = getattr(basis, "basis_kind", "qr")
+        if self.config.use_u_sigma and diag.numel() > 0 and basis_kind != "drineas_srht" and diag.numel() == coords.shape[-1]:
             coords = coords * torch.nan_to_num(diag.to(device=device, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0).view(1, -1)
         return coords
 
@@ -427,6 +428,8 @@ class SvdEvictionMerger:
             return torch.empty(0, device=device, dtype=torch.long)
         diag = basis.r_diag[b, h] if basis.granularity == "head" else basis.r_diag[b]
         diag = torch.nan_to_num(diag.to(device=device, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if getattr(basis, "basis_kind", "qr") == "drineas_srht":
+            return torch.arange(axes, device=device, dtype=torch.long)
         if diag.numel() >= axes:
             return torch.topk(diag.abs(), k=axes, dim=-1).indices.sort().values
         return torch.arange(axes, device=device, dtype=torch.long)

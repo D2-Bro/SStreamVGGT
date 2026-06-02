@@ -23,6 +23,7 @@ if SRC_ROOT not in sys.path:
 from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.utils.load_fn import load_and_preprocess_images
 from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+from streamvggt.utils.cache_analysis import add_eviction_nn_analysis_args, eviction_nn_config_from_args
 from streamvggt.layers.recent_merge import RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig
@@ -330,6 +331,7 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
         debug=args.covis_debug_log,
     )
     covis_log_fn = print if args.covis_debug_log else None
+    eviction_nn_analysis_config = eviction_nn_config_from_args(args)
 
     if torch.cuda.is_available() and str(device).startswith("cuda"):
         dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -345,6 +347,11 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             leverage_feature=args.leverage_feature,
             leverage_projection=args.leverage_projection,
             leverage_head_mean_dim=args.leverage_head_mean_dim,
+            leverage_approx_method=args.leverage_approx_method,
+            leverage_left_sketch_dim=args.leverage_left_sketch_dim,
+            leverage_right_jl_dim=args.leverage_right_jl_dim,
+            leverage_random_seed=args.leverage_random_seed,
+            eviction_nn_analysis_config=eviction_nn_analysis_config,
             eviction_protect_recent_frames=args.eviction_protect_recent_frames,
             recent_merge_config=recent_merge_config,
             svd_eviction_merge_config=svd_eviction_merge_config,
@@ -457,7 +464,18 @@ def main():
         choices=("random", "head_mean"),
     )
     parser.add_argument("--leverage_head_mean_dim", "--leverage-head-mean-dim", type=int, default=4)
+    parser.add_argument(
+        "--leverage_approx_method",
+        "--leverage-approx-method",
+        type=str,
+        default="right_sketch",
+        choices=("exact_qr", "right_sketch", "drineas_srht"),
+    )
+    parser.add_argument("--leverage_left_sketch_dim", "--leverage-left-sketch-dim", type=int, default=2048)
+    parser.add_argument("--leverage_right_jl_dim", "--leverage-right-jl-dim", type=int, default=64)
+    parser.add_argument("--leverage_random_seed", "--leverage-random-seed", type=int, default=0)
     parser.add_argument("--eviction_protect_recent_frames", "--eviction-protect-recent-frames", type=int, default=0)
+    add_eviction_nn_analysis_args(parser)
     parser.add_argument("--enable_svd_eviction_merge", "--enable-svd-eviction-merge", action="store_true")
     parser.add_argument(
         "--svd_eviction_merge_mode",
@@ -533,6 +551,7 @@ def main():
         f"frames={len(img_paths)}/{args.max_frames}, "
         f"budget={args.budget}, "
         f"eviction_policy={args.eviction_policy}, "
+        f"approx={args.leverage_approx_method}, "
         f"granularity={args.leverage_granularity}, "
         f"projection={args.leverage_projection}, "
         f"head_mean_dim={args.leverage_head_mean_dim}"
