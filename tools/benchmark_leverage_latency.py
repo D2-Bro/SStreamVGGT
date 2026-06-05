@@ -27,6 +27,7 @@ class Case:
     r1: int | None = None
     r2: int | None = None
     right_sketch_dim: int | None = None
+    ridge_dim: int | None = None
 
 
 def _dtype(name: str) -> torch.dtype:
@@ -59,15 +60,44 @@ def _manager_scores(mat: torch.Tensor, case: Case, seed: int, profile: bool) -> 
         leverage_approx_method=case.method,
         leverage_left_sketch_dim=case.r1,
         leverage_right_jl_dim=case.r2,
+        leverage_ridge_lambda=1e-3,
+        leverage_ridge_lambda_mode="relative",
+        leverage_ridge_score_chunk_size=4096,
+        leverage_ridge_jitter=1e-6,
+        leverage_ridge_dim=case.ridge_dim,
         leverage_random_seed=seed,
     )
     scores = manager.compute_svd_leverage_scores(mat, case.right_sketch_dim)
     if profile and manager._last_leverage_profile:
-        profile_items = " ".join(
-            f"{key}={value * 1000.0:.3f}ms" if key != "fallback" else f"{key}={int(value)}"
-            for key, value in manager._last_leverage_profile.items()
-        )
-        print(f"    profile[{case.name}] {profile_items}")
+        time_fields = {
+            "candidate_matrix_preparation",
+            "feature",
+            "sketch",
+            "sketch_matrix_retrieval",
+            "projection_matmul",
+            "qr",
+            "small_qr",
+            "left_sketch",
+            "right_jl_solve",
+            "omega_gemm",
+            "gram",
+            "cholesky",
+            "score_solve",
+            "scoring",
+            "total",
+        }
+        int_fields = {"fallback", "N", "D", "sketch_dim", "cholesky_retries"}
+        profile_items = []
+        for key, value in manager._last_leverage_profile.items():
+            if isinstance(value, str):
+                profile_items.append(f"{key}={value}")
+            elif key in int_fields:
+                profile_items.append(f"{key}={int(value)}")
+            elif key in time_fields:
+                profile_items.append(f"{key}={value * 1000.0:.3f}ms")
+            else:
+                profile_items.append(f"{key}={float(value):.6g}")
+        print(f"    profile[{case.name}] {' '.join(profile_items)}")
     return scores
 
 
@@ -209,6 +239,8 @@ def main() -> None:
         Case("exact_svd_full", "exact_svd"),
         Case("exact_qr_impl", "exact_qr", right_sketch_dim=0),
         Case(f"current_{args.current_method}", args.current_method, r1=2048, r2=64, right_sketch_dim=args.current_right_sketch_dim),
+        Case("full_d_ridge", "full_d_ridge", right_sketch_dim=0),
+        Case("right_sketch_ridge_r64", "right_sketch_ridge", r2=64, ridge_dim=64, right_sketch_dim=0),
         Case("drineas_r1_384_r2_64", "drineas_srht", r1=384, r2=64, right_sketch_dim=0),
         Case("drineas_r1_512_r2_128", "drineas_srht", r1=512, r2=128, right_sketch_dim=0),
         Case("drineas_r1_768_r2_128", "drineas_srht", r1=768, r2=128, right_sketch_dim=0),

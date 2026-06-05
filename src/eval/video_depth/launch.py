@@ -99,11 +99,47 @@ def get_args_parser():
         "--leverage-approx-method",
         type=str,
         default="right_sketch",
-        choices=("exact_qr", "right_sketch", "drineas_srht"),
+        choices=("exact_qr", "right_sketch", "drineas_srht", "full_d_ridge", "right_sketch_ridge"),
         help="Leverage approximation: exact QR, right-sketched/Compactor-style, or Drineas left SRHT",
     )
     parser.add_argument("--leverage_left_sketch_dim", "--leverage-left-sketch-dim", type=int, default=2048)
     parser.add_argument("--leverage_right_jl_dim", "--leverage-right-jl-dim", type=int, default=64)
+    parser.add_argument(
+        "--leverage_ridge_lambda",
+        "--leverage-ridge-lambda",
+        type=float,
+        default=1e-3,
+        help="Ridge lambda for full_d_ridge and right_sketch_ridge leverage scoring",
+    )
+    parser.add_argument(
+        "--leverage_ridge_lambda_mode",
+        "--leverage-ridge-lambda-mode",
+        type=str,
+        default="relative",
+        choices=("relative", "absolute"),
+        help="Use absolute lambda or scale it by trace(X^T X) / D",
+    )
+    parser.add_argument(
+        "--leverage_ridge_score_chunk_size",
+        "--leverage-ridge-score-chunk-size",
+        type=int,
+        default=4096,
+        help="Token chunk size for ridge leverage Cholesky solves",
+    )
+    parser.add_argument(
+        "--leverage_ridge_jitter",
+        "--leverage-ridge-jitter",
+        type=float,
+        default=1e-6,
+        help="Relative diagonal jitter added to ridge systems before Cholesky",
+    )
+    parser.add_argument(
+        "--leverage_ridge_dim",
+        "--leverage-ridge-dim",
+        type=int,
+        default=None,
+        help="Projection dimension for right_sketch_ridge; defaults to --leverage_right_jl_dim when omitted",
+    )
     parser.add_argument("--leverage_random_seed", "--leverage-random-seed", type=int, default=0)
     parser.add_argument(
         "--leverage_eviction_selector",
@@ -128,16 +164,47 @@ def get_args_parser():
         help="Fast DPP greedy selection block size; 1 is quality-oriented, larger values favor speed",
     )
     parser.add_argument(
+        "--leverage_dpp_diversity_beta",
+        "--leverage-dpp-diversity-beta",
+        type=float,
+        default=1.0,
+        help="Fast DPP diversity log-term weight; 1.0 preserves the default DPP balance",
+    )
+    parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
         type=str,
         default="uniform",
-        choices=("uniform", "leverage_pr", "leverage_entropy"),
+        choices=("uniform", "cosine_precomputed", "leverage_pr", "leverage_entropy", "value_weighted_leverage_pr"),
         help="Layer-wise KV budget allocation strategy",
+    )
+    parser.add_argument(
+        "--layer_budget_proportions_path",
+        "--layer-budget-proportions-path",
+        type=str,
+        default=None,
+        help="JSON file containing fixed proportions for cosine_precomputed layer budgets",
     )
     parser.add_argument("--layer_budget_alpha", "--layer-budget-alpha", type=float, default=0.5)
     parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
+    parser.add_argument("--layer_budget_value_gamma", "--layer-budget-value-gamma", type=float, default=0.5)
+    parser.add_argument(
+        "--layer_budget_value_norm_type",
+        "--layer-budget-value-norm-type",
+        type=str,
+        default="rms",
+        choices=("mean", "rms"),
+        help="Layer value-norm prior type for value_weighted_leverage_pr budget allocation",
+    )
+    parser.add_argument(
+        "--layer_budget_norm_source",
+        "--layer-budget-norm-source",
+        type=str,
+        default="value",
+        choices=("value", "key"),
+        help="Tensor source for value_weighted_leverage_pr norm prior: value cache or key cache",
+    )
     parser.add_argument(
         "--layer_budget_debug",
         "--layer-budget-debug",
@@ -166,6 +233,33 @@ def get_args_parser():
             "Protect tokens from the most recent N processed frames from eviction while still "
             "including them in SVD leverage computation."
         ),
+    )
+    parser.add_argument(
+        "--eviction_protect_special_tokens",
+        "--eviction-protect-special-tokens",
+        action="store_true",
+        help="Protect cached camera/CLS and register tokens from eviction.",
+    )
+    parser.add_argument(
+        "--eviction_protect_special_token_interval",
+        "--eviction-protect-special-token-interval",
+        type=int,
+        default=1,
+        help="Protect special tokens only for processed frame IDs divisible by N; 1 protects every cached frame.",
+    )
+    parser.add_argument(
+        "--kf_interval",
+        "--kf-interval",
+        type=int,
+        default=1,
+        help="Cache KV only for every Nth keyframe while still reading cached keyframe KV on intermediate frames",
+    )
+    parser.add_argument(
+        "--evict_interval",
+        "--evict-interval",
+        type=int,
+        default=1,
+        help="Run cache eviction only every N cached keyframes; 1 preserves current behavior",
     )
     parser.add_argument(
         "--history_anchor_strategy",
@@ -209,6 +303,12 @@ def get_args_parser():
         nargs="+",
         default=None,
         help="list of sequences for pose evaluation",
+    )
+    parser.add_argument(
+        "--first_seq_only",
+        "--first-seq-only",
+        action="store_true",
+        help="Run only the first sorted sequence from the resolved sequence list.",
     )
     return parser
 
@@ -256,6 +356,13 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 seq for seq in seq_list if os.path.isdir(os.path.join(img_path, seq))
             ]
         seq_list = sorted(seq_list)
+    if args.first_seq_only:
+        if not seq_list:
+            raise RuntimeError(
+                f"No sequences found for eval_dataset={args.eval_dataset}, img_path={img_path}"
+            )
+        seq_list = seq_list[11:12]
+        print(f"[video_depth] first_seq_only: running sequence {seq_list[0]}")
 
     if save_dir is None:
         save_dir = args.output_dir
@@ -333,17 +440,28 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_approx_method=args.leverage_approx_method,
                         leverage_left_sketch_dim=args.leverage_left_sketch_dim,
                         leverage_right_jl_dim=args.leverage_right_jl_dim,
+                        leverage_ridge_lambda=args.leverage_ridge_lambda,
+                        leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
+                        leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
+                        leverage_ridge_jitter=args.leverage_ridge_jitter,
+                        leverage_ridge_dim=args.leverage_ridge_dim,
                         leverage_random_seed=args.leverage_random_seed,
                         leverage_eviction_selector=args.leverage_eviction_selector,
                         leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
                         leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
+                        leverage_dpp_diversity_beta=args.leverage_dpp_diversity_beta,
                         layer_budget_strategy=args.layer_budget_strategy,
+                        layer_budget_value_gamma=args.layer_budget_value_gamma,
+                        layer_budget_value_norm_type=args.layer_budget_value_norm_type,
+                        layer_budget_norm_source=args.layer_budget_norm_source,
                         layer_budget_alpha=args.layer_budget_alpha,
                         layer_budget_min_tokens=args.layer_budget_min_tokens,
                         layer_budget_eps=args.layer_budget_eps,
                         layer_budget_debug=args.layer_budget_debug,
                         layer_budget_log_path=layer_budget_log_path,
                         eviction_protect_recent_frames=args.eviction_protect_recent_frames,
+                        eviction_protect_special_tokens=args.eviction_protect_special_tokens,
+                        eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
                         history_anchor_strategy=args.history_anchor_strategy,
                         anchor_interval=args.anchor_interval,
                         min_anchor_interval=args.min_anchor_interval,
@@ -353,6 +471,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         anchor_keep_ratio=args.anchor_keep_ratio,
                         eviction_debug=args.profile_eviction,
                         eviction_nn_analysis_config=eviction_nn_analysis_config,
+                        kf_interval=args.kf_interval,
+                        evict_interval=args.evict_interval,
                     )
                     outputs = dict(views=output.views, pred=output.ress)
                 end = time.time()
@@ -408,6 +528,11 @@ if __name__ == "__main__":
             "Error: --leverage_dpp_greedy_block_size must be >= 1, "
             f"got {args.leverage_dpp_greedy_block_size}."
         )
+    if args.leverage_dpp_diversity_beta < 0:
+        raise SystemExit(
+            "Error: --leverage_dpp_diversity_beta must be >= 0, "
+            f"got {args.leverage_dpp_diversity_beta}."
+        )
     if args.layer_budget_alpha < 0:
         raise SystemExit(
             "Error: --layer_budget_alpha must be >= 0, "
@@ -423,18 +548,64 @@ if __name__ == "__main__":
             "Error: --layer_budget_eps must be > 0, "
             f"got {args.layer_budget_eps}."
         )
-    if args.layer_budget_strategy != "uniform" and (
+    if args.layer_budget_value_gamma < 0:
+        raise SystemExit(
+            "Error: --layer_budget_value_gamma must be >= 0, "
+            f"got {args.layer_budget_value_gamma}."
+        )
+    if args.leverage_ridge_lambda < 0:
+        raise SystemExit(
+            "Error: --leverage_ridge_lambda must be >= 0, "
+            f"got {args.leverage_ridge_lambda}."
+        )
+    if args.leverage_ridge_jitter <= 0:
+        raise SystemExit(
+            "Error: --leverage_ridge_jitter must be > 0, "
+            f"got {args.leverage_ridge_jitter}."
+        )
+    if args.leverage_ridge_score_chunk_size < 1:
+        raise SystemExit(
+            "Error: --leverage_ridge_score_chunk_size must be >= 1, "
+            f"got {args.leverage_ridge_score_chunk_size}."
+        )
+    if args.leverage_ridge_dim is not None and args.leverage_ridge_dim < 1:
+        raise SystemExit(
+            "Error: --leverage_ridge_dim must be >= 1 when provided, "
+            f"got {args.leverage_ridge_dim}."
+        )
+    if args.leverage_approx_method == "right_sketch_ridge":
+        resolved_ridge_dim = args.leverage_ridge_dim if args.leverage_ridge_dim is not None else args.leverage_right_jl_dim
+        if resolved_ridge_dim is None or int(resolved_ridge_dim) < 1:
+            raise SystemExit(
+                "Error: --leverage_approx_method right_sketch_ridge requires "
+                "--leverage_ridge_dim >= 1 or --leverage_right_jl_dim >= 1."
+            )
+    if args.layer_budget_strategy in ("leverage_pr", "leverage_entropy", "value_weighted_leverage_pr") and (
         args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
     ):
         raise SystemExit(
-            "Error: --layer_budget_strategy leverage_pr/leverage_entropy requires "
+            "Error: leverage-based --layer_budget_strategy requires "
             "--eviction_policy svd_leverage and --leverage_granularity layer."
+        )
+    if args.layer_budget_strategy == "cosine_precomputed" and not args.layer_budget_proportions_path:
+        raise SystemExit(
+            "Error: --layer_budget_strategy cosine_precomputed requires "
+            "--layer_budget_proportions_path."
         )
     if args.eviction_protect_recent_frames < 0:
         raise SystemExit(
             "Error: --eviction_protect_recent_frames must be >= 0, "
             f"got {args.eviction_protect_recent_frames}."
         )
+    if args.eviction_protect_special_token_interval < 1:
+        raise SystemExit(
+            "Error: --eviction_protect_special_token_interval must be >= 1, "
+            f"got {args.eviction_protect_special_token_interval}."
+        )
+    if args.kf_interval < 1:
+        raise SystemExit(f"Error: --kf_interval must be >= 1, got {args.kf_interval}.")
+    if args.evict_interval < 1:
+        raise SystemExit(f"Error: --evict_interval must be >= 1, got {args.evict_interval}.")
     if args.anchor_interval < 1:
         raise SystemExit(f"Error: --anchor_interval must be >= 1, got {args.anchor_interval}.")
     if args.min_anchor_interval is not None and args.min_anchor_interval < 0:
@@ -472,16 +643,25 @@ if __name__ == "__main__":
             f"feature={args.leverage_feature}, "
             f"approx={args.leverage_approx_method}, "
             f"r1={args.leverage_left_sketch_dim}, r2={args.leverage_right_jl_dim}, "
+            f"ridge_dim={args.leverage_ridge_dim}, ridge_lambda={args.leverage_ridge_lambda}, "
+            f"ridge_lambda_mode={args.leverage_ridge_lambda_mode}, "
+            f"ridge_chunk={args.leverage_ridge_score_chunk_size}, ridge_jitter={args.leverage_ridge_jitter}, "
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
             f"selector={args.leverage_eviction_selector}, "
             f"dpp_candidate_multiplier={args.leverage_dpp_candidate_multiplier}, "
             f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
+            f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
-            f"protect_recent_frames={args.eviction_protect_recent_frames}"
+            f"layer_budget_value_gamma={args.layer_budget_value_gamma}, "
+            f"layer_budget_value_norm_type={args.layer_budget_value_norm_type}, "
+            f"layer_budget_norm_source={args.layer_budget_norm_source}, "
+            f"protect_recent_frames={args.eviction_protect_recent_frames}, "
+            f"kf_interval={args.kf_interval}, "
+            f"evict_interval={args.evict_interval}"
         )
     elif args.eviction_policy == "dpp":
         print(
@@ -491,6 +671,7 @@ if __name__ == "__main__":
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
+            f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
             f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
     add_path_to_dust3r(args.weights)
@@ -624,6 +805,9 @@ if __name__ == "__main__":
     model = StreamVGGT(total_budget=args.budget)
     ckpt = torch.load(args.weights, map_location=args.device)
     model.load_state_dict(ckpt, strict=True)
+    if args.layer_budget_strategy == "cosine_precomputed":
+        model.set_layer_budget_proportions(args.layer_budget_proportions_path)
+        print(f"Loaded precomputed layer budget proportions: {args.layer_budget_proportions_path}")
     model.eval()
     model = model.to("cuda")
     del ckpt

@@ -7,13 +7,11 @@ ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
 max_frames='500'
-kf_interval=1
-evict_interval=1
 eviction_policy='svd_leverage'
 # Switch to leverage_entropy to test the entropy effective-count allocator.
-layer_budget_strategy='leverage_pr'
+layer_budget_strategy='leverage_pr' #[leverage_pr, uniform, leverage_entropy]
 layer_budget_alpha=1.0
-layer_budget_min_tokens=0
+layer_budget_min_tokens=3000
 layer_budget_eps=1e-12
 layer_budget_debug=false
 layer_budget_debug_args=()
@@ -23,11 +21,20 @@ fi
 leverage_eviction_selector=fast_dpp
 leverage_dpp_candidate_multiplier=3
 leverage_dpp_greedy_block_size=64
+leverage_dpp_diversity_beta=1.5
 
-output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_layerBudget_${layer_budget_strategy}_a${layer_budget_alpha}_${leverage_eviction_selector}_block${leverage_dpp_greedy_block_size}_kf${kf_interval}_evict${evict_interval}"
+leverage_approx_method=right_sketch_ridge
+leverage_ridge_lambda=1e-3
+leverage_ridge_lambda_mode=relative
+leverage_ridge_score_chunk_size=4096
+leverage_ridge_jitter=1e-6
+leverage_ridge_dim=256
+leverage_random_seed=0
+
+output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_layerBudget_${layer_budget_strategy}_a${layer_budget_alpha}_${leverage_eviction_selector}_block${leverage_dpp_greedy_block_size}_db${leverage_dpp_diversity_beta}_rightSketchRidge_r${leverage_ridge_dim}_min${layer_budget_min_tokens}"
 echo "$output_dir"
 
-accelerate launch --num_processes 4 --main_process_port 29602 ./eval/mv_recon/launch.py \
+accelerate launch --num_processes 3 --main_process_port 29902 ./eval/mv_recon/launch.py \
     --weights "$model_weights" \
     --output_dir "$output_dir" \
     --model_name "$model_name" \
@@ -38,11 +45,17 @@ accelerate launch --num_processes 4 --main_process_port 29602 ./eval/mv_recon/la
     --leverage_eviction_selector "$leverage_eviction_selector" \
     --leverage_dpp_candidate_multiplier "$leverage_dpp_candidate_multiplier" \
     --leverage_dpp_greedy_block_size "$leverage_dpp_greedy_block_size" \
+    --leverage_dpp_diversity_beta "$leverage_dpp_diversity_beta" \
     --layer_budget_strategy "$layer_budget_strategy" \
     --layer_budget_alpha "$layer_budget_alpha" \
     --layer_budget_min_tokens "$layer_budget_min_tokens" \
     --layer_budget_eps "$layer_budget_eps" \
-    --kf_interval "$kf_interval" \
-    --evict_interval "$evict_interval" \
+    --leverage_approx_method "$leverage_approx_method" \
+    --leverage_ridge_lambda "$leverage_ridge_lambda" \
+    --leverage_ridge_lambda_mode "$leverage_ridge_lambda_mode" \
+    --leverage_ridge_score_chunk_size "$leverage_ridge_score_chunk_size" \
+    --leverage_ridge_jitter "$leverage_ridge_jitter" \
+    --leverage_ridge_dim "$leverage_ridge_dim" \
+    --leverage_random_seed "$leverage_random_seed" \
     "${layer_budget_debug_args[@]}"
 # Add --profile_eviction to the launch command above when measuring eviction latency.

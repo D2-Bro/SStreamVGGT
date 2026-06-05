@@ -1,3 +1,6 @@
+import json
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,8 +35,52 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
         self.total_budget = total_budget
-    
 
+    def set_layer_budget_proportions(self, proportions_or_path):
+        """Validate and install fixed layer-budget proportions."""
+        source = proportions_or_path
+        if isinstance(proportions_or_path, (str, os.PathLike)):
+            path = os.fspath(proportions_or_path)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    source = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Failed to load layer budget proportions from {path!r}: {exc}") from exc
+        if isinstance(source, dict):
+            declared_layers = source.get("num_layers")
+            if declared_layers is not None and int(declared_layers) != self.aggregator.depth:
+                raise ValueError(
+                    "Layer budget JSON num_layers must match aggregator depth: "
+                    f"got {declared_layers}, expected {self.aggregator.depth}"
+                )
+            if "proportions" not in source:
+                raise ValueError("Layer budget proportions JSON must contain a 'proportions' field")
+            source = source["proportions"]
+
+        try:
+            proportions = torch.as_tensor(source, dtype=torch.float32).detach().reshape(-1)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError(f"Invalid layer budget proportions: {exc}") from exc
+        if proportions.numel() != self.aggregator.depth:
+            raise ValueError(
+                "Layer budget proportions length must match aggregator depth: "
+                f"got {proportions.numel()}, expected {self.aggregator.depth}"
+            )
+        if not torch.isfinite(proportions).all():
+            raise ValueError("Layer budget proportions must contain only finite values")
+        if (proportions < 0).any():
+            raise ValueError("Layer budget proportions must be non-negative")
+        total = proportions.sum()
+        if float(total.item()) <= 0.0:
+            raise ValueError("Layer budget proportions must contain at least one positive value")
+
+        normalized = proportions / total
+        try:
+            target_device = next(self.parameters()).device
+        except (AttributeError, StopIteration):
+            target_device = self.aggregator.last_scores.device
+        self.aggregator.layer_budget_proportions = normalized.to(target_device)
+        return self.aggregator.layer_budget_proportions
 
     def forward(
         self,
@@ -123,7 +170,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         past_key_values=None, 
         frame_writer: Optional[Callable[[int, dict, dict], None]] = None,
         cache_results: bool = True,
-        history_anchor_strategy: str = "coverage",
+        history_anchor_strategy: str = "none",
         anchor_interval: int = 250,
         min_anchor_interval: Optional[int] = 100,
         window_protect_frames: int = 0,
@@ -145,27 +192,48 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_approx_method: str = "right_sketch",
         leverage_left_sketch_dim: Optional[int] = 2048,
         leverage_right_jl_dim: Optional[int] = 64,
+        leverage_ridge_lambda: float = 1e-3,
+        leverage_ridge_lambda_mode: str = "relative",
+        leverage_ridge_score_chunk_size: int = 4096,
+        leverage_ridge_jitter: float = 1e-6,
+        leverage_ridge_dim: Optional[int] = None,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
+        leverage_dpp_diversity_beta: float = 1.0,
         layer_budget_strategy: str = "uniform",
+        layer_budget_value_gamma: float = 0.5,
+        layer_budget_value_norm_type: str = "rms",
+        layer_budget_norm_source: str = "value",
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
         layer_budget_debug: bool = False,
         layer_budget_log_path: Optional[str] = None,
         eviction_protect_recent_frames: int = 0,
+        eviction_protect_special_tokens: bool = False,
+        eviction_protect_special_token_interval: int = 1,
         recent_merge_config: Optional[RecentMergeConfig] = None,
         svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
         voxel_covis_config: Optional[VoxelCovisConfig] = None,
         covis_log_fn: Optional[Callable[[str], None]] = None,
         global_attn_idx_ranges: Optional[Any] = None,
         global_attn_debug: bool = False,
+        kf_interval: int = 1,
+        evict_interval: int = 1,
     ):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
         total_budget = self.total_budget
+        kf_interval = max(int(kf_interval), 1)
+        evict_interval = max(int(evict_interval), 1)
+        eviction_protect_special_token_interval = int(eviction_protect_special_token_interval)
+        if eviction_protect_special_token_interval < 1:
+            raise ValueError(
+                "eviction_protect_special_token_interval must be >= 1, "
+                f"got {eviction_protect_special_token_interval}"
+            )
         recent_merger = None
         run_recent_merge = recent_merge_config is not None and recent_merge_config.enabled
         svd_needs_geometry = (
@@ -250,6 +318,12 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         processed_frames = [] 
 
         for i, frame in enumerate(frames):
+            cache_write_current_frame = i == 0 or i % kf_interval == 0
+            cached_keyframe_idx = i // kf_interval
+            cache_evict_current_frame = (
+                cache_write_current_frame
+                and cached_keyframe_idx % evict_interval == 0
+            )
 
             fixed_interval_registered = False
             fixed_interval_is_fifo = False
@@ -302,17 +376,28 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 leverage_approx_method=leverage_approx_method,
                 leverage_left_sketch_dim=leverage_left_sketch_dim,
                 leverage_right_jl_dim=leverage_right_jl_dim,
+                leverage_ridge_lambda=leverage_ridge_lambda,
+                leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
+                leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
+                leverage_ridge_jitter=leverage_ridge_jitter,
+                leverage_ridge_dim=leverage_ridge_dim,
                 leverage_random_seed=leverage_random_seed,
                 leverage_eviction_selector=leverage_eviction_selector,
                 leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                 leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
                 layer_budget_strategy=layer_budget_strategy,
+                layer_budget_value_gamma=layer_budget_value_gamma,
+                layer_budget_value_norm_type=layer_budget_value_norm_type,
+                layer_budget_norm_source=layer_budget_norm_source,
                 layer_budget_alpha=layer_budget_alpha,
                 layer_budget_min_tokens=layer_budget_min_tokens,
                 layer_budget_eps=layer_budget_eps,
                 layer_budget_debug=layer_budget_debug,
                 layer_budget_log_path=layer_budget_log_path,
                 eviction_protect_recent_frames=eviction_protect_recent_frames,
+                eviction_protect_special_tokens=eviction_protect_special_tokens,
+                eviction_protect_special_token_interval=eviction_protect_special_token_interval,
                 anchor_token_count=anchor_token_count,
                 window_token_count=effective_window_token_count,
                 recent_merge_config=recent_merge_config,
@@ -321,6 +406,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 voxel_covis_enabled=voxel_covis_graph is not None,
                 global_attn_idx_ranges=global_attn_idx_ranges,
                 global_attn_debug=global_attn_debug,
+                cache_write_current_frame=cache_write_current_frame,
+                cache_evict_current_frame=cache_evict_current_frame,
             )
 
             

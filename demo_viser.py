@@ -220,10 +220,41 @@ def validate_args(args):
         raise ValueError(
             f"--leverage_head_mean_dim must be >= 1, got {args.leverage_head_mean_dim}"
         )
+    if args.leverage_dpp_candidate_multiplier < 1:
+        raise ValueError(
+            "--leverage_dpp_candidate_multiplier must be >= 1, "
+            f"got {args.leverage_dpp_candidate_multiplier}"
+        )
+    if args.leverage_dpp_greedy_block_size < 1:
+        raise ValueError(
+            "--leverage_dpp_greedy_block_size must be >= 1, "
+            f"got {args.leverage_dpp_greedy_block_size}"
+        )
+    if args.layer_budget_alpha < 0:
+        raise ValueError(f"--layer_budget_alpha must be >= 0, got {args.layer_budget_alpha}")
+    if args.layer_budget_min_tokens < 0:
+        raise ValueError(
+            "--layer_budget_min_tokens must be >= 0, "
+            f"got {args.layer_budget_min_tokens}"
+        )
+    if args.layer_budget_eps <= 0:
+        raise ValueError(f"--layer_budget_eps must be > 0, got {args.layer_budget_eps}")
+    if args.layer_budget_strategy != "uniform" and (
+        args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
+    ):
+        raise ValueError(
+            "--layer_budget_strategy leverage_pr/leverage_entropy requires "
+            "--eviction_policy svd_leverage and --leverage_granularity layer"
+        )
     if args.eviction_protect_recent_frames < 0:
         raise ValueError(
             "--eviction_protect_recent_frames must be >= 0, "
             f"got {args.eviction_protect_recent_frames}"
+        )
+    if args.eviction_protect_special_token_interval < 1:
+        raise ValueError(
+            "--eviction_protect_special_token_interval must be >= 1, "
+            f"got {args.eviction_protect_special_token_interval}"
         )
     if args.merge_window < 1:
         raise ValueError(f"--merge_window must be >= 1, got {args.merge_window}")
@@ -278,6 +309,24 @@ def validate_args(args):
         raise ValueError(f"--covis_min_overlap must be in [0, 1], got {args.covis_min_overlap}")
     if args.covis_fallback_recent < 0:
         raise ValueError(f"--covis_fallback_recent must be >= 0, got {args.covis_fallback_recent}")
+    if args.leverage_ridge_lambda < 0:
+        raise ValueError(f"--leverage_ridge_lambda must be >= 0, got {args.leverage_ridge_lambda}")
+    if args.leverage_ridge_jitter <= 0:
+        raise ValueError(f"--leverage_ridge_jitter must be > 0, got {args.leverage_ridge_jitter}")
+    if args.leverage_ridge_score_chunk_size < 1:
+        raise ValueError(
+            "--leverage_ridge_score_chunk_size must be >= 1, "
+            f"got {args.leverage_ridge_score_chunk_size}"
+        )
+    if args.leverage_ridge_dim is not None and args.leverage_ridge_dim < 1:
+        raise ValueError(f"--leverage_ridge_dim must be >= 1 when provided, got {args.leverage_ridge_dim}")
+    if args.leverage_approx_method == "right_sketch_ridge":
+        resolved_ridge_dim = args.leverage_ridge_dim if args.leverage_ridge_dim is not None else args.leverage_right_jl_dim
+        if resolved_ridge_dim is None or int(resolved_ridge_dim) < 1:
+            raise ValueError(
+                "--leverage_approx_method right_sketch_ridge requires "
+                "--leverage_ridge_dim >= 1 or --leverage_right_jl_dim >= 1"
+            )
 
 
 @torch.no_grad()
@@ -350,9 +399,24 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             leverage_approx_method=args.leverage_approx_method,
             leverage_left_sketch_dim=args.leverage_left_sketch_dim,
             leverage_right_jl_dim=args.leverage_right_jl_dim,
+            leverage_ridge_lambda=args.leverage_ridge_lambda,
+            leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
+            leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
+            leverage_ridge_jitter=args.leverage_ridge_jitter,
+            leverage_ridge_dim=args.leverage_ridge_dim,
             leverage_random_seed=args.leverage_random_seed,
+            leverage_eviction_selector=args.leverage_eviction_selector,
+            leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
+            leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
+            layer_budget_strategy=args.layer_budget_strategy,
+            layer_budget_alpha=args.layer_budget_alpha,
+            layer_budget_min_tokens=args.layer_budget_min_tokens,
+            layer_budget_eps=args.layer_budget_eps,
+            layer_budget_debug=args.layer_budget_debug,
             eviction_nn_analysis_config=eviction_nn_analysis_config,
             eviction_protect_recent_frames=args.eviction_protect_recent_frames,
+            eviction_protect_special_tokens=args.eviction_protect_special_tokens,
+            eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
             recent_merge_config=recent_merge_config,
             svd_eviction_merge_config=svd_eviction_merge_config,
             voxel_covis_config=voxel_covis_config,
@@ -460,21 +524,79 @@ def main():
         "--leverage_projection",
         "--leverage-projection",
         type=str,
-        default="head_mean",
+        default="random",
         choices=("random", "head_mean"),
     )
-    parser.add_argument("--leverage_head_mean_dim", "--leverage-head-mean-dim", type=int, default=4)
+    parser.add_argument("--leverage_head_mean_dim", "--leverage-head-mean-dim", type=int, default=1)
     parser.add_argument(
         "--leverage_approx_method",
         "--leverage-approx-method",
         type=str,
-        default="right_sketch",
-        choices=("exact_qr", "right_sketch", "drineas_srht"),
+        default="right_sketch_ridge",
+        choices=("exact_qr", "right_sketch", "drineas_srht", "full_d_ridge", "right_sketch_ridge"),
     )
     parser.add_argument("--leverage_left_sketch_dim", "--leverage-left-sketch-dim", type=int, default=2048)
     parser.add_argument("--leverage_right_jl_dim", "--leverage-right-jl-dim", type=int, default=64)
+    parser.add_argument(
+        "--leverage_ridge_lambda",
+        "--leverage-ridge-lambda",
+        type=float,
+        default=1e-3,
+        help="Ridge lambda for full_d_ridge and right_sketch_ridge leverage scoring",
+    )
+    parser.add_argument(
+        "--leverage_ridge_lambda_mode",
+        "--leverage-ridge-lambda-mode",
+        type=str,
+        default="relative",
+        choices=("relative", "absolute"),
+        help="Use absolute lambda or scale it by trace(X^T X) / D",
+    )
+    parser.add_argument(
+        "--leverage_ridge_score_chunk_size",
+        "--leverage-ridge-score-chunk-size",
+        type=int,
+        default=4096,
+        help="Token chunk size for ridge leverage Cholesky solves",
+    )
+    parser.add_argument(
+        "--leverage_ridge_jitter",
+        "--leverage-ridge-jitter",
+        type=float,
+        default=1e-6,
+        help="Relative diagonal jitter added to ridge systems before Cholesky",
+    )
+    parser.add_argument(
+        "--leverage_ridge_dim",
+        "--leverage-ridge-dim",
+        type=int,
+        default=256,
+        help="Projection dimension for right_sketch_ridge; defaults to --leverage_right_jl_dim when omitted",
+    )
     parser.add_argument("--leverage_random_seed", "--leverage-random-seed", type=int, default=0)
+    parser.add_argument(
+        "--leverage_eviction_selector",
+        "--leverage-eviction-selector",
+        type=str,
+        default="fast_dpp",
+        choices=("topk", "fast_dpp"),
+    )
+    parser.add_argument("--leverage_dpp_candidate_multiplier", "--leverage-dpp-candidate-multiplier", type=int, default=3)
+    parser.add_argument("--leverage_dpp_greedy_block_size", "--leverage-dpp-greedy-block-size", type=int, default=64)
+    parser.add_argument(
+        "--layer_budget_strategy",
+        "--layer-budget-strategy",
+        type=str,
+        default="leverage_pr",
+        choices=("uniform", "leverage_pr", "leverage_entropy"),
+    )
+    parser.add_argument("--layer_budget_alpha", "--layer-budget-alpha", type=float, default=1.0)
+    parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=3000)
+    parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
+    parser.add_argument("--layer_budget_debug", "--layer-budget-debug", action="store_true")
     parser.add_argument("--eviction_protect_recent_frames", "--eviction-protect-recent-frames", type=int, default=0)
+    parser.add_argument("--eviction_protect_special_tokens", "--eviction-protect-special-tokens", action="store_true")
+    parser.add_argument("--eviction_protect_special_token_interval", "--eviction-protect-special-token-interval", type=int, default=1)
     add_eviction_nn_analysis_args(parser)
     parser.add_argument("--enable_svd_eviction_merge", "--enable-svd-eviction-merge", action="store_true")
     parser.add_argument(
@@ -547,14 +669,19 @@ def main():
         sys.exit(f"Checkpoint not found at {args.weights}")
         
     print(
-        "Using mv_recon headmean4 settings: "
+        "Using mv_recon rightSketchRidge layer-budget settings: "
         f"frames={len(img_paths)}/{args.max_frames}, "
         f"budget={args.budget}, "
         f"eviction_policy={args.eviction_policy}, "
         f"approx={args.leverage_approx_method}, "
+        f"ridge_dim={args.leverage_ridge_dim}, "
         f"granularity={args.leverage_granularity}, "
         f"projection={args.leverage_projection}, "
-        f"head_mean_dim={args.leverage_head_mean_dim}"
+        f"selector={args.leverage_eviction_selector}, "
+        f"dpp_block={args.leverage_dpp_greedy_block_size}, "
+        f"layer_budget={args.layer_budget_strategy}, "
+        f"alpha={args.layer_budget_alpha}, "
+        f"min_tokens={args.layer_budget_min_tokens}"
     )
     model = StreamVGGT(total_budget=args.budget).to(args.device)
     model.load_state_dict(torch.load(args.weights, map_location="cpu"), strict=True)

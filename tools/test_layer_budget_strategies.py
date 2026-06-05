@@ -1,9 +1,19 @@
+import json
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
 import torch
 
+from compute_cosine_layer_budget import compute_cosine_similarity, cosine_to_proportions
+
 from streamvggt.layers.eviction import (
+    EvictionManager,
     _allocate_layer_budgets_from_scores,
+    _combine_value_weighted_leverage_pr_scores,
     _layer_score_leverage_entropy,
     _layer_score_leverage_pr,
+    _layer_value_norm_score,
 )
 
 
@@ -12,6 +22,217 @@ def _assert_budget_invariants(budgets, capacities, total_budget):
     for layer, budget in budgets.items():
         assert 0 <= budget <= capacities[layer]
 
+
+
+from streamvggt.models.aggregator import Aggregator
+from streamvggt.models.streamvggt import StreamVGGT
+
+
+def _make_proportion_holder(depth):
+    return SimpleNamespace(
+        aggregator=SimpleNamespace(
+            depth=depth,
+            last_scores=torch.zeros(depth),
+            layer_budget_proportions=None,
+        )
+    )
+
+
+def test_precomputed_proportions_load_and_normalize():
+    holder = _make_proportion_holder(3)
+    normalized = StreamVGGT.set_layer_budget_proportions(holder, [1.0, 2.0, 1.0])
+    assert torch.allclose(normalized, torch.tensor([0.25, 0.5, 0.25]))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "budget.json"
+        path.write_text(json.dumps({"strategy": "cosine", "num_layers": 3, "proportions": [2.0, 1.0, 1.0]}), encoding="utf-8")
+        loaded = StreamVGGT.set_layer_budget_proportions(holder, path)
+    assert torch.allclose(loaded, torch.tensor([0.5, 0.25, 0.25]))
+
+
+def test_precomputed_proportions_reject_invalid_values():
+    holder = _make_proportion_holder(3)
+    bad_values = (
+        [1.0, 2.0],
+        [0.0, 0.0, 0.0],
+        [1.0, -1.0, 1.0],
+        [1.0, float("nan"), 1.0],
+        {"num_layers": 4, "proportions": [1.0, 1.0, 1.0]},
+    )
+    for values in bad_values:
+        try:
+            StreamVGGT.set_layer_budget_proportions(holder, values)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid proportions accepted: {values}")
+
+
+def test_cosine_precomputed_is_independent_of_leverage_mode():
+    EvictionManager(policy="mean", leverage_granularity="head", layer_budget_strategy="cosine_precomputed")
+
+
+def test_cosine_precomputed_capacity_aware_allocation():
+    agg = Aggregator(
+        img_size=16,
+        patch_size=8,
+        embed_dim=32,
+        depth=3,
+        num_heads=4,
+        mlp_ratio=1.0,
+        num_register_tokens=2,
+        patch_embed="conv",
+    )
+    agg.layer_budget_proportions = torch.tensor([0.8, 0.1, 0.1])
+
+    def make_kv(tokens):
+        value = torch.zeros(1, 1, tokens, 1)
+        return value, value
+
+    budgets = agg._calculate_dynamic_budgets(
+        10,
+        layer_budget_strategy="cosine_precomputed",
+        past_key_values=[make_kv(2), make_kv(100), make_kv(100)],
+    )
+    assert budgets.tolist() == [2, 4, 4]
+    assert int(budgets.sum().item()) == 10
+
+    ranged_budgets = agg._calculate_dynamic_budgets(
+        10,
+        enabled_global_idx_ranges=[(1, None)],
+        layer_budget_strategy="cosine_precomputed",
+        past_key_values=[make_kv(100), make_kv(100), make_kv(100)],
+    )
+    assert ranged_budgets.tolist() == [0, 5, 5]
+    assert int(ranged_budgets.sum().item()) == 10
+
+
+def test_cosine_helpers():
+    x = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+    identical = compute_cosine_similarity(x, x)
+    opposite = compute_cosine_similarity(x, -x)
+    assert torch.allclose(identical, torch.tensor(1.0))
+    assert torch.allclose(opposite, torch.tensor(-1.0))
+    importance, proportions = cosine_to_proportions([identical, opposite], temperature=0.5)
+    assert proportions[1] > proportions[0]
+    assert torch.allclose(proportions.sum(), torch.tensor(1.0))
+    assert importance[1] > importance[0]
+
+
+def test_value_norm_helper_mean_and_rms():
+    values = torch.tensor([[3.0, 4.0], [0.0, 12.0]])
+    assert torch.allclose(_layer_value_norm_score(values, "mean"), torch.tensor(8.5))
+    assert torch.allclose(_layer_value_norm_score(values, "rms"), torch.sqrt(torch.tensor(84.5)))
+
+
+def test_value_norm_helper_empty_and_nonfinite_are_safe():
+    empty = torch.empty(0, 2)
+    assert _layer_value_norm_score(empty, "rms").item() == 0.0
+    nonfinite = torch.tensor([[float("nan"), float("inf")], [3.0, 4.0]])
+    assert torch.isfinite(_layer_value_norm_score(nonfinite, "rms"))
+
+
+def test_value_weighted_gamma_zero_matches_pr():
+    base = torch.tensor([10.0, 20.0])
+    value_norms = torch.tensor([1.0, 100.0])
+    scores = _combine_value_weighted_leverage_pr_scores(base, value_norms, gamma=0.0)
+    assert torch.allclose(scores, base)
+
+
+def test_value_weighted_equal_values_preserve_pr():
+    base = torch.tensor([10.0, 20.0])
+    value_norms = torch.tensor([7.0, 7.0])
+    scores = _combine_value_weighted_leverage_pr_scores(base, value_norms, gamma=0.5)
+    assert torch.allclose(scores, base)
+
+
+def test_value_weighted_higher_value_norm_increases_equal_pr_score():
+    base = torch.tensor([10.0, 10.0])
+    value_norms = torch.tensor([1.0, 9.0])
+    scores = _combine_value_weighted_leverage_pr_scores(base, value_norms, gamma=1.0)
+    assert scores[1] > scores[0]
+
+
+def test_value_weighted_zero_values_fall_back_to_pr():
+    base = torch.tensor([10.0, 20.0])
+    value_norms = torch.zeros(2)
+    scores = _combine_value_weighted_leverage_pr_scores(base, value_norms, gamma=1.0)
+    assert torch.allclose(scores, base)
+
+
+def test_value_weighted_manager_returns_base_pr_and_value_norm_payload():
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        layer_budget_strategy="value_weighted_leverage_pr",
+        layer_budget_value_norm_type="rms",
+    )
+    policy_scores = torch.ones(1, 4)
+    candidate_v = torch.ones(1, 2, 4, 3)
+    payload = manager._compute_layer_budget_score(policy_scores, candidate_v=candidate_v)
+    assert payload.shape == (2,)
+    assert torch.allclose(payload[0], _layer_score_leverage_pr(policy_scores[0]))
+    assert payload[1] > 0
+
+
+def test_value_weighted_manager_key_norm_source_uses_candidate_k():
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        layer_budget_strategy="value_weighted_leverage_pr",
+        layer_budget_value_norm_type="mean",
+        layer_budget_norm_source="key",
+    )
+    policy_scores = torch.ones(1, 4)
+    candidate_k = torch.full((1, 2, 4, 3), 3.0)
+    candidate_v = torch.ones(1, 2, 4, 3)
+    payload = manager._compute_layer_budget_score(
+        policy_scores,
+        candidate_k=candidate_k,
+        candidate_v=candidate_v,
+    )
+    value_manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        layer_budget_strategy="value_weighted_leverage_pr",
+        layer_budget_value_norm_type="mean",
+        layer_budget_norm_source="value",
+    )
+    value_payload = value_manager._compute_layer_budget_score(
+        policy_scores,
+        candidate_k=candidate_k,
+        candidate_v=candidate_v,
+    )
+    assert payload[1] > 0
+    assert payload[1] > value_payload[1]
+
+
+def test_invalid_layer_budget_norm_source_rejected():
+    try:
+        EvictionManager(
+            policy="svd_leverage",
+            leverage_granularity="layer",
+            layer_budget_strategy="value_weighted_leverage_pr",
+            layer_budget_norm_source="query",
+        )
+    except ValueError as exc:
+        assert "layer_budget_norm_source" in str(exc)
+    else:
+        raise AssertionError("invalid layer_budget_norm_source was accepted")
+
+
+def test_value_weighted_allocation_invariants():
+    base = torch.tensor([100.0, 25.0, 25.0])
+    value_norms = torch.tensor([1.0, 5.0, 10.0])
+    weighted = _combine_value_weighted_leverage_pr_scores(base, value_norms, gamma=0.5)
+    capacities = {0: 100, 1: 100, 2: 100}
+    budgets = _allocate_layer_budgets_from_scores(
+        {idx: weighted[idx] for idx in range(3)},
+        capacities,
+        121,
+        alpha=1.0,
+    )
+    _assert_budget_invariants(budgets, capacities, 121)
 
 def test_equal_distributions_are_uniform():
     lev0 = torch.ones(100)
@@ -79,6 +300,21 @@ def test_min_tokens_and_capacity_caps():
 
 
 if __name__ == "__main__":
+    test_precomputed_proportions_load_and_normalize()
+    test_precomputed_proportions_reject_invalid_values()
+    test_cosine_precomputed_is_independent_of_leverage_mode()
+    test_cosine_precomputed_capacity_aware_allocation()
+    test_cosine_helpers()
+    test_value_norm_helper_mean_and_rms()
+    test_value_norm_helper_empty_and_nonfinite_are_safe()
+    test_value_weighted_gamma_zero_matches_pr()
+    test_value_weighted_equal_values_preserve_pr()
+    test_value_weighted_higher_value_norm_increases_equal_pr_score()
+    test_value_weighted_zero_values_fall_back_to_pr()
+    test_value_weighted_manager_returns_base_pr_and_value_norm_payload()
+    test_value_weighted_manager_key_norm_source_uses_candidate_k()
+    test_invalid_layer_budget_norm_source_rejected()
+    test_value_weighted_allocation_invariants()
     test_equal_distributions_are_uniform()
     test_spread_layer_gets_larger_budget()
     test_alpha_zero_is_uniform()

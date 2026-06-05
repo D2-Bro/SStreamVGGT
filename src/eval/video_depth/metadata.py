@@ -157,6 +157,11 @@ def process_kitti(args, img_path):
 
 
 def process_bonn(args, img_path):
+    bonn_number = (
+        args.eval_dataset.split("_")[-1]
+        if "_" in getattr(args, "eval_dataset", "")
+        else "110"
+    )
     if args.full_seq:
         for dir in tqdm(sorted(glob.glob(f"{img_path}/*/"))):
             filelist = sorted(glob.glob(f"{dir}/rgb/*.png"))
@@ -169,7 +174,9 @@ def process_bonn(args, img_path):
             else args.seq_list
         )
         for seq in tqdm(seq_list):
-            filelist = sorted(glob.glob(f"{img_path}/rgbd_bonn_{seq}/rgb_110/*.png"))
+            filelist = sorted(
+                glob.glob(f"{img_path}/rgbd_bonn_{seq}/rgb_{bonn_number}/*.png")
+            )
             save_dir = f"{args.output_dir}/{seq}"
             yield filelist, save_dir
 

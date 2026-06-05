@@ -7,8 +7,6 @@ ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
 max_frames='500'
-kf_interval=1
-evict_interval=1
 eviction_policy='svd_leverage'
 # Switch to leverage_entropy to test the entropy effective-count allocator.
 layer_budget_strategy='leverage_pr'
@@ -24,10 +22,14 @@ leverage_eviction_selector=fast_dpp
 leverage_dpp_candidate_multiplier=3
 leverage_dpp_greedy_block_size=64
 
-output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_layerBudget_${layer_budget_strategy}_a${layer_budget_alpha}_${leverage_eviction_selector}_block${leverage_dpp_greedy_block_size}_kf${kf_interval}_evict${evict_interval}"
+leverage_approx_method=right_sketch
+leverage_sketch_dim=256
+leverage_random_seed=0
+
+output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_layerBudget_${layer_budget_strategy}_a${layer_budget_alpha}_${leverage_eviction_selector}_block${leverage_dpp_greedy_block_size}_rightSketch"
 echo "$output_dir"
 
-accelerate launch --num_processes 4 --main_process_port 29602 ./eval/mv_recon/launch.py \
+accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/launch.py \
     --weights "$model_weights" \
     --output_dir "$output_dir" \
     --model_name "$model_name" \
@@ -42,7 +44,8 @@ accelerate launch --num_processes 4 --main_process_port 29602 ./eval/mv_recon/la
     --layer_budget_alpha "$layer_budget_alpha" \
     --layer_budget_min_tokens "$layer_budget_min_tokens" \
     --layer_budget_eps "$layer_budget_eps" \
-    --kf_interval "$kf_interval" \
-    --evict_interval "$evict_interval" \
+    --leverage_approx_method "$leverage_approx_method" \
+    --leverage_sketch_dim "$leverage_sketch_dim" \
+    --leverage_random_seed "$leverage_random_seed" \
     "${layer_budget_debug_args[@]}"
 # Add --profile_eviction to the launch command above when measuring eviction latency.

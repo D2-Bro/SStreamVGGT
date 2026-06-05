@@ -132,6 +132,12 @@ def run_inference(args: argparse.Namespace):
             f"got {args.eviction_protect_recent_frames}."
         )
         return
+    if args.eviction_protect_special_token_interval < 1:
+        print(
+            "Error: --eviction_protect_special_token_interval must be >= 1, "
+            f"got {args.eviction_protect_special_token_interval}."
+        )
+        return
     if args.svd_eviction_merge_candidate_axes < 1:
         print("Error: --svd_eviction_merge_candidate_axes must be >= 1.")
         return
@@ -195,6 +201,38 @@ def run_inference(args: argparse.Namespace):
             f"got {args.leverage_dpp_greedy_block_size}."
         )
         return
+    if args.leverage_ridge_lambda < 0:
+        print(
+            "Error: --leverage_ridge_lambda must be >= 0, "
+            f"got {args.leverage_ridge_lambda}."
+        )
+        return
+    if args.leverage_ridge_jitter <= 0:
+        print(
+            "Error: --leverage_ridge_jitter must be > 0, "
+            f"got {args.leverage_ridge_jitter}."
+        )
+        return
+    if args.leverage_ridge_score_chunk_size < 1:
+        print(
+            "Error: --leverage_ridge_score_chunk_size must be >= 1, "
+            f"got {args.leverage_ridge_score_chunk_size}."
+        )
+        return
+    if args.leverage_ridge_dim is not None and args.leverage_ridge_dim < 1:
+        print(
+            "Error: --leverage_ridge_dim must be >= 1 when provided, "
+            f"got {args.leverage_ridge_dim}."
+        )
+        return
+    if args.leverage_approx_method == "right_sketch_ridge":
+        resolved_ridge_dim = args.leverage_ridge_dim if args.leverage_ridge_dim is not None else args.leverage_right_jl_dim
+        if resolved_ridge_dim is None or int(resolved_ridge_dim) < 1:
+            print(
+                "Error: --leverage_approx_method right_sketch_ridge requires "
+                "--leverage_ridge_dim >= 1 or --leverage_right_jl_dim >= 1."
+            )
+            return
     try:
         global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
     except ValueError as exc:
@@ -207,7 +245,10 @@ def run_inference(args: argparse.Namespace):
         print(
             "Using SVD leverage approximation: "
             f"{args.leverage_approx_method} (r1={args.leverage_left_sketch_dim}, "
-            f"r2={args.leverage_right_jl_dim}, seed={args.leverage_random_seed})"
+            f"r2={args.leverage_right_jl_dim}, ridge_dim={args.leverage_ridge_dim}, "
+            f"ridge_lambda={args.leverage_ridge_lambda}, ridge_lambda_mode={args.leverage_ridge_lambda_mode}, "
+            f"ridge_chunk={args.leverage_ridge_score_chunk_size}, ridge_jitter={args.leverage_ridge_jitter}, "
+            f"seed={args.leverage_random_seed})"
         )
         print(
             "Using SVD leverage granularity: "
@@ -376,11 +417,18 @@ def run_inference(args: argparse.Namespace):
                 leverage_approx_method=args.leverage_approx_method,
                 leverage_left_sketch_dim=args.leverage_left_sketch_dim,
                 leverage_right_jl_dim=args.leverage_right_jl_dim,
+                leverage_ridge_lambda=args.leverage_ridge_lambda,
+                leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
+                leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
+                leverage_ridge_jitter=args.leverage_ridge_jitter,
+                leverage_ridge_dim=args.leverage_ridge_dim,
                 leverage_random_seed=args.leverage_random_seed,
                 leverage_eviction_selector=args.leverage_eviction_selector,
                 leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
                 leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
                 eviction_protect_recent_frames=args.eviction_protect_recent_frames,
+                eviction_protect_special_tokens=args.eviction_protect_special_tokens,
+                eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
                 recent_merge_config=recent_merge_config,
                 svd_eviction_merge_config=svd_eviction_merge_config,
                 voxel_covis_config=voxel_covis_config,
@@ -625,7 +673,7 @@ if __name__ == "__main__":
         "--leverage-approx-method",
         type=str,
         default="right_sketch",
-        choices=("exact_qr", "right_sketch", "drineas_srht"),
+        choices=("exact_qr", "right_sketch", "drineas_srht", "full_d_ridge", "right_sketch_ridge"),
         help="Leverage approximation: exact QR, right-sketched/Compactor-style, or Drineas left SRHT",
     )
     parser.add_argument(
@@ -641,6 +689,42 @@ if __name__ == "__main__":
         type=int,
         default=64,
         help="Right JL dimension r2 for leverage_approx_method=drineas_srht; <=0 uses no right JL",
+    )
+    parser.add_argument(
+        "--leverage_ridge_lambda",
+        "--leverage-ridge-lambda",
+        type=float,
+        default=1e-3,
+        help="Ridge lambda for full_d_ridge and right_sketch_ridge leverage scoring",
+    )
+    parser.add_argument(
+        "--leverage_ridge_lambda_mode",
+        "--leverage-ridge-lambda-mode",
+        type=str,
+        default="relative",
+        choices=("relative", "absolute"),
+        help="Use absolute lambda or scale it by trace(X^T X) / D",
+    )
+    parser.add_argument(
+        "--leverage_ridge_score_chunk_size",
+        "--leverage-ridge-score-chunk-size",
+        type=int,
+        default=4096,
+        help="Token chunk size for ridge leverage Cholesky solves",
+    )
+    parser.add_argument(
+        "--leverage_ridge_jitter",
+        "--leverage-ridge-jitter",
+        type=float,
+        default=1e-6,
+        help="Relative diagonal jitter added to ridge systems before Cholesky",
+    )
+    parser.add_argument(
+        "--leverage_ridge_dim",
+        "--leverage-ridge-dim",
+        type=int,
+        default=None,
+        help="Projection dimension for right_sketch_ridge; defaults to --leverage_right_jl_dim when omitted",
     )
     parser.add_argument(
         "--leverage_random_seed",
@@ -680,6 +764,19 @@ if __name__ == "__main__":
             "Protect tokens from the most recent N processed frames from eviction while still "
             "including them in SVD leverage computation."
         ),
+    )
+    parser.add_argument(
+        "--eviction_protect_special_tokens",
+        "--eviction-protect-special-tokens",
+        action="store_true",
+        help="Protect cached camera/CLS and register tokens from eviction.",
+    )
+    parser.add_argument(
+        "--eviction_protect_special_token_interval",
+        "--eviction-protect-special-token-interval",
+        type=int,
+        default=1,
+        help="Protect special tokens only for processed frame IDs divisible by N; 1 protects every cached frame.",
     )
     parser.add_argument(
         "--enable_svd_eviction_merge",

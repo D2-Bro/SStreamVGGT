@@ -21,6 +21,7 @@ def main():
     check_parser()
     check_budget_redistribution()
     check_streaming_modes()
+    check_kf_interval_cache_writes()
     print("global attention range sanity checks passed")
 
 
@@ -99,12 +100,59 @@ def check_budget_redistribution():
 
 
 def run_two_streaming_steps(ranges, depth):
+    agg, past_key_values, _, _ = run_streaming_steps(ranges, depth=depth, steps=2, kf_interval=1)
+    return agg, past_key_values
+
+
+def check_kf_interval_cache_writes():
+    depth = 4
+    agg, past_key_values, cache_sizes, traces = run_streaming_steps(
+        None,
+        depth=depth,
+        steps=3,
+        kf_interval=2,
+    )
+    token_count = cache_sizes[0][0]
+    assert token_count > 0
+    assert cache_sizes[1] == [token_count] * depth
+    assert cache_sizes[2] == [token_count * 2] * depth
+
+    step1_global = [row for row in traces[1] if row["original_attention_type"] == "global"]
+    assert all(row["kv_read"] for row in step1_global)
+    assert all(not row["kv_write"] for row in step1_global)
+
+    step2_global = [row for row in traces[2] if row["original_attention_type"] == "global"]
+    assert all(row["kv_read"] and row["kv_write"] for row in step2_global)
+
+    ranges = "2:"
+    _, ranged_past_key_values, ranged_cache_sizes, ranged_traces = run_streaming_steps(
+        ranges,
+        depth=depth,
+        steps=3,
+        kf_interval=2,
+    )
+    assert ranged_past_key_values[0] is None
+    assert ranged_past_key_values[1] is None
+    assert ranged_cache_sizes[1][:2] == [0, 0]
+    assert ranged_cache_sizes[2][2:] == [token_count * 2, token_count * 2]
+    ranged_step1_global = [row for row in ranged_traces[1] if row["original_attention_type"] == "global"]
+    for row in ranged_step1_global:
+        if row["global_idx"] >= 2:
+            assert row["kv_read"] and not row["kv_write"]
+        else:
+            assert not row["kv_read"] and not row["kv_write"]
+
+
+def run_streaming_steps(ranges, depth, steps, kf_interval):
     agg = make_tiny_aggregator(depth)
     agg.eval()
     past_key_values = [None] * agg.depth
+    cache_sizes = []
+    traces = []
 
     with torch.no_grad():
-        for step in range(2):
+        for step in range(steps):
+            cache_write_current_frame = step == 0 or step % int(kf_interval) == 0
             images = torch.rand(1, 1, 3, 16, 16)
             output_list, patch_start_idx, past_key_values = agg(
                 images,
@@ -114,11 +162,20 @@ def run_two_streaming_steps(ranges, depth):
                 total_budget=1000,
                 global_attn_idx_ranges=ranges,
                 global_attn_debug=False,
+                cache_write_current_frame=cache_write_current_frame,
             )
             assert len(output_list) == depth
             assert patch_start_idx == 3
+            traces.append(list(agg.last_global_attn_debug_trace))
+            cache_sizes.append([_cache_token_count(kv) for kv in past_key_values])
 
-    return agg, past_key_values
+    return agg, past_key_values, cache_sizes, traces
+
+
+def _cache_token_count(kv):
+    if kv is None:
+        return 0
+    return int(kv[0].shape[2])
 
 
 def make_tiny_aggregator(depth):

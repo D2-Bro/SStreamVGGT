@@ -32,6 +32,11 @@ def _assert_finite(tensor: torch.Tensor, name: str) -> None:
         raise AssertionError(f"{name} contains non-finite values")
 
 
+def _assert_nonnegative(tensor: torch.Tensor, name: str) -> None:
+    if bool((tensor.float() < -1e-6).any().item()):
+        raise AssertionError(f"{name} contains negative values")
+
+
 def check_head_mode_shape() -> None:
     k, v = _make_cache()
     manager = EvictionManager(
@@ -122,6 +127,12 @@ def check_approx_methods() -> None:
             "leverage_left_sketch_dim": 16,
             "leverage_right_jl_dim": 4,
         },
+        {"leverage_approx_method": "full_d_ridge", "leverage_sketch_dim": 4},
+        {
+            "leverage_approx_method": "right_sketch_ridge",
+            "leverage_sketch_dim": 4,
+            "leverage_right_jl_dim": 4,
+        },
     )
     for granularity in ("head", "layer"):
         for cfg in configs:
@@ -138,6 +149,7 @@ def check_approx_methods() -> None:
             assert result.leverage_basis.q.shape[-2] == 9
             method_name = cfg["leverage_approx_method"]
             _assert_finite(result.policy_scores, f"{granularity} {method_name} scores")
+            _assert_nonnegative(result.policy_scores, f"{granularity} {method_name} scores")
 
 
 def check_drineas_deterministic() -> None:
@@ -287,26 +299,38 @@ def _assert_evicted_subset_of_low_score_pool(result, candidate_count: int, multi
 def check_fast_dpp_shapes_and_low_score_pool() -> None:
     k, v = _make_cache()
     multiplier = 2
+    methods = (
+        {"leverage_approx_method": "right_sketch", "leverage_sketch_dim": 4},
+        {"leverage_approx_method": "full_d_ridge", "leverage_sketch_dim": 4},
+        {
+            "leverage_approx_method": "right_sketch_ridge",
+            "leverage_sketch_dim": 4,
+            "leverage_right_jl_dim": 4,
+        },
+    )
     for granularity in ("head", "layer"):
         for block_size in (1, 32):
-            manager = EvictionManager(
-                policy="svd_leverage",
-                leverage_sketch_dim=4,
-                leverage_granularity=granularity,
-                leverage_eviction_selector="fast_dpp",
-                leverage_dpp_candidate_multiplier=multiplier,
-                leverage_dpp_greedy_block_size=block_size,
-            )
-            result = manager.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
-            assert result.kept_candidate_indices.shape == (2, 3, 5)
-            expected_scores = (2, 3, 9) if granularity == "head" else (2, 9)
-            assert result.policy_scores.shape == expected_scores
-            _assert_finite(result.policy_scores, f"{granularity} fast_dpp block={block_size} scores")
-            _assert_evicted_subset_of_low_score_pool(result, candidate_count=9, multiplier=multiplier)
-            if granularity == "layer":
-                for head_idx in range(1, result.kept_candidate_indices.shape[1]):
-                    if not torch.equal(result.kept_candidate_indices[:, 0], result.kept_candidate_indices[:, head_idx]):
-                        raise AssertionError("layer-wise fast_dpp did not share kept indices across heads")
+            for method_cfg in methods:
+                manager = EvictionManager(
+                    policy="svd_leverage",
+                    leverage_granularity=granularity,
+                    leverage_eviction_selector="fast_dpp",
+                    leverage_dpp_candidate_multiplier=multiplier,
+                    leverage_dpp_greedy_block_size=block_size,
+                    **method_cfg,
+                )
+                result = manager.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+                assert result.kept_candidate_indices.shape == (2, 3, 5)
+                expected_scores = (2, 3, 9) if granularity == "head" else (2, 9)
+                assert result.policy_scores.shape == expected_scores
+                method = method_cfg["leverage_approx_method"]
+                _assert_finite(result.policy_scores, f"{granularity} {method} fast_dpp block={block_size} scores")
+                _assert_nonnegative(result.policy_scores, f"{granularity} {method} fast_dpp block={block_size} scores")
+                _assert_evicted_subset_of_low_score_pool(result, candidate_count=9, multiplier=multiplier)
+                if granularity == "layer":
+                    for head_idx in range(1, result.kept_candidate_indices.shape[1]):
+                        if not torch.equal(result.kept_candidate_indices[:, 0], result.kept_candidate_indices[:, head_idx]):
+                            raise AssertionError("layer-wise fast_dpp did not share kept indices across heads")
 
 
 def check_fast_dpp_retain_diversity() -> None:
@@ -338,6 +362,40 @@ def check_fast_dpp_retain_diversity() -> None:
     if retained != {2, 3}:
         raise AssertionError(
             "fast_dpp should retain diverse higher-score pool representatives, "
+            f"got retained={sorted(retained)} evicted={sorted(evicted)}"
+        )
+
+
+def check_fast_dpp_diversity_beta_zero_prefers_quality() -> None:
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_greedy_block_size=1,
+        leverage_dpp_diversity_beta=0.0,
+    )
+    scores = torch.tensor([0.0, 0.4, 0.9, 1.0], dtype=torch.float32)
+    features = torch.tensor(
+        [
+            [-1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    evicted = set(
+        manager._fast_dpp_evicted_indices(
+            scores,
+            torch.ones_like(scores, dtype=torch.bool),
+            2,
+            lambda idx: features.index_select(0, idx),
+        ).tolist()
+    )
+    retained = set(range(scores.numel())) - evicted
+    if retained != {2, 3}:
+        raise AssertionError(
+            "fast_dpp with diversity beta 0 should retain the highest-quality pool tokens, "
             f"got retained={sorted(retained)} evicted={sorted(evicted)}"
         )
 
@@ -497,6 +555,173 @@ def check_protection_disabled_matches_previous_behavior() -> None:
         raise AssertionError("protect_recent_frames=0 changed eviction indices")
 
 
+def _make_multiframe_metadata(batch_size: int, num_heads: int, tokens_per_frame: int, num_frames: int) -> KVCacheMetadata:
+    metadata = KVCacheMetadata.for_current_frame(batch_size, num_heads, tokens_per_frame, 0)
+    for frame_id in range(1, num_frames):
+        metadata = metadata.concat(
+            KVCacheMetadata.for_current_frame(batch_size, num_heads, tokens_per_frame, frame_id)
+        )
+    return metadata
+
+
+def _assert_candidate_indices_retained(kept: torch.Tensor, required) -> None:
+    required = set(required)
+    for row in kept.reshape(-1, kept.shape[-1]):
+        missing = required - set(row.tolist())
+        if missing:
+            raise AssertionError(f"protected candidate indices were evicted: {sorted(missing)}")
+
+
+def check_special_token_protection_policies() -> None:
+    torch.manual_seed(29)
+    batch_size, num_heads, tokens_per_frame, num_frames, head_dim = 1, 2, 4, 3, 4
+    num_tokens = tokens_per_frame * num_frames
+    num_anchor_tokens = tokens_per_frame
+    special_token_count = 2
+    k = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v = torch.randn_like(k)
+    metadata = _make_multiframe_metadata(batch_size, num_heads, tokens_per_frame, num_frames)
+    candidate_mask = metadata.token_indices[:, :, num_anchor_tokens:] >= special_token_count
+    protected_local = {0, 1, 4, 5}
+
+    configs = (
+        {"policy": "mean", "leverage_granularity": "head"},
+        {"policy": "svd_leverage", "leverage_granularity": "head", "leverage_sketch_dim": 0},
+        {"policy": "svd_leverage", "leverage_granularity": "layer", "leverage_sketch_dim": 0},
+        {
+            "policy": "svd_leverage",
+            "leverage_granularity": "layer",
+            "leverage_sketch_dim": 0,
+            "leverage_eviction_selector": "fast_dpp",
+        },
+        {"policy": "dpp", "leverage_granularity": "layer"},
+    )
+    for config in configs:
+        result = EvictionManager(**config).select(
+            k,
+            cache_budget=5,
+            num_anchor_tokens=num_anchor_tokens,
+            v=v,
+            candidate_evictable_mask=candidate_mask,
+        )
+        _assert_candidate_indices_retained(result.kept_candidate_indices, protected_local)
+        if result.kept_candidate_indices.shape[-1] <= 1:
+            raise AssertionError("special-token protection should allow the cache to exceed its target budget")
+
+
+def check_special_and_recent_protection_combine() -> None:
+    torch.manual_seed(37)
+    batch_size, num_heads, tokens_per_frame, num_frames, head_dim = 1, 2, 4, 3, 4
+    num_anchor_tokens = tokens_per_frame
+    num_tokens = tokens_per_frame * num_frames
+    k = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v = torch.randn_like(k)
+    metadata = _make_multiframe_metadata(batch_size, num_heads, tokens_per_frame, num_frames)
+    result = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_sketch_dim=0,
+    ).select(
+        k,
+        cache_budget=5,
+        num_anchor_tokens=num_anchor_tokens,
+        v=v,
+        current_frame_idx=2,
+        protect_recent_frames=1,
+        candidate_frame_ids=metadata.frame_ids[:, :, num_anchor_tokens:],
+        candidate_evictable_mask=metadata.token_indices[:, :, num_anchor_tokens:] >= 2,
+    )
+    _assert_candidate_indices_retained(result.kept_candidate_indices, {0, 1, 4, 5, 6, 7})
+
+
+def check_attention_special_token_protection() -> None:
+    torch.manual_seed(41)
+    attention = Attention(dim=4, num_heads=1)
+    attention.eval()
+    frames = [torch.randn(1, 4, 4) for _ in range(3)]
+    past = None
+    with torch.no_grad():
+        for frame_idx, frame in enumerate(frames):
+            _, past, _ = attention(
+                frame,
+                past_key_values=past,
+                use_cache=True,
+                cache_budget=3,
+                step_idx=frame_idx,
+                eviction_policy="svd_leverage",
+                leverage_granularity="layer",
+                leverage_sketch_dim=0,
+                eviction_protect_special_tokens=True,
+                special_token_count=2,
+            )
+
+    k, v, metadata = past
+    if k.shape != v.shape or k.shape[2] != metadata.token_indices.shape[2]:
+        raise AssertionError("protected cache tensors and metadata lost alignment")
+    for frame_id in range(3):
+        frame_tokens = metadata.token_indices[0, 0][metadata.frame_ids[0, 0] == frame_id]
+        if not {0, 1}.issubset(set(frame_tokens.tolist())):
+            raise AssertionError(f"frame {frame_id} special tokens were evicted")
+    if k.shape[2] <= 3:
+        raise AssertionError("special-token protection should take priority over the hard cache budget")
+
+
+def check_attention_special_token_interval() -> None:
+    torch.manual_seed(43)
+    attention = Attention(dim=4, num_heads=1)
+    attention.eval()
+    frames = [torch.randn(1, 4, 4) for _ in range(4)]
+    past = None
+    with torch.no_grad():
+        for frame_idx, frame in enumerate(frames):
+            _, past, _ = attention(
+                frame,
+                past_key_values=past,
+                use_cache=True,
+                cache_budget=6,
+                step_idx=frame_idx,
+                eviction_policy="svd_leverage",
+                leverage_granularity="layer",
+                leverage_sketch_dim=0,
+                eviction_protect_special_tokens=True,
+                eviction_protect_special_token_interval=2,
+                special_token_count=2,
+            )
+
+    k, v, metadata = past
+    if k.shape != v.shape or k.shape[2] != metadata.token_indices.shape[2]:
+        raise AssertionError("interval-protected cache tensors and metadata lost alignment")
+    if k.shape[2] != 6:
+        raise AssertionError(f"expected interval-protected cache size 6, got {k.shape[2]}")
+    frame_two_tokens = metadata.token_indices[0, 0][metadata.frame_ids[0, 0] == 2]
+    if not {0, 1}.issubset(set(frame_two_tokens.tolist())):
+        raise AssertionError("interval-protected frame 2 special tokens were evicted")
+    for frame_id in (1, 3):
+        frame_tokens = metadata.token_indices[0, 0][metadata.frame_ids[0, 0] == frame_id]
+        if {0, 1} & set(frame_tokens.tolist()):
+            raise AssertionError(f"non-interval frame {frame_id} special tokens were unexpectedly protected")
+
+
+def check_invalid_special_token_interval() -> None:
+    k, v = _make_cache()
+    attention = Attention(dim=k.shape[1] * k.shape[3], num_heads=k.shape[1])
+    metadata = KVCacheMetadata.for_current_frame(k.shape[0], k.shape[1], k.shape[2], frame_id=0)
+    try:
+        attention.eviction(
+            k,
+            v,
+            metadata,
+            cache_budget=7,
+            num_anchor_tokens=2,
+            eviction_protect_special_tokens=True,
+            eviction_protect_special_token_interval=0,
+            special_token_count=2,
+        )
+    except ValueError:
+        return
+    raise AssertionError("invalid special-token protection interval was accepted")
+
+
 def check_keep_after_eviction_zero_evict() -> None:
     scores = torch.randn(2, 3, 5)
     mask = torch.ones_like(scores, dtype=torch.bool)
@@ -531,6 +756,74 @@ def check_small_cache_no_eviction() -> None:
     assert score == 0.0
 
 
+def check_cache_evict_gate_forward() -> None:
+    torch.manual_seed(31)
+    attention = Attention(dim=4, num_heads=1)
+    attention.eval()
+    first = torch.randn(1, 3, 4)
+    second = torch.randn(1, 3, 4)
+
+    with torch.no_grad():
+        _, past, _ = attention(
+            first,
+            use_cache=True,
+            cache_budget=4,
+            eviction_policy="svd_leverage",
+            leverage_granularity="layer",
+            leverage_sketch_dim=0,
+        )
+        _, skipped, skipped_score = attention(
+            second,
+            past_key_values=past,
+            use_cache=True,
+            cache_budget=4,
+            eviction_policy="svd_leverage",
+            leverage_granularity="layer",
+            leverage_sketch_dim=0,
+            cache_write_current_frame=True,
+            cache_evict_current_frame=False,
+        )
+        _, pruned, pruned_score = attention(
+            second,
+            past_key_values=past,
+            use_cache=True,
+            cache_budget=4,
+            eviction_policy="svd_leverage",
+            leverage_granularity="layer",
+            leverage_sketch_dim=0,
+            cache_write_current_frame=True,
+            cache_evict_current_frame=True,
+        )
+
+    if past[0].shape[2] != 3:
+        raise AssertionError("initial cache write should keep the first frame tokens")
+    if skipped[0].shape[2] != 6:
+        raise AssertionError("disabled eviction gate should allow cache to exceed budget")
+    if skipped_score is not None:
+        raise AssertionError("disabled eviction gate should not report pruning scores")
+    if pruned[0].shape[2] != 4:
+        raise AssertionError("enabled eviction gate should prune cache to budget")
+    if pruned_score is None:
+        raise AssertionError("enabled eviction gate should report pruning scores")
+
+
+def check_ridge_invalid_args() -> None:
+    invalid_configs = (
+        {"leverage_approx_method": "full_d_ridge", "leverage_ridge_lambda": -1e-3},
+        {"leverage_approx_method": "full_d_ridge", "leverage_ridge_jitter": 0.0},
+        {"leverage_approx_method": "full_d_ridge", "leverage_ridge_score_chunk_size": 0},
+        {"leverage_approx_method": "right_sketch_ridge", "leverage_ridge_dim": 0},
+        {"leverage_approx_method": "right_sketch_ridge", "leverage_ridge_dim": None, "leverage_right_jl_dim": 0},
+        {"leverage_dpp_diversity_beta": -1e-3},
+    )
+    for cfg in invalid_configs:
+        try:
+            EvictionManager(policy="svd_leverage", **cfg)
+        except ValueError:
+            continue
+        raise AssertionError(f"invalid ridge config was accepted: {cfg}")
+
+
 def main() -> None:
     check_head_mode_shape()
     check_layer_score_shape()
@@ -539,8 +832,10 @@ def main() -> None:
     check_sketch_and_exact_modes()
     check_approx_methods()
     check_drineas_deterministic()
+    check_ridge_invalid_args()
     check_fast_dpp_shapes_and_low_score_pool()
     check_fast_dpp_retain_diversity()
+    check_fast_dpp_diversity_beta_zero_prefers_quality()
     check_fast_dpp_recent_frame_protection()
     check_dpp_shapes_and_full_pool()
     check_dpp_recent_frame_protection()
@@ -550,8 +845,14 @@ def main() -> None:
     check_recent_frame_protection_layer_modes()
     check_recent_frame_eviction_alignment()
     check_protection_disabled_matches_previous_behavior()
+    check_special_token_protection_policies()
+    check_special_and_recent_protection_combine()
+    check_attention_special_token_protection()
+    check_attention_special_token_interval()
+    check_invalid_special_token_interval()
     check_keep_after_eviction_zero_evict()
     check_small_cache_no_eviction()
+    check_cache_evict_gate_forward()
     print("leverage granularity sanity checks passed")
 
 
