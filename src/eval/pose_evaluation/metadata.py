@@ -43,8 +43,25 @@ def _kitti_image_files(dir_path):
     return sorted(glob.glob(os.path.join(dir_path, "*.png")))
 
 
+def _vbr_root():
+    return os.environ.get("SSTREAMVGGT_VBR_ROOT", "/home/dongjae/data/vbr")
+
+
+def _vbr_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "*.png")))
+
+
 KITTI_ODOMETRY_GT_SEQS = [f"{i:02d}" for i in range(11)]
 KITTI_ODOMETRY_TEST_SEQS = [f"{i:02d}" for i in range(11, 22)]
+VBR_SEQS = [
+    "campus_train1",
+    "diag_train0",
+    "colosseo_train0",
+    "pincio_train0",
+    "ciampino_train1",
+    "spagna_train0",
+    "campus_train0",
+]
 
 
 # Define the merged dataset metadata dictionary
@@ -110,6 +127,24 @@ dataset_metadata = {
         "gt_traj_func": lambda img_path, anno_path, seq: None,
         "traj_format": None,
         "seq_list": KITTI_ODOMETRY_TEST_SEQS,
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "vbr": {
+        "img_path": _vbr_root(),
+        "anno_path": os.path.join(_vbr_root(), "processed_gt"),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(
+            img_path, f"{seq}_processed_aligned", "rgb"
+        ),
+        "filelist_func": _vbr_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
+            anno_path, f"{seq}_gt.txt"
+        ),
+        "traj_format": "tum",
+        "seq_list": VBR_SEQS,
         "full_seq": False,
         "mask_path_seq_func": lambda mask_path, seq: None,
         "skip_condition": None,

@@ -324,6 +324,7 @@ def dump_eviction_nn_analysis(
     eviction_policy: str,
     leverage_granularity: str,
     leverage_feature: str,
+    selection_granularity: Optional[str] = None,
 ) -> None:
     """Dump nearest-retained diagnostics for one pre-eviction cache state."""
     with torch.no_grad():
@@ -331,12 +332,18 @@ def dump_eviction_nn_analysis(
         candidate_count = int(N) - int(num_anchor_tokens)
         if candidate_count < 0:
             return
+        active_selection_granularity = leverage_granularity if selection_granularity is None else selection_granularity
+        if active_selection_granularity not in ("head", "layer"):
+            raise ValueError(
+                "selection_granularity must be 'head' or 'layer', got "
+                f"{active_selection_granularity!r}"
+            )
         device = k_before.device
         all_candidates = torch.arange(candidate_count, device=device, dtype=torch.long)
 
         for space in config.spaces():
             if space == "full_key":
-                if leverage_granularity == "layer":
+                if active_selection_granularity == "layer":
                     for batch_id in range(B):
                         if not config.should_dump(layer_id, None, step_idx):
                             continue
@@ -368,6 +375,7 @@ def dump_eviction_nn_analysis(
                             num_anchor_tokens=num_anchor_tokens,
                             eviction_policy=eviction_policy,
                             leverage_granularity=leverage_granularity,
+                            selection_granularity=active_selection_granularity,
                             analysis_space=space,
                             analysis_feature=analysis_feature,
                             total_tokens_before_eviction=N,
@@ -380,9 +388,16 @@ def dump_eviction_nn_analysis(
                                 continue
                             kept_local = kept_candidate_indices[batch_id, head_id].to(device=device, dtype=torch.long)
                             evicted_local = _evicted_from_kept(kept_local, all_candidates, candidate_count)
+                            features = k_before[batch_id, head_id].float()
+                            analysis_feature = "key"
+                            if leverage_feature == "key_value" and v_before is not None:
+                                features = torch.cat([features, v_before[batch_id, head_id].float()], dim=-1)
+                                analysis_feature = "key_value"
+                            elif leverage_feature == "key_value":
+                                analysis_feature = "key_fallback"
                             _dump_one_eviction_nn_event(
                                 config,
-                                features=k_before[batch_id, head_id].float(),
+                                features=features,
                                 retained_cache_idx=kept_local + int(num_anchor_tokens),
                                 evicted_cache_idx=evicted_local + int(num_anchor_tokens),
                                 policy_scores=_scores_for_batch(policy_scores, batch_id, head_id),
@@ -395,8 +410,9 @@ def dump_eviction_nn_analysis(
                                 num_anchor_tokens=num_anchor_tokens,
                                 eviction_policy=eviction_policy,
                                 leverage_granularity=leverage_granularity,
+                                selection_granularity=active_selection_granularity,
                                 analysis_space=space,
-                                analysis_feature="key",
+                                analysis_feature=analysis_feature,
                                 total_tokens_before_eviction=N,
                                 original_evicted_count=int(evicted_local.numel()),
                             )
@@ -415,6 +431,7 @@ def dump_eviction_nn_analysis(
                     num_anchor_tokens=num_anchor_tokens,
                     eviction_policy=eviction_policy,
                     leverage_granularity=leverage_granularity,
+                    selection_granularity=active_selection_granularity,
                     total_tokens_before_eviction=N,
                     device=device,
                 )
@@ -435,6 +452,7 @@ def _dump_svd_coord_events(
     num_anchor_tokens: int,
     eviction_policy: str,
     leverage_granularity: str,
+    selection_granularity: str,
     total_tokens_before_eviction: int,
     device: torch.device,
 ) -> None:
@@ -443,13 +461,13 @@ def _dump_svd_coord_events(
     basis_granularity = None if leverage_basis is None else getattr(leverage_basis, "granularity", None)
     unavailable = basis_q is None or basis_q.numel() == 0
 
-    if leverage_granularity == "layer":
+    if selection_granularity == "layer":
         for batch_id in range(B):
             if not config.should_dump(layer_id, None, step_idx):
                 continue
             kept_local, evicted_local = _shared_local_indices(kept_candidate_indices, all_candidates, candidate_count, batch_id, device)
             if unavailable or basis_granularity != "layer":
-                _record_skipped_svd_event(config, batch_id, None, layer_id, step_idx, cache_budget, num_anchor_tokens, eviction_policy, leverage_granularity, total_tokens_before_eviction, int(kept_local.numel()), int(evicted_local.numel()), "coordinates_not_available")
+                _record_skipped_svd_event(config, batch_id, None, layer_id, step_idx, cache_budget, num_anchor_tokens, eviction_policy, leverage_granularity, selection_granularity, total_tokens_before_eviction, int(kept_local.numel()), int(evicted_local.numel()), "coordinates_not_available")
                 continue
             features = torch.nan_to_num(basis_q[batch_id].to(device=device, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
             _dump_one_eviction_nn_event(
@@ -468,6 +486,7 @@ def _dump_svd_coord_events(
                 num_anchor_tokens=num_anchor_tokens,
                 eviction_policy=eviction_policy,
                 leverage_granularity=leverage_granularity,
+                selection_granularity=selection_granularity,
                 analysis_space="svd_coord",
                 analysis_feature="signed_q",
                 total_tokens_before_eviction=total_tokens_before_eviction,
@@ -481,10 +500,11 @@ def _dump_svd_coord_events(
                     continue
                 kept_local = kept_candidate_indices[batch_id, head_id].to(device=device, dtype=torch.long)
                 evicted_local = _evicted_from_kept(kept_local, all_candidates, candidate_count)
-                if unavailable or basis_granularity != "head":
-                    _record_skipped_svd_event(config, batch_id, head_id, layer_id, step_idx, cache_budget, num_anchor_tokens, eviction_policy, leverage_granularity, total_tokens_before_eviction, int(kept_local.numel()), int(evicted_local.numel()), "coordinates_not_available")
+                if unavailable or basis_granularity not in ("head", "layer"):
+                    _record_skipped_svd_event(config, batch_id, head_id, layer_id, step_idx, cache_budget, num_anchor_tokens, eviction_policy, leverage_granularity, selection_granularity, total_tokens_before_eviction, int(kept_local.numel()), int(evicted_local.numel()), "coordinates_not_available")
                     continue
-                features = torch.nan_to_num(basis_q[batch_id, head_id].to(device=device, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                basis_features = basis_q[batch_id, head_id] if basis_granularity == "head" else basis_q[batch_id]
+                features = torch.nan_to_num(basis_features.to(device=device, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
                 _dump_one_eviction_nn_event(
                     config,
                     features=features,
@@ -501,6 +521,7 @@ def _dump_svd_coord_events(
                     num_anchor_tokens=num_anchor_tokens,
                     eviction_policy=eviction_policy,
                     leverage_granularity=leverage_granularity,
+                    selection_granularity=selection_granularity,
                     analysis_space="svd_coord",
                     analysis_feature="signed_q",
                     total_tokens_before_eviction=total_tokens_before_eviction,
@@ -525,6 +546,7 @@ def _dump_one_eviction_nn_event(
     num_anchor_tokens: int,
     eviction_policy: str,
     leverage_granularity: str,
+    selection_granularity: str,
     analysis_space: str,
     analysis_feature: str,
     total_tokens_before_eviction: int,
@@ -547,6 +569,7 @@ def _dump_one_eviction_nn_event(
         num_anchor_tokens=num_anchor_tokens,
         eviction_policy=eviction_policy,
         leverage_granularity=leverage_granularity,
+        selection_granularity=selection_granularity,
         analysis_space=analysis_space,
         analysis_feature=analysis_feature,
         total_tokens_before_eviction=total_tokens_before_eviction,
@@ -992,6 +1015,7 @@ def _record_skipped_svd_event(
     num_anchor_tokens: int,
     eviction_policy: str,
     leverage_granularity: str,
+    selection_granularity: str,
     total_tokens_before_eviction: int,
     retained_count: int,
     evicted_count: int,
@@ -1007,6 +1031,7 @@ def _record_skipped_svd_event(
         num_anchor_tokens=num_anchor_tokens,
         eviction_policy=eviction_policy,
         leverage_granularity=leverage_granularity,
+        selection_granularity=selection_granularity,
         analysis_space="svd_coord",
         analysis_feature="signed_q",
         total_tokens_before_eviction=total_tokens_before_eviction,

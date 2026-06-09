@@ -201,6 +201,30 @@ def run_inference(args: argparse.Namespace):
             f"got {args.leverage_dpp_greedy_block_size}."
         )
         return
+    if args.leverage_dpp_quality_beta < 0:
+        print(
+            "Error: --leverage_dpp_quality_beta must be >= 0, "
+            f"got {args.leverage_dpp_quality_beta}."
+        )
+        return
+    if args.leverage_dpp_recency_lambda < 0:
+        print(
+            "Error: --leverage_dpp_recency_lambda must be >= 0, "
+            f"got {args.leverage_dpp_recency_lambda}."
+        )
+        return
+    if args.leverage_dpp_recency_window < 1:
+        print(
+            "Error: --leverage_dpp_recency_window must be >= 1, "
+            f"got {args.leverage_dpp_recency_window}."
+        )
+        return
+    if args.leverage_dpp_recency_gate_power < 0:
+        print(
+            "Error: --leverage_dpp_recency_gate_power must be >= 0, "
+            f"got {args.leverage_dpp_recency_gate_power}."
+        )
+        return
     if args.leverage_ridge_lambda < 0:
         print(
             "Error: --leverage_ridge_lambda must be >= 0, "
@@ -259,7 +283,8 @@ def run_inference(args: argparse.Namespace):
             "Using SVD leverage selector: "
             f"{args.leverage_eviction_selector} "
             f"(dpp_candidate_multiplier={args.leverage_dpp_candidate_multiplier}, "
-            f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size})"
+            f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
+            f"dpp_quality_beta={args.leverage_dpp_quality_beta})"
         )
         print(f"Using SVD leverage recent-frame protection: {args.eviction_protect_recent_frames}")
     recent_merge_config = RecentMergeConfig(
@@ -346,7 +371,8 @@ def run_inference(args: argparse.Namespace):
     print("Model loaded successfully onto the GPU.")
 
     print(f"Loading images from input directory: {args.input_dir}")
-    image_names = sorted(glob.glob(os.path.join(args.input_dir, "*color.*")))
+    # image_names = sorted(glob.glob(os.path.join(args.input_dir, "*color.*")))
+    image_names = sorted(glob.glob(os.path.join(args.input_dir, "*.png")))
     
     if not image_names:
         print(f"Error: No images found in {args.input_dir}. Please check the path and file extensions.")
@@ -426,6 +452,12 @@ def run_inference(args: argparse.Namespace):
                 leverage_eviction_selector=args.leverage_eviction_selector,
                 leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
                 leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
+                leverage_dpp_quality_beta=args.leverage_dpp_quality_beta,
+                leverage_dpp_recency_bonus=args.leverage_dpp_recency_bonus,
+                leverage_dpp_recency_lambda=args.leverage_dpp_recency_lambda,
+                leverage_dpp_recency_window=args.leverage_dpp_recency_window,
+                leverage_dpp_recency_gate_power=args.leverage_dpp_recency_gate_power,
+                leverage_dpp_recency_debug=args.leverage_dpp_recency_debug,
                 eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                 eviction_protect_special_tokens=args.eviction_protect_special_tokens,
                 eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
@@ -738,8 +770,8 @@ if __name__ == "__main__":
         "--leverage-eviction-selector",
         type=str,
         default="topk",
-        choices=("topk", "fast_dpp"),
-        help="Eviction selector for svd_leverage scores: topk or low-score Fast DPP",
+        choices=("topk", "fast_dpp", "layer_head_fast_dpp"),
+        help="Eviction selector for svd_leverage scores: topk, shared Fast DPP, or GPU head-wise Fast DPP with layer scores",
     )
     parser.add_argument(
         "--leverage_dpp_candidate_multiplier",
@@ -755,6 +787,18 @@ if __name__ == "__main__":
         default=32,
         help="Fast DPP greedy selection block size; 1 is quality-oriented, larger values favor speed",
     )
+    parser.add_argument(
+        "--leverage_dpp_quality_beta",
+        "--leverage-dpp-quality-beta",
+        type=float,
+        default=1.0,
+        help="Fast DPP quality log-term weight; 0 removes quality from DPP selection",
+    )
+    parser.add_argument("--leverage_dpp_recency_bonus", "--leverage-dpp-recency-bonus", action="store_true", help="Add a weak recency quality prior inside Fast DPP retain selection")
+    parser.add_argument("--leverage_dpp_recency_lambda", "--leverage-dpp-recency-lambda", type=float, default=0.2, help="Strength of the Fast DPP recency quality prior")
+    parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=5, help="Frame window for linear Fast DPP freshness")
+    parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for Fast DPP recency")
+    parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print Fast DPP recency prior summary statistics")
     parser.add_argument(
         "--eviction_protect_recent_frames",
         "--eviction-protect-recent-frames",

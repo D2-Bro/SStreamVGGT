@@ -230,6 +230,26 @@ def validate_args(args):
             "--leverage_dpp_greedy_block_size must be >= 1, "
             f"got {args.leverage_dpp_greedy_block_size}"
         )
+    if args.leverage_dpp_quality_beta < 0:
+        raise ValueError(
+            "--leverage_dpp_quality_beta must be >= 0, "
+            f"got {args.leverage_dpp_quality_beta}"
+        )
+    if args.leverage_dpp_recency_lambda < 0:
+        raise ValueError(
+            "--leverage_dpp_recency_lambda must be >= 0, "
+            f"got {args.leverage_dpp_recency_lambda}"
+        )
+    if args.leverage_dpp_recency_window < 1:
+        raise ValueError(
+            "--leverage_dpp_recency_window must be >= 1, "
+            f"got {args.leverage_dpp_recency_window}"
+        )
+    if args.leverage_dpp_recency_gate_power < 0:
+        raise ValueError(
+            "--leverage_dpp_recency_gate_power must be >= 0, "
+            f"got {args.leverage_dpp_recency_gate_power}"
+        )
     if args.layer_budget_alpha < 0:
         raise ValueError(f"--layer_budget_alpha must be >= 0, got {args.layer_budget_alpha}")
     if args.layer_budget_min_tokens < 0:
@@ -408,6 +428,12 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             leverage_eviction_selector=args.leverage_eviction_selector,
             leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
             leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
+            leverage_dpp_quality_beta=args.leverage_dpp_quality_beta,
+            leverage_dpp_recency_bonus=args.leverage_dpp_recency_bonus,
+            leverage_dpp_recency_lambda=args.leverage_dpp_recency_lambda,
+            leverage_dpp_recency_window=args.leverage_dpp_recency_window,
+            leverage_dpp_recency_gate_power=args.leverage_dpp_recency_gate_power,
+            leverage_dpp_recency_debug=args.leverage_dpp_recency_debug,
             layer_budget_strategy=args.layer_budget_strategy,
             layer_budget_alpha=args.layer_budget_alpha,
             layer_budget_min_tokens=args.layer_budget_min_tokens,
@@ -579,10 +605,16 @@ def main():
         "--leverage-eviction-selector",
         type=str,
         default="fast_dpp",
-        choices=("topk", "fast_dpp"),
+        choices=("topk", "fast_dpp", "layer_head_fast_dpp"),
     )
     parser.add_argument("--leverage_dpp_candidate_multiplier", "--leverage-dpp-candidate-multiplier", type=int, default=3)
     parser.add_argument("--leverage_dpp_greedy_block_size", "--leverage-dpp-greedy-block-size", type=int, default=64)
+    parser.add_argument("--leverage_dpp_quality_beta", "--leverage-dpp-quality-beta", type=float, default=1.0)
+    parser.add_argument("--leverage_dpp_recency_bonus", "--leverage-dpp-recency-bonus", action="store_true")
+    parser.add_argument("--leverage_dpp_recency_lambda", "--leverage-dpp-recency-lambda", type=float, default=0.2)
+    parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=5)
+    parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0)
+    parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true")
     parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
@@ -679,6 +711,7 @@ def main():
         f"projection={args.leverage_projection}, "
         f"selector={args.leverage_eviction_selector}, "
         f"dpp_block={args.leverage_dpp_greedy_block_size}, "
+        f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
         f"layer_budget={args.layer_budget_strategy}, "
         f"alpha={args.layer_budget_alpha}, "
         f"min_tokens={args.layer_budget_min_tokens}"

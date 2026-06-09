@@ -185,6 +185,8 @@ def _benchmark_eviction_selectors(args, device: torch.device, dtype: torch.dtype
         ("selector_topk", "topk", 32),
         ("selector_fast_dpp_b1", "fast_dpp", 1),
         ("selector_fast_dpp_b32", "fast_dpp", 32),
+        ("selector_layer_head_dpp_b1", "layer_head_fast_dpp", 1),
+        ("selector_layer_head_dpp_b32", "layer_head_fast_dpp", 32),
     ]
     print("\nselector benchmark")
     print(

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -131,6 +132,43 @@ def check_dump_writes_knn_fields() -> None:
         shutil.rmtree(tmp)
 
 
+def check_layer_scores_with_head_selection_dump_per_head() -> None:
+    tmp = tempfile.mkdtemp(prefix="eviction_nn_layer_head_dump_")
+    try:
+        config = EvictionNNAnalysisConfig(tmp, save_topk_pairs=0)
+        k = torch.tensor(
+            [[
+                [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]],
+                [[1.0, 0.0], [0.0, 1.0], [0.9, 0.1], [0.1, 0.9]],
+            ]]
+        )
+        dump_eviction_nn_analysis(
+            config,
+            k_before=k,
+            v_before=None,
+            kept_candidate_indices=torch.tensor([[[0, 1], [2, 3]]]),
+            policy_scores=torch.zeros(1, 4),
+            leverage_basis=None,
+            metadata=None,
+            layer_id=0,
+            step_idx=3,
+            cache_budget=2,
+            num_anchor_tokens=0,
+            eviction_policy="svd_leverage",
+            leverage_granularity="layer",
+            leverage_feature="key",
+            selection_granularity="head",
+        )
+        with open(os.path.join(tmp, "summary.jsonl"), "r", encoding="utf-8") as handle:
+            rows = [json.loads(line) for line in handle]
+        if len(rows) != 2 or {row["head_idx"] for row in rows} != {0, 1}:
+            raise AssertionError(f"expected one diagnostic per selected head, got {rows}")
+        if any(row.get("selection_granularity") != "head" for row in rows):
+            raise AssertionError("head-specific selection granularity was not recorded")
+    finally:
+        shutil.rmtree(tmp)
+
+
 def check_empty_cases() -> None:
     tmp = tempfile.mkdtemp(prefix="eviction_nn_test_")
     try:
@@ -183,6 +221,7 @@ def main() -> None:
     check_knn_ratio_chunking_matches()
     check_knn_ratio_large_k()
     check_dump_writes_knn_fields()
+    check_layer_scores_with_head_selection_dump_per_head()
     check_empty_cases()
     print("eviction NN analysis smoke tests passed")
 

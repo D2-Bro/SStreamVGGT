@@ -3,7 +3,6 @@ import os
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from streamvggt.models.aggregator import Aggregator
@@ -176,6 +175,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         window_protect_frames: int = 0,
         max_anchors: int = 3,
         coverage_threshold: float = 0.2,
+        camera_motion_threshold: float = 0.2,
         anchor_keep_ratio: float = 0.05,
         total_budget=None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
@@ -189,6 +189,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_evictable_only: bool = False,
         leverage_approx_method: str = "right_sketch",
         leverage_left_sketch_dim: Optional[int] = 2048,
         leverage_right_jl_dim: Optional[int] = 64,
@@ -201,7 +202,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_eviction_selector: str = "topk",
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
+        leverage_dpp_quality_beta: float = 1.0,
         leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_recency_bonus: bool = False,
+        leverage_dpp_recency_lambda: float = 0.2,
+        leverage_dpp_recency_window: int = 5,
+        leverage_dpp_recency_gate_power: float = 1.0,
+        leverage_dpp_recency_debug: bool = False,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -284,35 +291,16 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 min_anchor_interval=min_anchor_interval,
                 max_anchors=max_anchors,
                 coverage_threshold=coverage_threshold,
+                camera_motion_threshold=camera_motion_threshold,
+                history_protect_token_count=self.aggregator.patch_start_idx,
                 anchor_keep_ratio=anchor_keep_ratio,
             )
             anchor_manager = HistoryAnchorManager(anchor_config, tokens_per_frame)
             anchor_manager.image_size_hw = (img_h, img_w)
 
-        def _select_anchor_token_indices(conf_map: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            if conf_map is None:
-                return None
-
-            special_count = self.aggregator.patch_start_idx
-            anchor_chunk = max(int(tokens_per_frame * anchor_keep_ratio), 1)
-            if anchor_chunk <= special_count:
-                return torch.arange(anchor_chunk, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
-
-            keep_patches = anchor_chunk - special_count
-            if conf_map.dim() == 4:
-                conf_map = conf_map.squeeze(1)
-            if conf_map.dim() != 3:
-                return None
-
-            pooled = F.adaptive_avg_pool2d(conf_map.unsqueeze(1), (patch_h, patch_w)).squeeze(1)
-            flat = pooled.reshape(conf_map.shape[0], -1)
-            keep_patches = min(keep_patches, flat.shape[1])
-            if keep_patches <= 0:
-                return torch.arange(anchor_chunk, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
-
-            topk = torch.topk(flat, k=keep_patches, dim=1).indices
-            special_indices = torch.arange(special_count, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
-            return torch.cat([special_indices, topk + special_count], dim=1)
+        def _select_history_anchor_token_indices(batch_size: int, device: torch.device) -> torch.Tensor:
+            special_count = min(int(self.aggregator.patch_start_idx), int(tokens_per_frame))
+            return torch.arange(special_count, device=device).unsqueeze(0).expand(batch_size, -1)
 
         all_ress = []
         processed_frames = [] 
@@ -343,7 +331,16 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             )
             effective_window_token_count = window_token_count if anchor_manager is not None else 0
 
-            images = frame["img"].unsqueeze(0) 
+            target_device = next(self.parameters()).device
+            frame_img = frame["img"].to(target_device, non_blocking=True)
+            if frame_img.dim() == 3:
+                images = frame_img.unsqueeze(0).unsqueeze(0)
+            elif frame_img.dim() == 4:
+                images = frame_img.unsqueeze(0)
+            elif frame_img.dim() == 5:
+                images = frame_img
+            else:
+                raise ValueError(f"Expected frame image with 3, 4, or 5 dims, got {frame_img.shape}")
             covis_selection = None
             voxel_covis_frame_ids = None
             if voxel_covis_graph is not None:
@@ -373,6 +370,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
                 leverage_normalize_rows=leverage_normalize_rows,
+                leverage_evictable_only=leverage_evictable_only,
                 leverage_approx_method=leverage_approx_method,
                 leverage_left_sketch_dim=leverage_left_sketch_dim,
                 leverage_right_jl_dim=leverage_right_jl_dim,
@@ -385,7 +383,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 leverage_eviction_selector=leverage_eviction_selector,
                 leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                 leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                leverage_dpp_quality_beta=leverage_dpp_quality_beta,
                 leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
+                leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
+                leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
+                leverage_dpp_recency_window=leverage_dpp_recency_window,
+                leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
+                leverage_dpp_recency_debug=leverage_dpp_recency_debug,
                 layer_budget_strategy=layer_budget_strategy,
                 layer_budget_value_gamma=layer_budget_value_gamma,
                 layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -446,8 +450,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     track_conf = conf[:, 0]
 
             if fixed_interval_registered:
-                anchor_token_indices = _select_anchor_token_indices(
-                    pts3d_conf if self.point_head is not None else None
+                anchor_token_indices = _select_history_anchor_token_indices(
+                    camera_pose.shape[0],
+                    camera_pose.device,
                 )
                 past_key_values = self.aggregator.sync_anchor_change(
                     past_key_values,
@@ -469,8 +474,32 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
                     print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
 
-                    anchor_token_indices = _select_anchor_token_indices(
-                        pts3d_conf if self.point_head is not None else None
+                    anchor_token_indices = _select_history_anchor_token_indices(
+                        camera_pose.shape[0],
+                        camera_pose.device,
+                    )
+                    past_key_values = self.aggregator.sync_anchor_change(
+                        past_key_values,
+                        anchor_token_count=anchor_manager.get_protected_token_count(),
+                        tokens_per_frame=tokens_per_frame,
+                        anchor_keep_ratio=anchor_keep_ratio,
+                        anchor_token_indices=anchor_token_indices,
+                        is_fifo=is_fifo,
+                    )
+
+            if anchor_manager is not None and history_anchor_strategy == "camera_motion":
+                should_register, is_fifo, reason, _camera_motion = anchor_manager.should_become_anchor_camera_motion(
+                    frame_idx=i,
+                    current_pose=camera_pose[0],
+                )
+                if should_register:
+                    anchor_manager.register_anchor_camera_motion(i, camera_pose[0])
+                    fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
+                    print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
+
+                    anchor_token_indices = _select_history_anchor_token_indices(
+                        camera_pose.shape[0],
+                        camera_pose.device,
                     )
                     past_key_values = self.aggregator.sync_anchor_change(
                         past_key_values,

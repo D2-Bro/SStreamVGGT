@@ -12,9 +12,9 @@ eviction_policy='svd_leverage'
 layer_budget_strategy='value_weighted_leverage_pr'  # [leverage_pr, uniform, value_weighted_leverage_pr, cosine_precomputed]
 layer_budget_proportions_path='../cosine_budget.json' # Required only for cosine_precomputed.
 layer_budget_alpha=0.5
-layer_budget_min_tokens=3000
+layer_budget_min_tokens=0
 layer_budget_eps=1e-12
-layer_budget_value_gamma=1.0
+layer_budget_value_gamma=0.7
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
 layer_budget_debug=false
@@ -39,11 +39,11 @@ if [ "$layer_budget_log_scores" = true ]; then
     layer_budget_log_args=(--layer_budget_log_scores)
 fi
 # datasets=('sintel' 'bonn' 'kitti')
-datasets=('kitti_s1_500')
-# datasets=('bonn_500')
+# datasets=('kitti_s1_500')
+datasets=('bonn_500')
 leverage_eviction_selector=fast_dpp # [topk, fast_dpp, layer_head_fast_dpp]
-leverage_dpp_candidate_multiplier=3
-leverage_dpp_greedy_block_size=16
+leverage_dpp_candidate_multiplier=4
+leverage_dpp_greedy_block_size=64
 leverage_dpp_quality_beta=0.0
 leverage_dpp_diversity_beta=1.0
 leverage_approx_method=right_sketch_ridge
@@ -54,15 +54,20 @@ leverage_ridge_jitter=1e-6
 leverage_ridge_dim=256
 leverage_random_seed=0
 eviction_protect_recent_frames=0
-special_token_interval=3
+special_token_interval=1
 
 leverage_approx_tag=""
 if [ "$leverage_approx_method" = "right_sketch_ridge" ]; then
     leverage_approx_tag="_rightSketchRidge_r${leverage_ridge_dim}"
 fi
 
+history_anchor_strategy=camera_motion
+camera_motion_threshold=0.2
+max_anchors=5
+min_anchor_interval=5
+
 for data in "${datasets[@]}"; do
-    output_dir="${workdir}/eval_results/video_depth/${data}_${model_name}_layerBudget_${layer_budget_strategy}_a${layer_budget_alpha}_min${layer_budget_min_tokens}_vg${layer_budget_value_gamma}_${layer_budget_value_norm_type}_${layer_budget_norm_source}_${leverage_eviction_selector}_block${leverage_dpp_greedy_block_size}${leverage_approx_tag}_budget${total_budget}_kf${kf_interval}_evict${evict_interval}_dppQuality${leverage_dpp_quality_beta}_dppRatio${leverage_dpp_diversity_beta}" # _protectSpecial${special_token_interval}_evictableSVD"
+    output_dir="${workdir}/eval_results/video_depth/${data}_${model_name}_layerBudget_${layer_budget_strategy}_a${layer_budget_alpha}_min${layer_budget_min_tokens}_vg${layer_budget_value_gamma}_${layer_budget_value_norm_type}_${layer_budget_norm_source}_${leverage_eviction_selector}_block${leverage_dpp_greedy_block_size}${leverage_approx_tag}_budget${total_budget}_kf${kf_interval}_evict${evict_interval}_dppQuality${leverage_dpp_quality_beta}_dppRatio${leverage_dpp_diversity_beta}_histCamMove" # _protectSpecial${special_token_interval}_evictableSVD"
     echo "$output_dir"
     CUDA_LAUNCH_BLOCKING=1 accelerate launch --num_processes 1 ../src/eval/video_depth/launch.py \
         --weights "$model_weights" \
@@ -98,6 +103,10 @@ for data in "${datasets[@]}"; do
         --leverage_dpp_diversity_beta "$leverage_dpp_diversity_beta" \
         --eviction_protect_recent_frames "$eviction_protect_recent_frames" \
         --leverage_evictable_only   \
+        --history_anchor_strategy "$history_anchor_strategy" \
+        --camera_motion_threshold "$camera_motion_threshold" \
+        --max_anchors "$max_anchors" \
+        --min_anchor_interval "$min_anchor_interval" \
         "${layer_budget_debug_args[@]}" \
         "${layer_budget_log_args[@]}"
     python ../src/eval/video_depth/eval_depth.py \

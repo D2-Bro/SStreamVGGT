@@ -15,8 +15,10 @@ class HistoryAnchorConfig:
     min_anchor_interval: Optional[int] = None
     max_anchors: int = 3
     coverage_threshold: float = 0.4
+    camera_motion_threshold: float = 0.2
     sample_ratio: float = 0.1
     anchor_keep_ratio: float = 1.0
+    history_protect_token_count: int = 5
 
 
 def compute_coverage(
@@ -106,6 +108,26 @@ def compute_coverage(
     return in_bounds.float().mean().item()
 
 
+def compute_camera_motion_score(
+    previous_pose: torch.Tensor,
+    current_pose: torch.Tensor,
+    eps: float = 1e-12,
+) -> float:
+    """Compute pose-encoding camera motion between two frames."""
+    previous = previous_pose.detach().float()
+    current = current_pose.detach().float()
+    translation_score = torch.linalg.vector_norm(current[..., :3] - previous[..., :3], dim=-1)
+
+    previous_q = previous[..., 3:7]
+    current_q = current[..., 3:7]
+    previous_q = previous_q / previous_q.norm(dim=-1, keepdim=True).clamp_min(eps)
+    current_q = current_q / current_q.norm(dim=-1, keepdim=True).clamp_min(eps)
+    quat_dot = (current_q * previous_q).sum(dim=-1).abs().clamp(max=1.0)
+    rotation_score = 1.0 - quat_dot
+    score = translation_score + rotation_score
+    return float(torch.nan_to_num(score.mean(), nan=0.0, posinf=0.0, neginf=0.0).item())
+
+
 class HistoryAnchorManager:
     """Manage fixed-interval and coverage-based history anchors."""
 
@@ -118,6 +140,7 @@ class HistoryAnchorManager:
         self.last_anchor_frame: Optional[int] = None
         self.latest_anchor_depth: Optional[torch.Tensor] = None
         self.latest_anchor_pose: Optional[torch.Tensor] = None
+        self.latest_camera_motion_anchor_pose: Optional[torch.Tensor] = None
         self.image_size_hw: Optional[Tuple[int, int]] = None
 
     def is_eviction_paused(self) -> bool:
@@ -146,10 +169,9 @@ class HistoryAnchorManager:
 
     def get_protected_token_count(self) -> int:
         global_anchor_tokens = self.tokens_per_frame
-        history_anchor_tokens = int(
-            self.num_history_anchors
-            * self.tokens_per_frame
-            * self.config.anchor_keep_ratio
+        history_anchor_tokens = self.num_history_anchors * min(
+            int(self.config.history_protect_token_count),
+            self.tokens_per_frame,
         )
         return global_anchor_tokens + history_anchor_tokens
 
@@ -221,6 +243,52 @@ class HistoryAnchorManager:
         self.latest_anchor_depth = depth.clone()
         self.latest_anchor_pose = pose.clone()
 
+    def should_become_anchor_camera_motion(
+        self,
+        frame_idx: int,
+        current_pose: torch.Tensor,
+    ) -> Tuple[bool, bool, str, float]:
+        if self.config.strategy != "camera_motion":
+            return False, False, "camera_motion_disabled", 0.0
+
+        if self.latest_camera_motion_anchor_pose is None:
+            self.latest_camera_motion_anchor_pose = current_pose.clone()
+            return False, False, "frame_0_global_anchor", 0.0
+
+        score = compute_camera_motion_score(self.latest_camera_motion_anchor_pose, current_pose)
+        if score < self.config.camera_motion_threshold:
+            return (
+                False,
+                False,
+                f"camera_motion_{score:.3f}<threshold_{self.config.camera_motion_threshold}",
+                score,
+            )
+
+        if self.last_anchor_frame is not None:
+            base_interval = self.config.min_anchor_interval
+            if base_interval is None:
+                base_interval = self.config.interval
+            min_interval = max(base_interval, 0)
+            if (frame_idx - self.last_anchor_frame) < min_interval:
+                return False, False, f"min_interval_{min_interval}_not_met", score
+
+        is_fifo = self.num_history_anchors >= self.config.max_anchors
+        return (
+            self.config.max_anchors > 0,
+            is_fifo,
+            f"camera_motion_{score:.3f}>=threshold_{self.config.camera_motion_threshold}",
+            score,
+        )
+
+    def register_anchor_camera_motion(
+        self,
+        frame_idx: int,
+        pose: torch.Tensor,
+    ) -> None:
+        self.register_anchor(frame_idx)
+        self.last_anchor_frame = frame_idx
+        self.latest_camera_motion_anchor_pose = pose.clone()
+
     def __repr__(self) -> str:
         base_repr = (
             "HistoryAnchorManager("
@@ -232,4 +300,6 @@ class HistoryAnchorManager:
             return base_repr + f", next_target={self.next_anchor_frame})"
         if self.config.strategy == "coverage":
             return base_repr + f", threshold={self.config.coverage_threshold})"
+        if self.config.strategy == "camera_motion":
+            return base_repr + f", threshold={self.config.camera_motion_threshold})"
         return base_repr + ")"

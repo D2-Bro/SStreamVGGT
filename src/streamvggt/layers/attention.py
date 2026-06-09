@@ -80,6 +80,7 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_evictable_only: bool = False,
         leverage_approx_method: str = "right_sketch",
         leverage_left_sketch_dim: Optional[int] = 2048,
         leverage_right_jl_dim: Optional[int] = 64,
@@ -92,7 +93,13 @@ class Attention(nn.Module):
         leverage_eviction_selector: str = "topk",
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
+        leverage_dpp_quality_beta: float = 1.0,
         leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_recency_bonus: bool = False,
+        leverage_dpp_recency_lambda: float = 0.2,
+        leverage_dpp_recency_window: int = 5,
+        leverage_dpp_recency_gate_power: float = 1.0,
+        leverage_dpp_recency_debug: bool = False,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -155,6 +162,16 @@ class Attention(nn.Module):
         selection_budget = max(select_budget, num_anchor_tokens) if eviction_protect_special_tokens else select_budget
         if eviction_protect_special_tokens and select_metadata is None:
             raise ValueError("Special-token protection requires KV cache metadata")
+        if (
+            leverage_eviction_selector == "layer_head_fast_dpp"
+            and svd_eviction_merge_config is not None
+            and svd_eviction_merge_config.enabled
+            and svd_eviction_merge_config.mode != "head"
+        ):
+            raise ValueError(
+                "layer_head_fast_dpp produces head-specific keep sets and is only compatible with "
+                "svd_eviction_merge_mode='head'"
+            )
 
         profile_eviction = bool(eviction_debug)
         if profile_eviction and k.is_cuda and torch.cuda.is_available():
@@ -170,6 +187,7 @@ class Attention(nn.Module):
             leverage_projection,
             leverage_head_mean_dim,
             leverage_normalize_rows,
+            leverage_evictable_only,
             leverage_approx_method,
             leverage_left_sketch_dim,
             leverage_right_jl_dim,
@@ -182,7 +200,13 @@ class Attention(nn.Module):
             leverage_eviction_selector,
             leverage_dpp_candidate_multiplier,
             leverage_dpp_greedy_block_size,
+            leverage_dpp_quality_beta,
             leverage_dpp_diversity_beta,
+            leverage_dpp_recency_bonus,
+            leverage_dpp_recency_lambda,
+            leverage_dpp_recency_window,
+            leverage_dpp_recency_gate_power,
+            leverage_dpp_recency_debug,
             layer_budget_strategy,
             layer_budget_value_gamma,
             layer_budget_value_norm_type,
@@ -200,6 +224,7 @@ class Attention(nn.Module):
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
                 leverage_normalize_rows=leverage_normalize_rows,
+                leverage_evictable_only=leverage_evictable_only,
                 leverage_approx_method=leverage_approx_method,
                 leverage_left_sketch_dim=leverage_left_sketch_dim,
                 leverage_right_jl_dim=leverage_right_jl_dim,
@@ -212,7 +237,13 @@ class Attention(nn.Module):
                 leverage_eviction_selector=leverage_eviction_selector,
                 leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                 leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                leverage_dpp_quality_beta=leverage_dpp_quality_beta,
                 leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
+                leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
+                leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
+                leverage_dpp_recency_window=leverage_dpp_recency_window,
+                leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
+                leverage_dpp_recency_debug=leverage_dpp_recency_debug,
                 layer_budget_strategy=layer_budget_strategy,
                 layer_budget_value_gamma=layer_budget_value_gamma,
                 layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -220,6 +251,24 @@ class Attention(nn.Module):
                 layer_budget_eps=layer_budget_eps,
             )
             self._eviction_managers[manager_key] = eviction
+        candidate_evictable_mask = None
+        if eviction_protect_special_tokens and select_metadata is not None:
+            candidate_token_indices = select_metadata.token_indices[:, :, num_anchor_tokens:]
+            candidate_frame_ids = select_metadata.frame_ids[:, :, num_anchor_tokens:]
+            candidate_evictable_mask = (
+                (candidate_token_indices >= special_token_count)
+                | (
+                    (candidate_frame_ids >= 0)
+                    & candidate_frame_ids.remainder(eviction_protect_special_token_interval).ne(0)
+                )
+            )
+            if (
+                eviction_policy in ("svd_leverage", "dpp")
+                and leverage_granularity == "layer"
+                and leverage_eviction_selector != "layer_head_fast_dpp"
+            ):
+                candidate_evictable_mask = candidate_evictable_mask.all(dim=1)
+            candidate_evictable_mask = candidate_evictable_mask.to(device=select_k.device)
         selection_start = time.perf_counter() if profile_eviction else 0.0
         eviction_result = eviction.select(
             select_k,
@@ -236,19 +285,7 @@ class Attention(nn.Module):
                 if select_metadata is not None
                 else None
             ),
-            candidate_evictable_mask=(
-                (select_metadata.token_indices[:, :, num_anchor_tokens:] >= special_token_count)
-                | (
-                    (select_metadata.frame_ids[:, :, num_anchor_tokens:] >= 0)
-                    & (
-                        select_metadata.frame_ids[:, :, num_anchor_tokens:]
-                        .remainder(eviction_protect_special_token_interval)
-                        .ne(0)
-                    )
-                )
-                if eviction_protect_special_tokens and select_metadata is not None
-                else None
-            ),
+            candidate_evictable_mask=candidate_evictable_mask,
             need_leverage_basis=(
                 (svd_eviction_merge_config is not None
                 and svd_eviction_merge_config.enabled
@@ -279,6 +316,9 @@ class Attention(nn.Module):
                 eviction_policy=eviction_policy,
                 leverage_granularity=leverage_granularity,
                 leverage_feature=leverage_feature,
+                selection_granularity=(
+                    "head" if leverage_eviction_selector == "layer_head_fast_dpp" else leverage_granularity
+                ),
             )
 
         if (
@@ -359,6 +399,7 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_evictable_only: bool = False,
         leverage_approx_method: str = "right_sketch",
         leverage_left_sketch_dim: Optional[int] = 2048,
         leverage_right_jl_dim: Optional[int] = 64,
@@ -371,7 +412,13 @@ class Attention(nn.Module):
         leverage_eviction_selector: str = "topk",
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
+        leverage_dpp_quality_beta: float = 1.0,
         leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_recency_bonus: bool = False,
+        leverage_dpp_recency_lambda: float = 0.2,
+        leverage_dpp_recency_window: int = 5,
+        leverage_dpp_recency_gate_power: float = 1.0,
+        leverage_dpp_recency_debug: bool = False,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -414,6 +461,7 @@ class Attention(nn.Module):
                 or (svd_eviction_merge_config is not None and svd_eviction_merge_config.enabled and eviction_policy == "svd_leverage")
                 or eviction_nn_analysis_config is not None
                 or int(eviction_protect_recent_frames) > 0
+                or bool(leverage_dpp_recency_bonus)
                 or bool(eviction_protect_special_tokens)
                 or bool(voxel_covis_enabled)
             )
@@ -487,6 +535,7 @@ class Attention(nn.Module):
                     "leverage_feature": leverage_feature,
                     "leverage_projection": leverage_projection,
                     "leverage_head_mean_dim": leverage_head_mean_dim,
+                    "leverage_evictable_only": leverage_evictable_only,
                     "leverage_approx_method": leverage_approx_method,
                     "leverage_left_sketch_dim": leverage_left_sketch_dim,
                     "leverage_right_jl_dim": leverage_right_jl_dim,
@@ -499,7 +548,13 @@ class Attention(nn.Module):
                     "leverage_eviction_selector": leverage_eviction_selector,
                     "leverage_dpp_candidate_multiplier": leverage_dpp_candidate_multiplier,
                     "leverage_dpp_greedy_block_size": leverage_dpp_greedy_block_size,
+                    "leverage_dpp_quality_beta": leverage_dpp_quality_beta,
                     "leverage_dpp_diversity_beta": leverage_dpp_diversity_beta,
+                    "leverage_dpp_recency_bonus": leverage_dpp_recency_bonus,
+                    "leverage_dpp_recency_lambda": leverage_dpp_recency_lambda,
+                    "leverage_dpp_recency_window": leverage_dpp_recency_window,
+                    "leverage_dpp_recency_gate_power": leverage_dpp_recency_gate_power,
+                    "leverage_dpp_recency_debug": leverage_dpp_recency_debug,
                     "layer_budget_strategy": layer_budget_strategy,
                     "layer_budget_value_gamma": layer_budget_value_gamma,
                     "layer_budget_value_norm_type": layer_budget_value_norm_type,

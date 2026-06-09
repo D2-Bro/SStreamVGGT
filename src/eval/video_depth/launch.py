@@ -95,6 +95,13 @@ def get_args_parser():
         help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
     )
     parser.add_argument(
+        "--leverage_evictable_only",
+        "--leverage-evictable-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute SVD leverage using only tokens allowed by special-token eviction protection",
+    )
+    parser.add_argument(
         "--leverage_approx_method",
         "--leverage-approx-method",
         type=str,
@@ -146,8 +153,8 @@ def get_args_parser():
         "--leverage-eviction-selector",
         type=str,
         default="topk",
-        choices=("topk", "fast_dpp"),
-        help="Eviction selector for svd_leverage scores: topk or low-score Fast DPP",
+        choices=("topk", "fast_dpp", "layer_head_fast_dpp"),
+        help="Eviction selector for svd_leverage scores: topk, shared Fast DPP, or GPU head-wise Fast DPP with layer scores",
     )
     parser.add_argument(
         "--leverage_dpp_candidate_multiplier",
@@ -164,12 +171,24 @@ def get_args_parser():
         help="Fast DPP greedy selection block size; 1 is quality-oriented, larger values favor speed",
     )
     parser.add_argument(
+        "--leverage_dpp_quality_beta",
+        "--leverage-dpp-quality-beta",
+        type=float,
+        default=1.0,
+        help="Fast DPP quality log-term weight; 0 removes quality from DPP selection",
+    )
+    parser.add_argument(
         "--leverage_dpp_diversity_beta",
         "--leverage-dpp-diversity-beta",
         type=float,
         default=1.0,
         help="Fast DPP diversity log-term weight; 1.0 preserves the default DPP balance",
     )
+    parser.add_argument("--leverage_dpp_recency_bonus", "--leverage-dpp-recency-bonus", action="store_true", help="Add a weak recency quality prior inside Fast DPP retain selection")
+    parser.add_argument("--leverage_dpp_recency_lambda", "--leverage-dpp-recency-lambda", type=float, default=0.2, help="Strength of the Fast DPP recency quality prior")
+    parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=10, help="Frame window for linear Fast DPP freshness")
+    parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for Fast DPP recency")
+    parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print Fast DPP recency prior summary statistics")
     parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
@@ -266,7 +285,7 @@ def get_args_parser():
         "--history-anchor-strategy",
         type=str,
         default="none",
-        choices=("none", "fixed_interval", "coverage"),
+        choices=("none", "fixed_interval", "coverage", "camera_motion"),
         help="History Anchor selection strategy",
     )
     parser.add_argument("--anchor_interval", "--anchor-interval", type=int, default=250)
@@ -274,6 +293,7 @@ def get_args_parser():
     parser.add_argument("--window_protect_frames", "--window-protect-frames", type=int, default=0)
     parser.add_argument("--max_anchors", "--max-anchors", type=int, default=0)
     parser.add_argument("--coverage_threshold", "--coverage-threshold", type=float, default=0.2)
+    parser.add_argument("--camera_motion_threshold", "--camera-motion-threshold", type=float, default=0.2)
     parser.add_argument("--anchor_keep_ratio", "--anchor-keep-ratio", type=float, default=0.05)
     parser.add_argument(
         "--profile_eviction",
@@ -437,6 +457,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_projection=args.leverage_projection,
                         leverage_head_mean_dim=args.leverage_head_mean_dim,
                         leverage_normalize_rows=args.leverage_normalize_rows,
+                        leverage_evictable_only=args.leverage_evictable_only,
                         leverage_approx_method=args.leverage_approx_method,
                         leverage_left_sketch_dim=args.leverage_left_sketch_dim,
                         leverage_right_jl_dim=args.leverage_right_jl_dim,
@@ -449,7 +470,13 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_eviction_selector=args.leverage_eviction_selector,
                         leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
                         leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
+                        leverage_dpp_quality_beta=args.leverage_dpp_quality_beta,
                         leverage_dpp_diversity_beta=args.leverage_dpp_diversity_beta,
+                        leverage_dpp_recency_bonus=args.leverage_dpp_recency_bonus,
+                        leverage_dpp_recency_lambda=args.leverage_dpp_recency_lambda,
+                        leverage_dpp_recency_window=args.leverage_dpp_recency_window,
+                        leverage_dpp_recency_gate_power=args.leverage_dpp_recency_gate_power,
+                        leverage_dpp_recency_debug=args.leverage_dpp_recency_debug,
                         layer_budget_strategy=args.layer_budget_strategy,
                         layer_budget_value_gamma=args.layer_budget_value_gamma,
                         layer_budget_value_norm_type=args.layer_budget_value_norm_type,
@@ -468,6 +495,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         window_protect_frames=args.window_protect_frames,
                         max_anchors=args.max_anchors,
                         coverage_threshold=args.coverage_threshold,
+                        camera_motion_threshold=args.camera_motion_threshold,
                         anchor_keep_ratio=args.anchor_keep_ratio,
                         eviction_debug=args.profile_eviction,
                         eviction_nn_analysis_config=eviction_nn_analysis_config,
@@ -528,10 +556,30 @@ if __name__ == "__main__":
             "Error: --leverage_dpp_greedy_block_size must be >= 1, "
             f"got {args.leverage_dpp_greedy_block_size}."
         )
+    if args.leverage_dpp_quality_beta < 0:
+        raise SystemExit(
+            "Error: --leverage_dpp_quality_beta must be >= 0, "
+            f"got {args.leverage_dpp_quality_beta}."
+        )
     if args.leverage_dpp_diversity_beta < 0:
         raise SystemExit(
             "Error: --leverage_dpp_diversity_beta must be >= 0, "
             f"got {args.leverage_dpp_diversity_beta}."
+        )
+    if args.leverage_dpp_recency_lambda < 0:
+        raise SystemExit(
+            "Error: --leverage_dpp_recency_lambda must be >= 0, "
+            f"got {args.leverage_dpp_recency_lambda}."
+        )
+    if args.leverage_dpp_recency_window < 1:
+        raise SystemExit(
+            "Error: --leverage_dpp_recency_window must be >= 1, "
+            f"got {args.leverage_dpp_recency_window}."
+        )
+    if args.leverage_dpp_recency_gate_power < 0:
+        raise SystemExit(
+            "Error: --leverage_dpp_recency_gate_power must be >= 0, "
+            f"got {args.leverage_dpp_recency_gate_power}."
         )
     if args.layer_budget_alpha < 0:
         raise SystemExit(
@@ -625,6 +673,11 @@ if __name__ == "__main__":
             "Error: --coverage_threshold must be in [0, 1], "
             f"got {args.coverage_threshold}."
         )
+    if args.camera_motion_threshold < 0.0:
+        raise SystemExit(
+            "Error: --camera_motion_threshold must be >= 0, "
+            f"got {args.camera_motion_threshold}."
+        )
     if not (0.0 <= args.anchor_keep_ratio <= 1.0):
         raise SystemExit(
             "Error: --anchor_keep_ratio must be in [0, 1], "
@@ -649,9 +702,11 @@ if __name__ == "__main__":
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
+            f"evictable_only={args.leverage_evictable_only}, "
             f"selector={args.leverage_eviction_selector}, "
             f"dpp_candidate_multiplier={args.leverage_dpp_candidate_multiplier}, "
             f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
+            f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
             f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
@@ -671,6 +726,7 @@ if __name__ == "__main__":
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
+            f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
             f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
             f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
