@@ -13,11 +13,6 @@ layer_budget_strategy='leverage_pr'
 layer_budget_alpha=1.0
 layer_budget_min_tokens=0
 layer_budget_eps=1e-12
-layer_budget_debug=false
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 leverage_eviction_selector=fast_dpp
 leverage_dpp_candidate_multiplier=3
 leverage_dpp_greedy_block_size=64
@@ -46,6 +41,5 @@ accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/la
     --layer_budget_eps "$layer_budget_eps" \
     --leverage_approx_method "$leverage_approx_method" \
     --leverage_sketch_dim "$leverage_sketch_dim" \
-    --leverage_random_seed "$leverage_random_seed" \
-    "${layer_budget_debug_args[@]}"
+    --leverage_random_seed "$leverage_random_seed"
 # Add --profile_eviction to the launch command above when measuring eviction latency.

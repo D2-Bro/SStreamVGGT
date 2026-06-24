@@ -19,6 +19,8 @@ class HistoryAnchorConfig:
     sample_ratio: float = 0.1
     anchor_keep_ratio: float = 1.0
     history_protect_token_count: int = 5
+    global_protect_token_count: Optional[int] = None
+    patch_topk_per_anchor_frame: int = 0
 
 
 def compute_coverage(
@@ -112,18 +114,26 @@ def compute_camera_motion_score(
     previous_pose: torch.Tensor,
     current_pose: torch.Tensor,
     eps: float = 1e-12,
+    translation_scale: Optional[float] = None,
+    rotation_scale: Optional[float] = None,
 ) -> float:
     """Compute pose-encoding camera motion between two frames."""
     previous = previous_pose.detach().float()
     current = current_pose.detach().float()
     translation_score = torch.linalg.vector_norm(current[..., :3] - previous[..., :3], dim=-1)
+    if translation_scale is not None:
+        scale = max(float(translation_scale), eps)
+        translation_score = translation_score / scale
 
     previous_q = previous[..., 3:7]
     current_q = current[..., 3:7]
     previous_q = previous_q / previous_q.norm(dim=-1, keepdim=True).clamp_min(eps)
     current_q = current_q / current_q.norm(dim=-1, keepdim=True).clamp_min(eps)
     quat_dot = (current_q * previous_q).sum(dim=-1).abs().clamp(max=1.0)
-    rotation_score = 1.0 - quat_dot
+    rotation_score = 2.0 * torch.acos(quat_dot)
+    if rotation_scale is not None:
+        scale = max(float(rotation_scale), eps)
+        rotation_score = rotation_score / scale
     score = translation_score + rotation_score
     return float(torch.nan_to_num(score.mean(), nan=0.0, posinf=0.0, neginf=0.0).item())
 
@@ -141,6 +151,10 @@ class HistoryAnchorManager:
         self.latest_anchor_depth: Optional[torch.Tensor] = None
         self.latest_anchor_pose: Optional[torch.Tensor] = None
         self.latest_camera_motion_anchor_pose: Optional[torch.Tensor] = None
+        self.latest_camera_motion_previous_pose: Optional[torch.Tensor] = None
+        self.camera_motion_step_translations: List[float] = []
+        self.camera_motion_step_rotations: List[float] = []
+        self.camera_motion_step_window = 20
         self.image_size_hw: Optional[Tuple[int, int]] = None
 
     def is_eviction_paused(self) -> bool:
@@ -163,12 +177,20 @@ class HistoryAnchorManager:
             return
         if self.num_history_anchors < self.config.max_anchors:
             self.num_history_anchors += 1
-        if len(self.history_anchor_frames) >= self.config.max_anchors:
+        if (
+            self.config.patch_topk_per_anchor_frame <= 0
+            and len(self.history_anchor_frames) >= self.config.max_anchors
+        ):
             self.history_anchor_frames.pop(0)
         self.history_anchor_frames.append(frame_idx)
 
     def get_protected_token_count(self) -> int:
         global_anchor_tokens = self.tokens_per_frame
+        if self.config.global_protect_token_count is not None:
+            global_anchor_tokens = min(
+                max(int(self.config.global_protect_token_count), 0),
+                self.tokens_per_frame,
+            )
         history_anchor_tokens = self.num_history_anchors * min(
             int(self.config.history_protect_token_count),
             self.tokens_per_frame,
@@ -251,11 +273,18 @@ class HistoryAnchorManager:
         if self.config.strategy != "camera_motion":
             return False, False, "camera_motion_disabled", 0.0
 
+        self._update_camera_motion_step_scale(current_pose)
+
         if self.latest_camera_motion_anchor_pose is None:
             self.latest_camera_motion_anchor_pose = current_pose.clone()
             return False, False, "frame_0_global_anchor", 0.0
 
-        score = compute_camera_motion_score(self.latest_camera_motion_anchor_pose, current_pose)
+        score = compute_camera_motion_score(
+            self.latest_camera_motion_anchor_pose,
+            current_pose,
+            translation_scale=self._camera_motion_translation_step_median(),
+            rotation_scale=self._camera_motion_rotation_step_median(),
+        )
         if score < self.config.camera_motion_threshold:
             return (
                 False,
@@ -279,6 +308,44 @@ class HistoryAnchorManager:
             f"camera_motion_{score:.3f}>=threshold_{self.config.camera_motion_threshold}",
             score,
         )
+
+    def _update_camera_motion_step_scale(self, current_pose: torch.Tensor) -> None:
+        current = current_pose.detach().float()
+        if self.latest_camera_motion_previous_pose is not None:
+            previous = self.latest_camera_motion_previous_pose.detach().float()
+            step = torch.linalg.vector_norm(current[..., :3] - previous[..., :3], dim=-1)
+            step_value = float(torch.nan_to_num(step.mean(), nan=0.0, posinf=0.0, neginf=0.0).item())
+            if step_value > 0.0:
+                self.camera_motion_step_translations.append(step_value)
+                if len(self.camera_motion_step_translations) > self.camera_motion_step_window:
+                    self.camera_motion_step_translations = self.camera_motion_step_translations[-self.camera_motion_step_window:]
+
+            previous_q = previous[..., 3:7]
+            current_q = current[..., 3:7]
+            previous_q = previous_q / previous_q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            current_q = current_q / current_q.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            quat_dot = (current_q * previous_q).sum(dim=-1).abs().clamp(max=1.0)
+            rot_step = 2.0 * torch.acos(quat_dot)
+            rot_value = float(torch.nan_to_num(rot_step.mean(), nan=0.0, posinf=0.0, neginf=0.0).item())
+            if rot_value > 0.0:
+                self.camera_motion_step_rotations.append(rot_value)
+                if len(self.camera_motion_step_rotations) > self.camera_motion_step_window:
+                    self.camera_motion_step_rotations = self.camera_motion_step_rotations[-self.camera_motion_step_window:]
+        self.latest_camera_motion_previous_pose = current_pose.clone()
+
+    def _camera_motion_translation_step_median(self) -> Optional[float]:
+        return self._median_or_none(self.camera_motion_step_translations)
+
+    def _camera_motion_rotation_step_median(self) -> Optional[float]:
+        return self._median_or_none(self.camera_motion_step_rotations)
+
+    @staticmethod
+    def _median_or_none(values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        tensor_values = torch.tensor(values, dtype=torch.float32)
+        median = torch.median(tensor_values)
+        return float(torch.nan_to_num(median, nan=0.0, posinf=0.0, neginf=0.0).item())
 
     def register_anchor_camera_motion(
         self,

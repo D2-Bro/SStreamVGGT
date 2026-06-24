@@ -8,10 +8,10 @@ ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
 
-datasets=('vbr')
+datasets=('replica')
 size='518'
 max_frames='500'
-kf_every='12'
+kf_every='1'
 pose_eval_stride='1'
 
 eviction_policy='svd_leverage'
@@ -24,11 +24,6 @@ layer_budget_value_norm_type='mean' # [mean, rms]
 layer_budget_norm_source='key' # [value, key]
 total_budget=200000
 special_token_interval=5
-layer_budget_debug=false
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 
 leverage_sketch_dim=0
 leverage_granularity='layer'
@@ -96,7 +91,6 @@ for data in "${datasets[@]}"; do
         --layer_budget_value_gamma "$layer_budget_value_gamma" \
         --layer_budget_value_norm_type "$layer_budget_value_norm_type" \
         --layer_budget_norm_source "$layer_budget_norm_source" \
-        --leverage_evictable_only \
         --eviction_protect_recent_frames "$eviction_protect_recent_frames" \
         --history_anchor_strategy "$history_anchor_strategy" \
         --anchor_interval "$anchor_interval" \
@@ -104,11 +98,10 @@ for data in "${datasets[@]}"; do
         --window_protect_frames "$window_protect_frames" \
         --max_anchors "$max_anchors" \
         --coverage_threshold "$coverage_threshold" \
-        --anchor_keep_ratio "$anchor_keep_ratio" \
-        "${layer_budget_debug_args[@]}"
+        --anchor_keep_ratio "$anchor_keep_ratio"
 done
 # Add --profile_eviction to the launch command above when measuring eviction latency.
 # To run a VBR stride variant, change pose_eval_stride above, e.g. pose_eval_stride='3'.
 # To protect special tokens, add:
-# --eviction_protect_special_tokens \
+# --eviction_protect_special_tokens
 # --eviction_protect_special_token_interval "$special_token_interval"

@@ -17,11 +17,6 @@ layer_budget_strategy=uniform
 layer_budget_alpha=0.5
 layer_budget_min_tokens=0
 layer_budget_eps=1e-12
-layer_budget_debug=false
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 
 for data in "${datasets[@]}"; do
     output_dir="${workdir}/eval_results/video_depth/${data}_S${model_name}_${max_frames}_${leverage_eviction_selector}_block${leverage_dpp_greedy_block_size}"
@@ -41,8 +36,7 @@ for data in "${datasets[@]}"; do
         --layer_budget_strategy "$layer_budget_strategy" \
         --layer_budget_alpha "$layer_budget_alpha" \
         --layer_budget_min_tokens "$layer_budget_min_tokens" \
-        --layer_budget_eps "$layer_budget_eps" \
-        "${layer_budget_debug_args[@]}"
+        --layer_budget_eps "$layer_budget_eps"
     python ../src/eval/video_depth/eval_depth.py \
     --output_dir "$output_dir" \
     --eval_dataset "$data" \

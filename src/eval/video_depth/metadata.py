@@ -2,6 +2,26 @@ import os
 import glob
 from tqdm import tqdm
 
+
+def _replica_root():
+    return os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica")
+
+
+def _replica_sequences(root=None):
+    root = root or _replica_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        seq
+        for seq in os.listdir(root)
+        if os.path.isdir(os.path.join(root, seq))
+        and os.path.exists(os.path.join(root, seq, "traj.txt"))
+    )
+
+
+def _replica_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "frame*.jpg")))
+
 # Define the merged dataset metadata dictionary
 dataset_metadata = {
     "davis": {
@@ -62,6 +82,21 @@ dataset_metadata = {
         "mask_path_seq_func": lambda mask_path, seq: None,
         "skip_condition": None,  # lambda save_dir, seq: os.path.exists(os.path.join(save_dir, seq)),
         "process_func": lambda args, img_path: process_scannet(args, img_path),
+    },
+
+    "replica": {
+        "img_path": _replica_root(),
+        "anno_path": _replica_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "results"),
+        "filelist_func": _replica_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq, "traj.txt"),
+        "traj_format": "replica",
+        "seq_list": _replica_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": lambda args, img_path: process_replica(args, img_path),
     },
     "tum": {
         "img_path": "../data/eval/tum",
@@ -192,6 +227,14 @@ def process_scannet(args, img_path):
     for seq in tqdm(seq_list):
         filelist = sorted(glob.glob(f"{seq}/color_90/*.jpg"))
         save_dir = f"{args.output_dir}/{os.path.basename(seq)}"
+        yield filelist, save_dir
+
+
+def process_replica(args, img_path):
+    seq_list = args.seq_list if args.seq_list is not None else _replica_sequences(img_path)
+    for seq in tqdm(seq_list):
+        filelist = _replica_image_files(os.path.join(img_path, seq, "results"))
+        save_dir = f"{args.output_dir}/{seq}"
         yield filelist, save_dir
 
 

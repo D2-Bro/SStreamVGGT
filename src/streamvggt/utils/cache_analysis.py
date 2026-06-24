@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import csv
 import json
 import math
 import os
@@ -84,6 +86,474 @@ class CacheAnalysisConfig:
 
     def record_dump(self) -> None:
         self._num_snapshots += 1
+
+
+
+@dataclass
+class LeverageScoreHistogramConfig:
+    """Opt-in cumulative histograms for raw SVD leverage policy scores."""
+
+    output_dir: str
+    bins: int = 100
+    min_value: float = 0.0
+    max_value: float = 1.0
+    layers: Optional[set[int]] = None
+    steps: Optional[set[int]] = None
+
+    def __post_init__(self) -> None:
+        if int(self.bins) < 1:
+            raise ValueError(f"bins must be >= 1, got {self.bins}")
+        if not math.isfinite(float(self.min_value)) or not math.isfinite(float(self.max_value)):
+            raise ValueError("histogram min/max must be finite")
+        if float(self.max_value) <= float(self.min_value):
+            raise ValueError(
+                f"histogram max must be greater than min, got min={self.min_value}, max={self.max_value}"
+            )
+        self.output_dir = os.path.abspath(self.output_dir)
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.bins = int(self.bins)
+        self.min_value = float(self.min_value)
+        self.max_value = float(self.max_value)
+        self.edges = torch.linspace(self.min_value, self.max_value, self.bins + 1, dtype=torch.float64)
+        self._counts: dict[int, torch.Tensor] = {}
+        self._summary: dict[int, dict[str, float | int | None]] = {}
+        self._flushed = False
+        atexit.register(self.flush)
+
+    @classmethod
+    def from_cli(
+        cls,
+        output_dir: Optional[str],
+        bins: int = 100,
+        min_value: float = 0.0,
+        max_value: float = 1.0,
+        layers: Optional[str] = None,
+        steps: Optional[str] = None,
+    ) -> Optional["LeverageScoreHistogramConfig"]:
+        if not output_dir:
+            return None
+        return cls(
+            output_dir=output_dir,
+            bins=bins,
+            min_value=min_value,
+            max_value=max_value,
+            layers=parse_index_filter(layers),
+            steps=parse_index_filter(steps),
+        )
+
+    def should_record(self, layer_id: int, step_idx: int) -> bool:
+        if self.layers is not None and int(layer_id) not in self.layers:
+            return False
+        if self.steps is not None and int(step_idx) not in self.steps:
+            return False
+        return True
+
+    def record(self, policy_scores: torch.Tensor, *, layer_id: int, step_idx: int) -> None:
+        if policy_scores is None or not self.should_record(layer_id, step_idx):
+            return
+        with torch.no_grad():
+            values = policy_scores.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+            values = values[torch.isfinite(values)]
+            if values.numel() == 0:
+                return
+
+            layer_id = int(layer_id)
+            if layer_id not in self._counts:
+                self._counts[layer_id] = torch.zeros(self.bins, dtype=torch.int64)
+                self._summary[layer_id] = {
+                    "total_tokens": 0,
+                    "records": 0,
+                    "sum": 0.0,
+                    "sum_sq": 0.0,
+                    "min": None,
+                    "max": None,
+                    "underflow": 0,
+                    "overflow": 0,
+                }
+
+            in_range = (values >= self.min_value) & (values <= self.max_value)
+            underflow = values < self.min_value
+            overflow = values > self.max_value
+            if bool(in_range.any().item()):
+                bin_ids = torch.bucketize(values[in_range], self.edges[1:-1], right=False)
+                self._counts[layer_id] += torch.bincount(bin_ids, minlength=self.bins).to(torch.int64)
+
+            summary = self._summary[layer_id]
+            count = int(values.numel())
+            summary["total_tokens"] = int(summary["total_tokens"]) + count
+            summary["records"] = int(summary["records"]) + 1
+            summary["sum"] = float(summary["sum"]) + float(values.sum().item())
+            summary["sum_sq"] = float(summary["sum_sq"]) + float((values * values).sum().item())
+            vmin = float(values.min().item())
+            vmax = float(values.max().item())
+            summary["min"] = vmin if summary["min"] is None else min(float(summary["min"]), vmin)
+            summary["max"] = vmax if summary["max"] is None else max(float(summary["max"]), vmax)
+            summary["underflow"] = int(summary["underflow"]) + int(underflow.sum().item())
+            summary["overflow"] = int(summary["overflow"]) + int(overflow.sum().item())
+            self._flushed = False
+
+    def flush(self) -> None:
+        if self._flushed:
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+        hist_path = os.path.join(self.output_dir, "leverage_histograms.csv")
+        summary_path = os.path.join(self.output_dir, "leverage_histogram_summary.csv")
+        layer_ids = sorted(self._counts)
+
+        with open(hist_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["layer_id", "bin_left", "bin_right", "count"])
+            for layer_id in layer_ids:
+                counts = self._counts[layer_id].tolist()
+                for bin_idx, count in enumerate(counts):
+                    writer.writerow([
+                        layer_id,
+                        float(self.edges[bin_idx].item()),
+                        float(self.edges[bin_idx + 1].item()),
+                        int(count),
+                    ])
+
+        with open(summary_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["layer_id", "min", "max", "mean", "std", "total_tokens", "underflow", "overflow", "records"])
+            for layer_id in layer_ids:
+                summary = self._summary[layer_id]
+                total = int(summary["total_tokens"])
+                mean = None
+                std = None
+                if total > 0:
+                    mean = float(summary["sum"]) / float(total)
+                    variance = max(float(summary["sum_sq"]) / float(total) - mean * mean, 0.0)
+                    std = math.sqrt(variance)
+                writer.writerow([
+                    layer_id,
+                    summary["min"],
+                    summary["max"],
+                    mean,
+                    std,
+                    total,
+                    int(summary["underflow"]),
+                    int(summary["overflow"]),
+                    int(summary["records"]),
+                ])
+
+        self._write_plots(layer_ids)
+        self._flushed = True
+
+    def _write_plots(self, layer_ids: list[int]) -> None:
+        if not layer_ids:
+            return
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception:
+            return
+
+        edges = self.edges.numpy()
+        left = edges[:-1]
+        width = edges[1:] - edges[:-1]
+        for layer_id in layer_ids:
+            counts = self._counts[layer_id].numpy()
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(left, counts, width=width, align="edge")
+            ax.set_xlabel("Leverage score bin")
+            ax.set_ylabel("Token count")
+            ax.set_title(f"Layer {layer_id:02d} leverage score histogram")
+            fig.tight_layout()
+            fig.savefig(os.path.join(self.output_dir, f"layer_{layer_id:02d}_hist.png"), dpi=150)
+            plt.close(fig)
+
+        heat = torch.stack([self._counts[layer_id] for layer_id in layer_ids], dim=0).numpy()
+        fig, ax = plt.subplots(figsize=(10, max(3, 0.25 * len(layer_ids))))
+        image = ax.imshow(heat, aspect="auto", interpolation="nearest", origin="lower")
+        ax.set_xlabel("Leverage score bin")
+        ax.set_ylabel("Layer")
+        ax.set_yticks(range(len(layer_ids)))
+        ax.set_yticklabels([str(layer_id) for layer_id in layer_ids])
+        ax.set_title("Leverage score histogram by layer")
+        fig.colorbar(image, ax=ax, label="Token count")
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.output_dir, "all_layers_heatmap.png"), dpi=150)
+        plt.close(fig)
+
+
+def add_leverage_score_histogram_args(parser) -> None:
+    parser.add_argument("--leverage_score_histogram_dir", "--leverage-score-histogram-dir", type=str, default=None)
+    parser.add_argument("--leverage_score_histogram_bins", "--leverage-score-histogram-bins", type=int, default=100)
+    parser.add_argument("--leverage_score_histogram_min", "--leverage-score-histogram-min", type=float, default=0.0)
+    parser.add_argument("--leverage_score_histogram_max", "--leverage-score-histogram-max", type=float, default=1.0)
+    parser.add_argument("--leverage_score_histogram_layers", "--leverage-score-histogram-layers", type=str, default="all")
+    parser.add_argument("--leverage_score_histogram_steps", "--leverage-score-histogram-steps", type=str, default="all")
+
+
+def leverage_score_histogram_config_from_args(
+    args: Any,
+    output_dir: Optional[str] = None,
+) -> Optional[LeverageScoreHistogramConfig]:
+    return LeverageScoreHistogramConfig.from_cli(
+        output_dir if output_dir is not None else getattr(args, "leverage_score_histogram_dir", None),
+        bins=getattr(args, "leverage_score_histogram_bins", 100),
+        min_value=getattr(args, "leverage_score_histogram_min", 0.0),
+        max_value=getattr(args, "leverage_score_histogram_max", 1.0),
+        layers=getattr(args, "leverage_score_histogram_layers", "all"),
+        steps=getattr(args, "leverage_score_histogram_steps", "all"),
+    )
+
+
+@dataclass
+class TokenOverlayDumpConfig:
+    """Opt-in full token dump for step-wise eviction/leverage overlays."""
+
+    output_dir: str
+    layers: Optional[set[int]] = None
+    heads: Optional[set[int]] = None
+    steps: Optional[set[int]] = None
+    max_events: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        self.output_dir = os.path.abspath(self.output_dir)
+        self.events_dir = os.path.join(self.output_dir, "events")
+        os.makedirs(self.events_dir, exist_ok=True)
+        self._num_events = 0
+
+    @classmethod
+    def from_cli(
+        cls,
+        output_dir: Optional[str],
+        layers: Optional[str] = None,
+        heads: Optional[str] = None,
+        steps: Optional[str] = None,
+        max_events: Optional[int] = None,
+    ) -> Optional["TokenOverlayDumpConfig"]:
+        if not output_dir:
+            return None
+        return cls(
+            output_dir=output_dir,
+            layers=parse_index_filter(layers),
+            heads=parse_index_filter(heads),
+            steps=parse_index_filter(steps),
+            max_events=max_events,
+        )
+
+    def should_dump(self, layer_id: int, head_id: Optional[int], step_idx: int) -> bool:
+        if self.max_events is not None and self._num_events >= self.max_events:
+            return False
+        if self.layers is not None and int(layer_id) not in self.layers:
+            return False
+        if self.heads is not None and head_id is not None and int(head_id) not in self.heads:
+            return False
+        if self.steps is not None and int(step_idx) not in self.steps:
+            return False
+        return True
+
+    def next_path(self, *, step_idx: int, layer_id: int, head_id: Optional[int], batch_id: int) -> Path:
+        head_label = "layer_shared" if head_id is None else f"{int(head_id):02d}"
+        stem = f"step_{int(step_idx):06d}_layer_{int(layer_id):02d}_head_{head_label}_batch_{int(batch_id):02d}"
+        return Path(self.events_dir) / f"{stem}.pt"
+
+    def record_dump(self) -> None:
+        self._num_events += 1
+
+
+def add_token_overlay_dump_args(parser) -> None:
+    parser.add_argument("--token_overlay_dump_dir", "--token-overlay-dump-dir", type=str, default=None)
+    parser.add_argument("--token_overlay_dump_layers", "--token-overlay-dump-layers", type=str, default="all")
+    parser.add_argument("--token_overlay_dump_heads", "--token-overlay-dump-heads", type=str, default="all")
+    parser.add_argument("--token_overlay_dump_steps", "--token-overlay-dump-steps", type=str, default="all")
+    parser.add_argument("--token_overlay_dump_max_events", "--token-overlay-dump-max-events", type=int, default=None)
+
+
+def token_overlay_dump_config_from_args(
+    args: Any,
+    output_dir: Optional[str] = None,
+) -> Optional[TokenOverlayDumpConfig]:
+    return TokenOverlayDumpConfig.from_cli(
+        output_dir if output_dir is not None else getattr(args, "token_overlay_dump_dir", None),
+        layers=getattr(args, "token_overlay_dump_layers", "all"),
+        heads=getattr(args, "token_overlay_dump_heads", "all"),
+        steps=getattr(args, "token_overlay_dump_steps", "all"),
+        max_events=getattr(args, "token_overlay_dump_max_events", None),
+    )
+
+
+def dump_token_overlay_event(
+    config: TokenOverlayDumpConfig,
+    *,
+    kept_candidate_indices: torch.Tensor,
+    policy_scores: torch.Tensor,
+    metadata: Optional[Any],
+    layer_id: int,
+    step_idx: int,
+    cache_budget: int,
+    num_anchor_tokens: int,
+    tokens_per_frame: Optional[int],
+    eviction_policy: str,
+    leverage_granularity: str,
+    selection_granularity: Optional[str] = None,
+) -> None:
+    """Save full candidate leverage scores and current-step evicted token ids."""
+    if policy_scores is None or kept_candidate_indices is None or metadata is None:
+        return
+    with torch.no_grad():
+        scores = policy_scores.detach()
+        if scores.ndim not in (2, 3):
+            return
+
+        B = int(metadata.frame_ids.shape[0])
+        H = int(metadata.frame_ids.shape[1])
+        candidate_count = int(scores.shape[-1])
+        if candidate_count <= 0:
+            return
+        active_selection_granularity = leverage_granularity if selection_granularity is None else selection_granularity
+        all_candidates_cpu = torch.arange(candidate_count, dtype=torch.long)
+        all_candidates_device = all_candidates_cpu.to(device=kept_candidate_indices.device)
+
+        def candidate_metadata(batch_id: int, head_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+            start = int(num_anchor_tokens)
+            end = start + candidate_count
+            frame_ids = metadata.frame_ids[batch_id, head_id, start:end]
+            token_indices = metadata.token_indices[batch_id, head_id, start:end]
+            return frame_ids.detach().cpu().long(), token_indices.detach().cpu().long()
+
+        def anchor_metadata(batch_id: int, head_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+            if int(num_anchor_tokens) <= 0:
+                empty = torch.empty(0, dtype=torch.long)
+                return empty, empty
+            frame_ids = metadata.frame_ids[batch_id, head_id, :int(num_anchor_tokens)]
+            token_indices = metadata.token_indices[batch_id, head_id, :int(num_anchor_tokens)]
+            return frame_ids.detach().cpu().long(), token_indices.detach().cpu().long()
+
+        if active_selection_granularity == "layer" or scores.ndim == 2:
+            for batch_id in range(B):
+                if not config.should_dump(layer_id, None, step_idx):
+                    continue
+                kept_local, evicted_local = _shared_local_indices(
+                    kept_candidate_indices,
+                    all_candidates_device,
+                    candidate_count,
+                    batch_id,
+                    device=kept_candidate_indices.device,
+                )
+                kept_local = kept_local.detach().cpu().long()
+                evicted_local = evicted_local.detach().cpu().long()
+                candidate_scores = _scores_for_batch(scores, batch_id, None).detach().cpu().float()
+                candidate_frame_ids, candidate_token_indices = candidate_metadata(batch_id, 0)
+                anchor_frame_ids, anchor_token_indices = anchor_metadata(batch_id, 0)
+                _write_token_overlay_payload(
+                    config,
+                    batch_id=batch_id,
+                    head_id=None,
+                    layer_id=layer_id,
+                    step_idx=step_idx,
+                    cache_budget=cache_budget,
+                    num_anchor_tokens=num_anchor_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    candidate_frame_ids=candidate_frame_ids,
+                    candidate_token_indices=candidate_token_indices,
+                    candidate_scores=candidate_scores,
+                    kept_local=kept_local,
+                    evicted_local=evicted_local,
+                    anchor_frame_ids=anchor_frame_ids,
+                    anchor_token_indices=anchor_token_indices,
+                    eviction_policy=eviction_policy,
+                    leverage_granularity=leverage_granularity,
+                    selection_granularity=active_selection_granularity,
+                )
+        else:
+            for batch_id in range(B):
+                for head_id in range(H):
+                    if not config.should_dump(layer_id, head_id, step_idx):
+                        continue
+                    kept_local = kept_candidate_indices[batch_id, head_id].detach().cpu().long()
+                    evicted_local = _evicted_from_kept(
+                        kept_local.to(device=all_candidates_cpu.device),
+                        all_candidates_cpu,
+                        candidate_count,
+                    ).detach().cpu().long()
+                    candidate_scores = _scores_for_batch(scores, batch_id, head_id).detach().cpu().float()
+                    candidate_frame_ids, candidate_token_indices = candidate_metadata(batch_id, head_id)
+                    anchor_frame_ids, anchor_token_indices = anchor_metadata(batch_id, head_id)
+                    _write_token_overlay_payload(
+                        config,
+                        batch_id=batch_id,
+                        head_id=head_id,
+                        layer_id=layer_id,
+                        step_idx=step_idx,
+                        cache_budget=cache_budget,
+                        num_anchor_tokens=num_anchor_tokens,
+                        tokens_per_frame=tokens_per_frame,
+                        candidate_frame_ids=candidate_frame_ids,
+                        candidate_token_indices=candidate_token_indices,
+                        candidate_scores=candidate_scores,
+                        kept_local=kept_local,
+                        evicted_local=evicted_local,
+                        anchor_frame_ids=anchor_frame_ids,
+                        anchor_token_indices=anchor_token_indices,
+                        eviction_policy=eviction_policy,
+                        leverage_granularity=leverage_granularity,
+                        selection_granularity=active_selection_granularity,
+                    )
+
+
+def _write_token_overlay_payload(
+    config: TokenOverlayDumpConfig,
+    *,
+    batch_id: int,
+    head_id: Optional[int],
+    layer_id: int,
+    step_idx: int,
+    cache_budget: int,
+    num_anchor_tokens: int,
+    tokens_per_frame: Optional[int],
+    candidate_frame_ids: torch.Tensor,
+    candidate_token_indices: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    kept_local: torch.Tensor,
+    evicted_local: torch.Tensor,
+    anchor_frame_ids: torch.Tensor,
+    anchor_token_indices: torch.Tensor,
+    eviction_policy: str,
+    leverage_granularity: str,
+    selection_granularity: str,
+) -> None:
+    event_path = config.next_path(step_idx=step_idx, layer_id=layer_id, head_id=head_id, batch_id=batch_id)
+    empty_float = torch.empty(0, dtype=torch.float32)
+    empty_long = torch.empty(0, dtype=torch.long)
+    evicted_scores = candidate_scores.index_select(0, evicted_local) if evicted_local.numel() else empty_float
+    payload = {
+        "candidate_frame_ids": candidate_frame_ids,
+        "candidate_token_indices": candidate_token_indices,
+        "candidate_leverage_scores": candidate_scores,
+        "kept_candidate_indices": kept_local,
+        "evicted_candidate_indices": evicted_local,
+        "evicted_frame_ids": candidate_frame_ids.index_select(0, evicted_local) if evicted_local.numel() else empty_long,
+        "evicted_token_indices": candidate_token_indices.index_select(0, evicted_local) if evicted_local.numel() else empty_long,
+        "evicted_leverage_scores": evicted_scores,
+        "anchor_frame_ids": anchor_frame_ids,
+        "anchor_token_indices": anchor_token_indices,
+        "meta": {
+            "layer_id": int(layer_id),
+            "step_idx": int(step_idx),
+            "batch_id": int(batch_id),
+            "head_id": None if head_id is None else int(head_id),
+            "head_label": "layer_shared" if head_id is None else f"{int(head_id):02d}",
+            "num_anchor_tokens": int(num_anchor_tokens),
+            "cache_budget": int(cache_budget),
+            "candidate_count": int(candidate_scores.numel()),
+            "tokens_per_frame": None if tokens_per_frame is None else int(tokens_per_frame),
+            "evicted_count": int(evicted_local.numel()),
+            "kept_count": int(kept_local.numel()),
+            "eviction_policy": str(eviction_policy),
+            "leverage_granularity": str(leverage_granularity),
+            "selection_granularity": str(selection_granularity),
+        },
+    }
+    torch.save(payload, event_path, pickle_protocol=4)
+    with open(event_path.with_suffix(".json"), "w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload["meta"]), f, indent=2)
+    config.record_dump()
 
 
 def dump_eviction_snapshot(

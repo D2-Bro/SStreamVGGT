@@ -26,10 +26,10 @@ accelerate launch --num_processes 2 --main_process_port 29602 ./eval/mv_recon/la
     --global-attn-idx-ranges 9: \
     --enable_recent_merge \
     --merge_window 2 \
-    --merge_similarity_threshold 0.9 \
+    --merge_similarity_threshold 0.9
     # --merge_voxel_size 0.05 \
     --merge_candidate_mode spatial \
-    --merge_patch_radius 2 \
+    --merge_patch_radius 2
     # --merge_voxel_neighbor_radius 0 \
     --merge_max_candidates_per_token 64
 

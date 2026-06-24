@@ -21,9 +21,9 @@ accelerate launch --num_processes 2 --main_process_port 29602 ./eval/mv_recon/la
     --max_frames "$max_frames" \
     --eviction_policy "$eviction_policy" \
     --leverage_sketch_dim 16 \
-    --global-attn-idx-ranges 9: \
-    # --enable_recent_merge \
-    # --merge_window "$merge_window" \
-    # --merge_similarity_threshold "$merge_similarity_threshold" \
+    --global-attn-idx-ranges 9:
+    # --enable_recent_merge
+    # --merge_window "$merge_window"
+    # --merge_similarity_threshold "$merge_similarity_threshold"
     # --merge_voxel_size "$merge_voxel_size" \
     

@@ -13,11 +13,6 @@ layer_budget_strategy='uniform'
 layer_budget_alpha=1.0
 layer_budget_min_tokens=0
 layer_budget_eps=1e-12
-layer_budget_debug=false
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 leverage_eviction_selector=fast_dpp
 leverage_dpp_candidate_multiplier=3
 leverage_dpp_greedy_block_size=64
@@ -53,6 +48,5 @@ accelerate launch --num_processes 3 --main_process_port 29702 ./eval/mv_recon/la
     --leverage_ridge_score_chunk_size "$leverage_ridge_score_chunk_size" \
     --leverage_ridge_jitter "$leverage_ridge_jitter" \
     --leverage_random_seed "$leverage_random_seed" \
-    --leverage_normalize_rows \
-    "${layer_budget_debug_args[@]}"
+    --leverage_normalize_rows
 # Add --profile_eviction to the launch command above when measuring eviction latency.

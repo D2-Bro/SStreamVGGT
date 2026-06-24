@@ -1,4 +1,6 @@
 from copy import deepcopy
+import json
+import os
 import cv2
 
 import numpy as np
@@ -91,6 +93,268 @@ def save_depth_maps(pts3ds_self, path, conf_self=None):
     return depth_maps
 
 
+def _depth_array_to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _reshape_depth_sequence(x, sequence_shape):
+    x = _depth_array_to_numpy(x)
+    if x.ndim == 3:
+        return x
+    if x.ndim == 2 and len(sequence_shape) == 3:
+        num_frames, height, width = sequence_shape
+        if x.shape == (num_frames * height, width):
+            return x.reshape(num_frames, height, width)
+    if x.ndim == 2:
+        return x[None]
+    raise ValueError(
+        f"Expected depth map with shape [N,H,W] or [N*H,W], got {x.shape}"
+    )
+
+
+def _positive_percentile_range(error, valid_mask, percentile):
+    finite_mask = valid_mask & np.isfinite(error)
+    values = error[finite_mask]
+    if values.size == 0:
+        return 0.0, 1.0
+    vmax = float(np.percentile(values, percentile))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = float(np.max(values))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1.0
+    return 0.0, vmax
+
+
+def _error_stats(error, valid_mask):
+    finite_mask = valid_mask & np.isfinite(error)
+    values = error[finite_mask]
+    if values.size == 0:
+        return {"mean": 0.0, "max": 0.0}
+    return {
+        "mean": float(np.mean(values)),
+        "max": float(np.max(values)),
+    }
+
+
+def _colorize_error_frame(
+    error,
+    valid_mask,
+    value_range,
+    *,
+    cmap_name="magma",
+    append_cbar=True,
+):
+    vmin, vmax = value_range
+    denom = max(vmax - vmin, 1e-12)
+    normalized = np.clip((np.nan_to_num(error, nan=vmin) - vmin) / denom, 0.0, 1.0)
+    colored = cm.get_cmap(cmap_name)(normalized)[:, :, :3].astype(np.float32)
+    colored[~valid_mask] = 0.0
+
+    if append_cbar:
+        cbar = get_vertical_colorbar(
+            h=error.shape[0],
+            vmin=vmin,
+            vmax=vmax,
+            cmap_name=cmap_name,
+            cbar_precision=3,
+        )
+        colored = np.concatenate(
+            (colored, np.zeros_like(colored[:, :5, :]), cbar), axis=1
+        )
+    return (colored * 255).clip(0, 255).astype(np.uint8)
+
+
+
+def _load_rgb_frame(image_path, target_shape):
+    height, width = target_shape
+    rgb = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.float32) / 255.0
+    if rgb.shape[:2] != (height, width):
+        rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
+    return rgb
+
+
+def _overlay_error_frame(
+    image,
+    error,
+    valid_mask,
+    value_range,
+    *,
+    alpha=0.55,
+    cmap_name="magma",
+    append_cbar=True,
+):
+    vmin, vmax = value_range
+    denom = max(vmax - vmin, 1e-12)
+    normalized = np.clip((np.nan_to_num(error, nan=vmin) - vmin) / denom, 0.0, 1.0)
+    heat = cm.get_cmap(cmap_name)(normalized)[:, :, :3].astype(np.float32)
+    overlay = image.copy()
+    overlay[valid_mask] = (1.0 - alpha) * image[valid_mask] + alpha * heat[valid_mask]
+
+    if append_cbar:
+        cbar = get_vertical_colorbar(
+            h=error.shape[0],
+            vmin=vmin,
+            vmax=vmax,
+            cmap_name=cmap_name,
+            cbar_precision=3,
+        )
+        overlay = np.concatenate(
+            (overlay, np.zeros_like(overlay[:, :5, :]), cbar), axis=1
+        )
+    return (overlay * 255).clip(0, 255).astype(np.uint8)
+
+
+def _write_mp4(frames, path, fps):
+    if not frames:
+        return
+    height, width = frames[0].shape[:2]
+    pad_h = height % 2
+    pad_w = width % 2
+    if pad_h or pad_w:
+        frames = [
+            np.pad(frame, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+            for frame in frames
+        ]
+        height, width = frames[0].shape[:2]
+    writer = cv2.VideoWriter(
+        path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        try:
+            iio.mimwrite(path, frames, fps=fps, macro_block_size=1)
+            return
+        except Exception as exc:
+            raise RuntimeError(f"Failed to open mp4 writer for {path}") from exc
+    try:
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+
+
+def save_depth_error_visuals(
+    depth_predict,
+    depth_gt,
+    relative_error,
+    output_dir,
+    *,
+    sequence,
+    sequence_shape,
+    fps=10,
+    percentile=99.0,
+    image_paths=None,
+    overlay_alpha=0.55,
+):
+    pred = _reshape_depth_sequence(depth_predict, sequence_shape).astype(np.float32)
+    gt = _reshape_depth_sequence(depth_gt, sequence_shape).astype(np.float32)
+    rel_error = _reshape_depth_sequence(relative_error, sequence_shape).astype(np.float32)
+
+    valid_mask = (gt > 0) & np.isfinite(gt) & np.isfinite(pred)
+    abs_error = np.abs(pred - gt)
+    rel_error = np.where(np.isfinite(rel_error), rel_error, 0.0)
+
+    abs_range = _positive_percentile_range(abs_error, valid_mask, percentile)
+    rel_range = _positive_percentile_range(rel_error, valid_mask, percentile)
+
+    abs_dir = os.path.join(output_dir, "absolute")
+    rel_dir = os.path.join(output_dir, "relative")
+    os.makedirs(abs_dir, exist_ok=True)
+    os.makedirs(rel_dir, exist_ok=True)
+
+    overlay_enabled = image_paths is not None
+    if overlay_enabled:
+        if len(image_paths) != gt.shape[0]:
+            raise ValueError(
+                f"Expected {gt.shape[0]} RGB frames for overlay, got {len(image_paths)}"
+            )
+        abs_overlay_dir = os.path.join(output_dir, "absolute_overlay")
+        rel_overlay_dir = os.path.join(output_dir, "relative_overlay")
+        os.makedirs(abs_overlay_dir, exist_ok=True)
+        os.makedirs(rel_overlay_dir, exist_ok=True)
+
+    abs_frames = []
+    rel_frames = []
+    abs_overlay_frames = []
+    rel_overlay_frames = []
+    for frame_idx in range(gt.shape[0]):
+        abs_frame = _colorize_error_frame(
+            abs_error[frame_idx],
+            valid_mask[frame_idx],
+            abs_range,
+        )
+        rel_frame = _colorize_error_frame(
+            rel_error[frame_idx],
+            valid_mask[frame_idx],
+            rel_range,
+        )
+        iio.imwrite(os.path.join(abs_dir, f"frame_{frame_idx:04d}.png"), abs_frame)
+        iio.imwrite(os.path.join(rel_dir, f"frame_{frame_idx:04d}.png"), rel_frame)
+        abs_frames.append(abs_frame)
+        rel_frames.append(rel_frame)
+
+        if overlay_enabled:
+            image = _load_rgb_frame(image_paths[frame_idx], gt.shape[1:])
+            abs_overlay = _overlay_error_frame(
+                image,
+                abs_error[frame_idx],
+                valid_mask[frame_idx],
+                abs_range,
+                alpha=overlay_alpha,
+            )
+            rel_overlay = _overlay_error_frame(
+                image,
+                rel_error[frame_idx],
+                valid_mask[frame_idx],
+                rel_range,
+                alpha=overlay_alpha,
+            )
+            iio.imwrite(
+                os.path.join(abs_overlay_dir, f"frame_{frame_idx:04d}.png"),
+                abs_overlay,
+            )
+            iio.imwrite(
+                os.path.join(rel_overlay_dir, f"frame_{frame_idx:04d}.png"),
+                rel_overlay,
+            )
+            abs_overlay_frames.append(abs_overlay)
+            rel_overlay_frames.append(rel_overlay)
+
+    _write_mp4(abs_frames, os.path.join(output_dir, "absolute_error.mp4"), fps)
+    _write_mp4(rel_frames, os.path.join(output_dir, "relative_error.mp4"), fps)
+    if overlay_enabled:
+        _write_mp4(
+            abs_overlay_frames,
+            os.path.join(output_dir, "absolute_overlay.mp4"),
+            fps,
+        )
+        _write_mp4(
+            rel_overlay_frames,
+            os.path.join(output_dir, "relative_overlay.mp4"),
+            fps,
+        )
+
+    summary = {
+        "sequence": sequence,
+        "frames": int(gt.shape[0]),
+        "valid_pixels": int(np.sum(valid_mask)),
+        "percentile": float(percentile),
+        "overlay": bool(overlay_enabled),
+        "overlay_alpha": float(overlay_alpha) if overlay_enabled else None,
+        "absolute_range": [float(abs_range[0]), float(abs_range[1])],
+        "relative_range": [float(rel_range[0]), float(rel_range[1])],
+        "absolute_error": _error_stats(abs_error, valid_mask),
+        "relative_error": _error_stats(rel_error, valid_mask),
+    }
+    with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, sort_keys=True)
+    return summary
+
+
 def get_vertical_colorbar(h, vmin, vmax, cmap_name="jet", label=None, cbar_precision=2):
     """
     :param w: pixels
@@ -135,7 +399,7 @@ def get_vertical_colorbar(h, vmin, vmax, cmap_name="jet", label=None, cbar_preci
 
     im = im[:, :, :3].astype(np.float32) / 255.0
     if h != im.shape[0]:
-        w = int(im.shape[1] / im.shape[0] * h)
+        w = max(1, int(im.shape[1] / im.shape[0] * h))
         im = cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA)
 
     return im

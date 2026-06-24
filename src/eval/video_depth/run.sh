@@ -22,7 +22,7 @@ for data in "${datasets[@]}"; do
         --max_frames "$max_frames" \
         --eviction_policy "$eviction_policy" \
         --leverage_granularity layer \
-        --leverage_projection random \
+        --leverage_projection random
         # --leverage_head_mean_dim 4
     python ../src/eval/video_depth/eval_depth.py \
     --output_dir "$output_dir" \

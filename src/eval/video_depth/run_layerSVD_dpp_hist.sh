@@ -17,11 +17,6 @@ layer_budget_strategy=uniform
 layer_budget_alpha=0.5
 layer_budget_min_tokens=0
 layer_budget_eps=1e-12
-layer_budget_debug=false
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 history_anchor_strategy=coverage
 anchor_interval=250
 min_anchor_interval=100
@@ -49,7 +44,6 @@ for data in "${datasets[@]}"; do
         --layer_budget_alpha "$layer_budget_alpha" \
         --layer_budget_min_tokens "$layer_budget_min_tokens" \
         --layer_budget_eps "$layer_budget_eps" \
-        "${layer_budget_debug_args[@]}" \
         --history_anchor_strategy "$history_anchor_strategy" \
         --anchor_interval "$anchor_interval" \
         --min_anchor_interval "$min_anchor_interval" \

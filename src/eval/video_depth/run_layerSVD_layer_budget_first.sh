@@ -16,15 +16,10 @@ layer_budget_eps=1e-12
 layer_budget_value_gamma=1.0
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
-layer_budget_debug=false
 layer_budget_log_scores=true
 total_budget=200000
 kf_interval=1
 evict_interval=1
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 layer_budget_log_args=()
 if [ "$layer_budget_log_scores" = true ]; then
     layer_budget_log_args=(--layer_budget_log_scores)
@@ -83,7 +78,6 @@ for data in "${datasets[@]}"; do
         --evict_interval "$evict_interval" \
         --leverage_dpp_diversity_beta "$leverage_dpp_diversity_beta" \
         --first_seq_only \
-        "${layer_budget_debug_args[@]}" \
         "${layer_budget_log_args[@]}"
     python ../src/eval/video_depth/eval_depth.py \
         --output_dir "$output_dir" \

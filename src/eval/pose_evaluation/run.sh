@@ -8,8 +8,10 @@ model_name="StreamVGGT"
 ckpt_name="checkpoints"
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 
-datasets=("kitti_trajectory")       # 00-10, GT metric available
+datasets=("NRGBD")
+# datasets=("kitti_trajectory")       # 00-10, GT metric available
 # datasets=("kitti_trajectory_test")  # 11-21, prediction-only official test split
+# For a single NRGBD scene, add: --seq_list breakfast_room
 
 size="518"
 max_frames="500"
@@ -24,8 +26,6 @@ leverage_feature="key"
 leverage_projection="random"
 leverage_head_mean_dim="1"
 # leverage_approx_method="right_sketch"
-# leverage_left_sketch_dim="2048"
-# leverage_right_jl_dim="64"
 # leverage_random_seed="0"
 leverage_eviction_selector="fast_dpp"
 leverage_dpp_candidate_multiplier="3"

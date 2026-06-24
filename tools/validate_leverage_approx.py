@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare exact, right-sketched, and Drineas SRHT leverage scores."""
+"""Compare exact, right-sketched leverage scores."""
 
 from __future__ import annotations
 
@@ -54,8 +54,6 @@ def _score_matrix(mat: torch.Tensor, method: str, args: argparse.Namespace) -> t
         leverage_sketch_dim=args.right_sketch_dim,
         leverage_granularity="layer",
         leverage_approx_method=method,
-        leverage_left_sketch_dim=args.left_sketch_dim,
-        leverage_right_jl_dim=args.right_jl_dim,
         leverage_ridge_lambda=args.ridge_lambda,
         leverage_ridge_lambda_mode=args.ridge_lambda_mode,
         leverage_ridge_score_chunk_size=args.ridge_score_chunk_size,
@@ -78,7 +76,6 @@ def _run_shape(num_tokens: int, feature_dim: int, args: argparse.Namespace) -> N
 
     exact, exact_profile, exact_time = _score_matrix(mat, "exact_qr", args)
     right, right_profile, right_time = _score_matrix(mat, "right_sketch", args)
-    drineas, drineas_profile, drineas_time = _score_matrix(mat, "drineas_srht", args)
     full_ridge, full_ridge_profile, full_ridge_time = _score_matrix(mat, "full_d_ridge", args)
     right_ridge, right_ridge_profile, right_ridge_time = _score_matrix(mat, "right_sketch_ridge", args)
     rank_est = int(torch.linalg.matrix_rank(mat.float().cpu()).item())
@@ -87,7 +84,6 @@ def _run_shape(num_tokens: int, feature_dim: int, args: argparse.Namespace) -> N
     for name, scores, profile, elapsed in (
         ("exact_qr", exact, exact_profile, exact_time),
         ("right_sketch", right, right_profile, right_time),
-        ("drineas_srht", drineas, drineas_profile, drineas_time),
         ("full_d_ridge", full_ridge, full_ridge_profile, full_ridge_time),
         ("right_sketch_ridge", right_ridge, right_ridge_profile, right_ridge_time),
     ):
@@ -108,8 +104,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--right_sketch_dim", type=int, default=16)
-    parser.add_argument("--left_sketch_dim", type=int, default=2048)
-    parser.add_argument("--right_jl_dim", type=int, default=64)
     parser.add_argument("--ridge_dim", type=int, default=32)
     parser.add_argument("--ridge_lambda", type=float, default=1e-3)
     parser.add_argument("--ridge_lambda_mode", choices=("relative", "absolute"), default="relative")

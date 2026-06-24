@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import csv
 import os
 import sys
+import tempfile
 
 import torch
 
@@ -18,6 +20,7 @@ from streamvggt.layers.attention import Attention
 from streamvggt.layers.eviction import EvictionManager
 from streamvggt.layers.recent_merge import KVCacheMetadata
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
+from streamvggt.utils.cache_analysis import LeverageScoreHistogramConfig
 
 
 def _make_cache(dtype: torch.dtype = torch.float32):
@@ -122,17 +125,11 @@ def check_approx_methods() -> None:
     configs = (
         {"leverage_approx_method": "exact_qr", "leverage_sketch_dim": 16},
         {"leverage_approx_method": "right_sketch", "leverage_sketch_dim": 4},
-        {
-            "leverage_approx_method": "drineas_srht",
-            "leverage_sketch_dim": 4,
-            "leverage_left_sketch_dim": 16,
-            "leverage_right_jl_dim": 4,
-        },
         {"leverage_approx_method": "full_d_ridge", "leverage_sketch_dim": 4},
         {
             "leverage_approx_method": "right_sketch_ridge",
             "leverage_sketch_dim": 4,
-            "leverage_right_jl_dim": 4,
+            "leverage_ridge_dim": 4,
         },
     )
     for granularity in ("head", "layer"):
@@ -151,23 +148,6 @@ def check_approx_methods() -> None:
             method_name = cfg["leverage_approx_method"]
             _assert_finite(result.policy_scores, f"{granularity} {method_name} scores")
             _assert_nonnegative(result.policy_scores, f"{granularity} {method_name} scores")
-
-
-def check_drineas_deterministic() -> None:
-    k, _ = _make_cache()
-    kwargs = dict(
-        policy="svd_leverage",
-        leverage_granularity="head",
-        leverage_approx_method="drineas_srht",
-        leverage_left_sketch_dim=16,
-        leverage_right_jl_dim=4,
-        leverage_random_seed=123,
-    )
-    first = EvictionManager(**kwargs)._svd_leverage_scores(k[:, :, 2:, :])
-    second = EvictionManager(**kwargs)._svd_leverage_scores(k[:, :, 2:, :])
-    if not torch.allclose(first, second):
-        raise AssertionError("drineas_srht leverage scores are not deterministic for a fixed seed")
-
 
 def check_key_value_feature() -> None:
     k, v = _make_cache()
@@ -306,7 +286,7 @@ def check_fast_dpp_shapes_and_low_score_pool() -> None:
         {
             "leverage_approx_method": "right_sketch_ridge",
             "leverage_sketch_dim": 4,
-            "leverage_right_jl_dim": 4,
+            "leverage_ridge_dim": 4,
         },
     )
     for granularity in ("head", "layer"):
@@ -332,6 +312,197 @@ def check_fast_dpp_shapes_and_low_score_pool() -> None:
                     for head_idx in range(1, result.kept_candidate_indices.shape[1]):
                         if not torch.equal(result.kept_candidate_indices[:, 0], result.kept_candidate_indices[:, head_idx]):
                             raise AssertionError("layer-wise fast_dpp did not share kept indices across heads")
+
+
+
+def check_similarity_topk_shapes_and_low_score_pool() -> None:
+    k, v = _make_cache()
+    multiplier = 2
+    methods = (
+        {"leverage_approx_method": "right_sketch", "leverage_sketch_dim": 4},
+        {"leverage_approx_method": "full_d_ridge", "leverage_sketch_dim": 4},
+        {
+            "leverage_approx_method": "right_sketch_ridge",
+            "leverage_sketch_dim": 4,
+            "leverage_ridge_dim": 4,
+        },
+    )
+    for granularity in ("head", "layer"):
+        for method_cfg in methods:
+            manager = EvictionManager(
+                policy="svd_leverage",
+                leverage_granularity=granularity,
+                leverage_eviction_selector="similarity_topk",
+                leverage_dpp_candidate_multiplier=multiplier,
+                **method_cfg,
+            )
+            result = manager.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+            assert result.kept_candidate_indices.shape == (2, 3, 5)
+            expected_scores = (2, 3, 9) if granularity == "head" else (2, 9)
+            assert result.policy_scores.shape == expected_scores
+            method = method_cfg["leverage_approx_method"]
+            _assert_finite(result.policy_scores, f"{granularity} {method} similarity_topk scores")
+            _assert_nonnegative(result.policy_scores, f"{granularity} {method} similarity_topk scores")
+            _assert_evicted_subset_of_low_score_pool(result, candidate_count=9, multiplier=multiplier)
+            if granularity == "layer":
+                for head_idx in range(1, result.kept_candidate_indices.shape[1]):
+                    if not torch.equal(result.kept_candidate_indices[:, 0], result.kept_candidate_indices[:, head_idx]):
+                        raise AssertionError("layer-wise similarity_topk did not share kept indices across heads")
+
+
+def check_similarity_topk_evicts_redundant_pool_key() -> None:
+    scores = torch.tensor([[[0.0, 0.1, 1.0, 1.1, 1.2, 1.3]]])
+    mask = torch.ones_like(scores, dtype=torch.bool)
+    candidate_k = torch.tensor(
+        [[[
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [-1.0, 0.0],
+            [0.0, -1.0],
+            [-1.0, -1.0],
+        ]]],
+        dtype=torch.float32,
+    )
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="head",
+        leverage_eviction_selector="similarity_topk",
+        leverage_dpp_candidate_multiplier=2,
+    )
+    kept = manager._keep_after_head_similarity_topk(scores, mask, 1, candidate_k)
+    evicted = set(range(candidate_k.shape[2])) - set(kept.reshape(-1).tolist())
+    if evicted != {0}:
+        raise AssertionError(f"similarity_topk did not evict the duplicated low-score key first: {evicted}")
+
+
+
+
+def check_similarity_topk_uses_similarity_over_leverage_ratio() -> None:
+    scores = torch.tensor([[[0.2, 0.9, 1.0, 1.1]]], dtype=torch.float32)
+    mask = torch.ones_like(scores, dtype=torch.bool)
+    candidate_k = torch.tensor(
+        [[[
+            [0.8, 0.6],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]]],
+        dtype=torch.float32,
+    )
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="head",
+        leverage_eviction_selector="similarity_topk",
+        leverage_dpp_candidate_multiplier=2,
+    )
+    kept = manager._keep_after_head_similarity_topk(scores, mask, 1, candidate_k)
+    evicted = set(range(candidate_k.shape[2])) - set(kept.reshape(-1).tolist())
+    if evicted != {0}:
+        raise AssertionError(f"similarity_topk should evict by max_cosine/leverage ratio, got {evicted}")
+
+
+def check_similarity_topk_head_granularity_head_specific_eviction() -> None:
+    scores = torch.tensor([[0.0, 0.1, 1.0, 1.1]], dtype=torch.float32)
+    mask = torch.ones_like(scores, dtype=torch.bool)
+    candidate_k = torch.tensor(
+        [[
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [1.0, 0.0], [-1.0, 0.0], [1.0, 0.0]],
+        ]],
+        dtype=torch.float32,
+    )
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_eviction_selector="similarity_topk",
+        leverage_similarity_granularity="head",
+        leverage_dpp_candidate_multiplier=2,
+    )
+    kept = manager._keep_after_layer_head_similarity_topk(scores, mask, 1, candidate_k)
+    evicted_h0 = set(range(candidate_k.shape[2])) - set(kept[0, 0].tolist())
+    evicted_h1 = set(range(candidate_k.shape[2])) - set(kept[0, 1].tolist())
+    if evicted_h0 != {0} or evicted_h1 != {1}:
+        raise AssertionError(f"head-wise similarity_topk evicted {evicted_h0=} {evicted_h1=}")
+    if torch.equal(kept[:, 0], kept[:, 1]):
+        raise AssertionError("head-wise similarity_topk should allow head-specific keep sets")
+
+
+def check_similarity_topk_head_granularity_select_and_merge_guard() -> None:
+    k, v = _make_cache()
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_eviction_selector="similarity_topk",
+        leverage_similarity_granularity="head",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_sketch_dim=4,
+    )
+    result = manager.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+    assert result.kept_candidate_indices.shape == (2, 3, 5)
+    _assert_evicted_subset_of_low_score_pool(result, candidate_count=9, multiplier=2)
+
+    attention = Attention(dim=5, num_heads=1)
+    try:
+        attention.eviction(
+            k[:, :1],
+            v[:, :1],
+            None,
+            cache_budget=7,
+            num_anchor_tokens=2,
+            eviction_policy="svd_leverage",
+            leverage_granularity="layer",
+            leverage_eviction_selector="similarity_topk",
+            leverage_similarity_granularity="head",
+            svd_eviction_merge_config=SvdEvictionMergeConfig(enabled=True, mode="layer"),
+        )
+    except ValueError as exc:
+        if "Head-specific eviction keep sets" not in str(exc):
+            raise AssertionError(f"unexpected merge guard error: {exc}") from exc
+    else:
+        raise AssertionError("head-wise similarity_topk should reject non-head SVD merge mode")
+
+
+def check_similarity_topk_protection_and_recent_frames() -> None:
+    k, v = _make_cache()
+    candidate_count = k.shape[2] - 2
+    mask = torch.ones(k.shape[0], candidate_count, dtype=torch.bool)
+    mask[0, :3] = False
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_sketch_dim=4,
+        leverage_eviction_selector="similarity_topk",
+        leverage_dpp_candidate_multiplier=2,
+    )
+    result = manager.select(k, cache_budget=7, num_anchor_tokens=2, v=v, candidate_evictable_mask=mask)
+    protected = set(torch.nonzero(~mask[0], as_tuple=False).flatten().tolist())
+    missing = protected - set(result.kept_candidate_indices[0, 0].tolist())
+    if missing:
+        raise AssertionError(f"similarity_topk evicted protected layer tokens: {sorted(missing)}")
+
+    limited_mask = torch.zeros_like(mask)
+    limited_mask[..., -1] = True
+    limited = manager.select(k, cache_budget=5, num_anchor_tokens=2, v=v, candidate_evictable_mask=limited_mask)
+    if limited.kept_candidate_indices.shape[-1] != candidate_count - 1:
+        raise AssertionError("similarity_topk did not limit eviction to evictable capacity")
+
+    torch.manual_seed(59)
+    batch_size, num_heads, num_tokens, head_dim = 1, 3, 10, 4
+    k_recent = torch.randn(batch_size, num_heads, num_tokens, head_dim)
+    v_recent = torch.randn_like(k_recent)
+    frame_ids = torch.tensor([0, 0, 0, 0, 1, 1, 2, 2, 3, 3], dtype=torch.long)
+    metadata = _frame_metadata(batch_size, num_heads, frame_ids)
+    recent = manager.select(
+        k_recent,
+        cache_budget=4,
+        num_anchor_tokens=2,
+        v=v_recent,
+        current_frame_idx=3,
+        protect_recent_frames=2,
+        candidate_frame_ids=metadata.frame_ids[:, :, 2:],
+    )
+    _assert_recent_frames_not_evicted(recent.kept_candidate_indices, frame_ids, {2, 3})
 
 
 def _reference_layer_score_head_dpp(
@@ -630,6 +801,111 @@ def check_fast_dpp_quality_beta_zero_uses_only_diversity() -> None:
         )
 
 
+def check_fast_dpp_random_projection_features() -> None:
+    scores = torch.linspace(0.0, 1.0, 8, dtype=torch.float32)
+    mask = torch.ones_like(scores, dtype=torch.bool)
+    features = torch.tensor(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.5, 0.1],
+            [0.0, 1.0, 0.0, 0.0, 0.4, 0.2],
+            [0.0, 0.0, 1.0, 0.0, 0.3, 0.3],
+            [0.0, 0.0, 0.0, 1.0, 0.2, 0.4],
+            [1.0, 1.0, 0.0, 0.0, 0.1, 0.5],
+            [0.0, 1.0, 1.0, 0.0, 0.6, 0.1],
+            [0.0, 0.0, 1.0, 1.0, 0.2, 0.6],
+            [1.0, 0.0, 0.0, 1.0, 0.7, 0.2],
+        ],
+        dtype=torch.float32,
+    )
+
+    default_manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_greedy_block_size=1,
+    )
+    raw_manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_greedy_block_size=1,
+        leverage_dpp_feature_projection="raw",
+        leverage_ridge_dim=2,
+    )
+    default_evicted = default_manager._fast_dpp_evicted_indices(
+        scores, mask, 4, lambda idx: features.index_select(0, idx)
+    )
+    raw_evicted = raw_manager._fast_dpp_evicted_indices(
+        scores, mask, 4, lambda idx: features.index_select(0, idx)
+    )
+    if not torch.equal(default_evicted, raw_evicted):
+        raise AssertionError("explicit raw Fast DPP projection changed default behavior")
+
+    random_manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_greedy_block_size=1,
+        leverage_dpp_feature_projection="random",
+        leverage_ridge_dim=3,
+        leverage_random_seed=7,
+    )
+    random_evicted = random_manager._fast_dpp_evicted_indices(
+        scores, mask, 4, lambda idx: features.index_select(0, idx)
+    )
+    repeat_manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_greedy_block_size=1,
+        leverage_dpp_feature_projection="random",
+        leverage_ridge_dim=3,
+        leverage_random_seed=7,
+    )
+    repeat_evicted = repeat_manager._fast_dpp_evicted_indices(
+        scores, mask, 4, lambda idx: features.index_select(0, idx)
+    )
+    if not torch.equal(random_evicted, repeat_evicted):
+        raise AssertionError("same-seed random projected Fast DPP was not deterministic")
+    if random_manager._last_layer_feature_shape != (8, 3):
+        raise AssertionError(
+            "random projected Fast DPP did not use min(leverage_ridge_dim, feature_dim), "
+            f"got {random_manager._last_layer_feature_shape}"
+        )
+
+    found_seed_sensitive_case = False
+    search_scores = torch.linspace(0.0, 1.0, 10, dtype=torch.float32)
+    search_mask = torch.ones_like(search_scores, dtype=torch.bool)
+    for trial_seed in range(128):
+        generator = torch.Generator().manual_seed(trial_seed)
+        search_features = torch.randn(10, 8, generator=generator)
+        seed_outputs = []
+        for projection_seed in (0, 1):
+            manager = EvictionManager(
+                policy="svd_leverage",
+                leverage_eviction_selector="fast_dpp",
+                leverage_dpp_candidate_multiplier=2,
+                leverage_dpp_greedy_block_size=1,
+                leverage_dpp_quality_beta=0.0,
+                leverage_dpp_feature_projection="random",
+                leverage_ridge_dim=2,
+                leverage_random_seed=projection_seed,
+            )
+            seed_outputs.append(
+                manager._fast_dpp_evicted_indices(
+                    search_scores,
+                    search_mask,
+                    5,
+                    lambda idx, search_features=search_features: search_features.index_select(0, idx),
+                )
+            )
+        if not torch.equal(seed_outputs[0], seed_outputs[1]):
+            found_seed_sensitive_case = True
+            break
+    if not found_seed_sensitive_case:
+        raise AssertionError("different projection seeds never changed Fast DPP choices in the fixture search")
+
+
 def check_fast_dpp_recency_prior() -> None:
     scores = torch.zeros(4, dtype=torch.float32)
     features = torch.eye(4, dtype=torch.float32)
@@ -714,6 +990,98 @@ def check_fast_dpp_recency_prior() -> None:
     retained = set(range(scores.numel())) - evicted
     if retained != {1}:
         raise AssertionError(f"recency prior should retain the recent tied low-score token, got {sorted(retained)}")
+
+    quality_zero_recency = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_diversity_beta=0.0,
+        leverage_dpp_quality_beta=0.0,
+        leverage_dpp_recency_bonus=True,
+        leverage_dpp_recency_lambda=0.2,
+        leverage_dpp_recency_window=5,
+    )
+    evicted = set(
+        quality_zero_recency._fast_dpp_evicted_indices(
+            scores,
+            mask,
+            3,
+            lambda idx: features.index_select(0, idx),
+            row_frame_ids=frame_ids,
+            current_frame_id=5,
+        ).tolist()
+    )
+    retained = set(range(scores.numel())) - evicted
+    if retained != {1}:
+        raise AssertionError(
+            "quality beta 0 should keep the recency prior active, "
+            f"got {sorted(retained)}"
+        )
+
+    gate_free_scores = torch.tensor([0.0, 0.0, 1.0, 1.0], dtype=torch.float32)
+    gate_free_frame_ids = torch.tensor([0, 0, 5, 0], dtype=torch.long)
+    gate_free_recency = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_diversity_beta=0.0,
+        leverage_dpp_quality_beta=0.0,
+        leverage_dpp_recency_bonus=True,
+        leverage_dpp_recency_lambda=0.2,
+        leverage_dpp_recency_window=5,
+        leverage_dpp_recency_gate_power=0.0,
+    )
+    evicted = set(
+        gate_free_recency._fast_dpp_evicted_indices(
+            gate_free_scores,
+            mask,
+            3,
+            lambda idx: features.index_select(0, idx),
+            row_frame_ids=gate_free_frame_ids,
+            current_frame_id=5,
+        ).tolist()
+    )
+    retained = set(range(gate_free_scores.numel())) - evicted
+    if retained != {2}:
+        raise AssertionError(
+            "recency gate power 0 should ignore leverage score gating, "
+            f"got {sorted(retained)}"
+        )
+
+    pure_similarity = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_quality_beta=0.0,
+    )
+    lambda_zero_recency = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_selector="fast_dpp",
+        leverage_dpp_candidate_multiplier=2,
+        leverage_dpp_quality_beta=0.0,
+        leverage_dpp_recency_bonus=True,
+        leverage_dpp_recency_lambda=0.0,
+    )
+    pure_similarity_evicted = set(
+        pure_similarity._fast_dpp_evicted_indices(
+            scores,
+            mask,
+            2,
+            lambda idx: features.index_select(0, idx),
+        ).tolist()
+    )
+    lambda_zero_evicted = set(
+        lambda_zero_recency._fast_dpp_evicted_indices(
+            scores,
+            mask,
+            2,
+            lambda idx: features.index_select(0, idx),
+            row_frame_ids=frame_ids,
+            current_frame_id=5,
+        ).tolist()
+    )
+    if lambda_zero_evicted != pure_similarity_evicted:
+        raise AssertionError("recency lambda 0 should match pure-similarity DPP when quality beta is 0")
 
     layer_head = EvictionManager(
         policy="svd_leverage",
@@ -924,144 +1292,6 @@ def check_protection_disabled_matches_previous_behavior() -> None:
         raise AssertionError("protect_recent_frames=0 changed eviction indices")
 
 
-def _evictable_only_configs():
-    return (
-        {"leverage_approx_method": "exact_qr", "leverage_sketch_dim": 0},
-        {"leverage_approx_method": "right_sketch", "leverage_sketch_dim": 3},
-        {
-            "leverage_approx_method": "right_sketch_ridge",
-            "leverage_sketch_dim": 3,
-            "leverage_ridge_dim": 3,
-        },
-    )
-
-
-def check_evictable_only_matches_subset_reference() -> None:
-    k, v = _make_cache()
-    num_anchor_tokens = 2
-    candidate_k = k[:, :, num_anchor_tokens:]
-    candidate_v = v[:, :, num_anchor_tokens:]
-    mask = torch.ones(candidate_k.shape[:3], dtype=torch.bool)
-    mask[0, 0, :2] = False
-    mask[0, 1, :6] = False
-    mask[1, 0, 3:5] = False
-    mask[1, 1, 5:] = False
-
-    for granularity in ("head", "layer"):
-        for config in _evictable_only_configs():
-            manager = EvictionManager(
-                policy="svd_leverage",
-                leverage_granularity=granularity,
-                leverage_evictable_only=True,
-                **config,
-            )
-            result = manager.select(
-                k,
-                cache_budget=7,
-                num_anchor_tokens=num_anchor_tokens,
-                v=v,
-                candidate_evictable_mask=mask,
-                need_leverage_basis=True,
-            )
-            basis = result.leverage_basis
-            assert basis is not None
-            assert basis.q.shape[-2] == candidate_k.shape[2]
-
-            if granularity == "head":
-                if not torch.equal(result.policy_scores[~mask], torch.zeros_like(result.policy_scores[~mask])):
-                    raise AssertionError("protected head-wise rows received non-zero leverage scores")
-                if not torch.equal(basis.q[~mask], torch.zeros_like(basis.q[~mask])):
-                    raise AssertionError("protected head-wise rows received non-zero leverage coordinates")
-                for batch_idx in range(k.shape[0]):
-                    for head_idx in range(k.shape[1]):
-                        indices = torch.nonzero(mask[batch_idx, head_idx], as_tuple=False).flatten()
-                        reference = EvictionManager(
-                            policy="svd_leverage",
-                            leverage_granularity="head",
-                            **config,
-                        )._svd_leverage_scores(
-                            candidate_k[batch_idx : batch_idx + 1, head_idx : head_idx + 1].index_select(2, indices)
-                        )[0, 0]
-                        if not torch.allclose(result.policy_scores[batch_idx, head_idx, indices], reference, atol=1e-5, rtol=1e-4):
-                            raise AssertionError(f"head evictable-only scores differ from subset reference: {config}")
-            else:
-                shared_mask = mask.all(dim=1)
-                if not torch.equal(result.policy_scores[~shared_mask], torch.zeros_like(result.policy_scores[~shared_mask])):
-                    raise AssertionError("protected layer-wise rows received non-zero leverage scores")
-                if not torch.equal(basis.q[~shared_mask], torch.zeros_like(basis.q[~shared_mask])):
-                    raise AssertionError("protected layer-wise rows received non-zero leverage coordinates")
-                for batch_idx in range(k.shape[0]):
-                    indices = torch.nonzero(shared_mask[batch_idx], as_tuple=False).flatten()
-                    reference = EvictionManager(
-                        policy="svd_leverage",
-                        leverage_granularity="layer",
-                        **config,
-                    )._layer_svd_leverage_scores(
-                        candidate_k[batch_idx : batch_idx + 1].index_select(2, indices),
-                        candidate_v[batch_idx : batch_idx + 1].index_select(2, indices),
-                    )[0]
-                    if not torch.allclose(result.policy_scores[batch_idx, indices], reference, atol=1e-5, rtol=1e-4):
-                        raise AssertionError(f"layer evictable-only scores differ from subset reference: {config}")
-
-
-def check_evictable_only_disabled_and_recent_only_are_unchanged() -> None:
-    k, v = _make_cache()
-    metadata = KVCacheMetadata.for_current_frame(k.shape[0], k.shape[1], k.shape[2], frame_id=3)
-    config = dict(
-        policy="svd_leverage",
-        leverage_granularity="layer",
-        leverage_approx_method="right_sketch_ridge",
-        leverage_ridge_dim=3,
-        leverage_sketch_dim=3,
-    )
-    baseline = EvictionManager(**config).select(k, cache_budget=7, num_anchor_tokens=2, v=v)
-    enabled_without_mask = EvictionManager(leverage_evictable_only=True, **config).select(
-        k,
-        cache_budget=7,
-        num_anchor_tokens=2,
-        v=v,
-    )
-    enabled_recent_only = EvictionManager(leverage_evictable_only=True, **config).select(
-        k,
-        cache_budget=7,
-        num_anchor_tokens=2,
-        v=v,
-        current_frame_idx=3,
-        protect_recent_frames=1,
-        candidate_frame_ids=metadata.frame_ids[:, :, 2:],
-    )
-    if not torch.equal(baseline.policy_scores, enabled_without_mask.policy_scores):
-        raise AssertionError("evictable-only without a special-token mask changed leverage scores")
-    if not torch.equal(baseline.policy_scores, enabled_recent_only.policy_scores):
-        raise AssertionError("recent-frame protection unexpectedly changed evictable-only leverage scores")
-
-
-def check_evictable_only_empty_mask() -> None:
-    k, v = _make_cache()
-    candidate_count = k.shape[2] - 2
-    mask = torch.zeros(k.shape[0], k.shape[1], candidate_count, dtype=torch.bool)
-    for granularity in ("head", "layer"):
-        result = EvictionManager(
-            policy="svd_leverage",
-            leverage_granularity=granularity,
-            leverage_evictable_only=True,
-            leverage_sketch_dim=0,
-        ).select(
-            k,
-            cache_budget=7,
-            num_anchor_tokens=2,
-            v=v,
-            candidate_evictable_mask=mask,
-            need_leverage_basis=True,
-        )
-        assert result.leverage_basis is not None
-        assert result.leverage_basis.q.shape[-2:] == (candidate_count, 0)
-        if not torch.equal(result.policy_scores, torch.zeros_like(result.policy_scores)):
-            raise AssertionError("empty evictable mask did not produce zero leverage scores")
-        if result.kept_candidate_indices.shape[-1] != candidate_count:
-            raise AssertionError("empty evictable mask should retain every candidate")
-
-
 def _make_multiframe_metadata(batch_size: int, num_heads: int, tokens_per_frame: int, num_frames: int) -> KVCacheMetadata:
     metadata = KVCacheMetadata.for_current_frame(batch_size, num_heads, tokens_per_frame, 0)
     for frame_id in range(1, num_frames):
@@ -1158,7 +1388,6 @@ def check_attention_special_token_protection() -> None:
                 eviction_policy="svd_leverage",
                 leverage_granularity="layer",
                 leverage_sketch_dim=0,
-                leverage_evictable_only=True,
                 eviction_protect_special_tokens=True,
                 special_token_count=2,
             )
@@ -1264,6 +1493,75 @@ def check_small_cache_no_eviction() -> None:
     assert score == 0.0
 
 
+def check_layer_range_fifo_override() -> None:
+    k = torch.arange(8, dtype=torch.float32).view(1, 1, 8, 1)
+    v = k + 100.0
+    metadata = KVCacheMetadata.for_current_frame(
+        batch_size=1,
+        num_heads=1,
+        num_tokens=8,
+        frame_id=0,
+    )
+    attention = Attention(dim=1, num_heads=1)
+
+    fifo_k, fifo_v, fifo_metadata, fifo_score = attention.eviction(
+        k,
+        v,
+        metadata,
+        cache_budget=5,
+        num_anchor_tokens=2,
+        layer_id=3,
+        step_idx=1,
+        eviction_policy="svd_leverage",
+        eviction_policy_layers={4},
+        leverage_granularity="layer",
+        leverage_sketch_dim=0,
+    )
+    expected = torch.tensor([0.0, 1.0, 5.0, 6.0, 7.0]).view(1, 1, 5, 1)
+    if not torch.equal(fifo_k, expected):
+        raise AssertionError(f"FIFO override kept wrong k indices: {fifo_k.flatten().tolist()}")
+    if not torch.equal(fifo_v, expected + 100.0):
+        raise AssertionError("FIFO override kept wrong v indices")
+    if fifo_metadata is None or not torch.equal(fifo_metadata.token_indices, expected.long().squeeze(-1)):
+        raise AssertionError("FIFO override kept wrong metadata indices")
+    if fifo_score != 0.0:
+        raise AssertionError("FIFO override should not emit policy scores")
+
+    _, _, _, selected_score = attention.eviction(
+        k,
+        v,
+        metadata,
+        cache_budget=5,
+        num_anchor_tokens=2,
+        layer_id=3,
+        step_idx=1,
+        eviction_policy="svd_leverage",
+        eviction_policy_layers={3},
+        leverage_granularity="layer",
+        leverage_sketch_dim=0,
+        layer_budget_strategy="leverage_pr",
+    )
+    if not isinstance(selected_score, tuple):
+        raise AssertionError("selected layer should use svd_leverage and emit layer-budget payload")
+
+    _, _, _, default_score = attention.eviction(
+        k,
+        v,
+        metadata,
+        cache_budget=5,
+        num_anchor_tokens=2,
+        layer_id=3,
+        step_idx=1,
+        eviction_policy="svd_leverage",
+        eviction_policy_layers=None,
+        leverage_granularity="layer",
+        leverage_sketch_dim=0,
+        layer_budget_strategy="leverage_pr",
+    )
+    if not isinstance(default_score, tuple):
+        raise AssertionError("empty layer override should preserve existing svd_leverage behavior")
+
+
 def check_cache_evict_gate_forward() -> None:
     torch.manual_seed(31)
     attention = Attention(dim=4, num_heads=1)
@@ -1315,18 +1613,281 @@ def check_cache_evict_gate_forward() -> None:
         raise AssertionError("enabled eviction gate should report pruning scores")
 
 
+def check_attention_anchor_only_special_cache_write() -> None:
+    torch.manual_seed(41)
+    baseline = Attention(dim=4, num_heads=1)
+    special_only = Attention(dim=4, num_heads=1)
+    special_only.load_state_dict(baseline.state_dict())
+    baseline.eval()
+    special_only.eval()
+    x = torch.randn(1, 5, 4)
+
+    with torch.no_grad():
+        baseline_out, baseline_kv, _ = baseline(
+            x,
+            use_cache=True,
+            cache_budget=16,
+            step_idx=1,
+            special_token_count=2,
+        )
+        special_result = special_only(
+            x,
+            use_cache=True,
+            cache_budget=16,
+            step_idx=1,
+            special_token_count=2,
+            global_cache_history_anchor_special_tokens_only=True,
+        )
+
+    if len(special_result) != 4:
+        raise AssertionError("anchor-only special cache mode should return a sidecar")
+    special_out, special_kv, _scores, sidecar = special_result
+    if not torch.allclose(baseline_out, special_out, atol=1e-5, rtol=1e-5):
+        raise AssertionError("read-only current special tokens should preserve current-frame attention output")
+    if baseline_kv[0].shape[2] != 5:
+        raise AssertionError("baseline cache should keep all current tokens")
+    if special_kv[0].shape[2] != 3:
+        raise AssertionError(f"special-only cache should write only patch tokens, got {special_kv[0].shape[2]}")
+    if sidecar[0].shape[2] != 2 or sidecar[1].shape[2] != 2:
+        raise AssertionError("sidecar should contain the skipped special tokens")
+    metadata = special_kv[2]
+    if not torch.equal(metadata.token_indices.view(-1), torch.tensor([2, 3, 4], dtype=torch.int32)):
+        raise AssertionError(f"unexpected persistent token indices: {metadata.token_indices.view(-1).tolist()}")
+
+
+
+def check_attention_first_frame_special_only_anchor_prefix() -> None:
+    torch.manual_seed(43)
+    attention = Attention(dim=4, num_heads=1)
+    k = torch.randn(1, 1, 20, 4)
+    v = torch.randn(1, 1, 20, 4)
+    first_meta = KVCacheMetadata.for_current_frame(1, 1, 10, frame_id=0)
+    second_meta = KVCacheMetadata.for_current_frame(1, 1, 10, frame_id=1)
+    metadata = first_meta.concat(second_meta)
+
+    with torch.no_grad():
+        _k, _v, pruned_metadata, _scores = attention.eviction(
+            k,
+            v,
+            metadata,
+            cache_budget=10,
+            num_anchor_tokens=5,
+            eviction_policy="mean",
+        )
+
+    token_indices = pruned_metadata.token_indices.view(-1)
+    frame_ids = pruned_metadata.frame_ids.view(-1)
+    if not torch.equal(token_indices[:5], torch.arange(5, dtype=torch.int32)):
+        raise AssertionError(f"unexpected protected token prefix: {token_indices[:5].tolist()}")
+    if not torch.equal(frame_ids[:5], torch.zeros(5, dtype=torch.long)):
+        raise AssertionError(f"unexpected protected frame prefix: {frame_ids[:5].tolist()}")
+    first_frame_patch_positions = torch.nonzero((frame_ids == 0) & (token_indices >= 5), as_tuple=False).flatten()
+    if first_frame_patch_positions.numel() > 0 and int(first_frame_patch_positions.min().item()) < 5:
+        raise AssertionError("first-frame patch tokens entered the protected prefix")
+
+
+def check_outlier_then_low_risk_mode() -> None:
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_eviction_risk_mode="outlier_then_low",
+        leverage_high_outlier_z=1.0,
+    )
+    scores = torch.tensor([[0.2, 0.25, 0.3, 10.0]], dtype=torch.float32)
+    evictable = torch.ones_like(scores, dtype=torch.bool)
+    kept = manager._keep_after_outlier_then_low_topk(scores, evictable, num_to_evict=1)
+    evicted = set(range(scores.shape[-1])) - set(kept[0].tolist())
+    if evicted != {3}:
+        raise AssertionError(f"high outlier was not evicted first: {sorted(evicted)}")
+
+    scores = torch.tensor([[0.0, 0.1, 0.2, 8.0, 9.0]], dtype=torch.float32)
+    kept = manager._keep_after_outlier_then_low_topk(scores, torch.ones_like(scores, dtype=torch.bool), num_to_evict=3)
+    evicted = set(range(scores.shape[-1])) - set(kept[0].tolist())
+    if evicted != {0, 3, 4}:
+        raise AssertionError(f"expected high outliers then lowest score, got {sorted(evicted)}")
+
+    scores = torch.tensor([[0.0, 0.1, 10.0]], dtype=torch.float32)
+    evictable = torch.tensor([[True, True, False]])
+    kept = manager._keep_after_outlier_then_low_topk(scores, evictable, num_to_evict=1)
+    evicted = set(range(scores.shape[-1])) - set(kept[0].tolist())
+    if evicted != {0}:
+        raise AssertionError(f"protected high outlier should not be evicted: {sorted(evicted)}")
+
+    k = torch.randn(1, 2, 4, 3)
+    v = torch.randn_like(k)
+    kept = manager._keep_after_layer_fast_dpp(
+        torch.tensor([[0.2, 0.25, 0.3, 10.0]], dtype=torch.float32),
+        torch.ones(1, 4, dtype=torch.bool),
+        num_to_evict=1,
+        candidate_k=k,
+        candidate_v=v,
+        outlier_then_low=True,
+    )
+    evicted = set(range(4)) - set(kept[0].tolist())
+    if evicted != {3}:
+        raise AssertionError(f"Fast DPP path did not direct-evict high outlier: {sorted(evicted)}")
+
+
+
+def check_leverage_score_histogram_config() -> None:
+    with tempfile.TemporaryDirectory(prefix="lev_hist_sanity_") as tmpdir:
+        config = LeverageScoreHistogramConfig(output_dir=tmpdir, bins=4, min_value=0.0, max_value=1.0)
+        config.record(
+            torch.tensor([[-0.1, 0.1, 0.2, 0.8, 1.0, 1.2, float("nan"), float("inf")]]),
+            layer_id=2,
+            step_idx=0,
+        )
+        config.record(
+            torch.tensor([[[0.0, 0.49, 0.51], [0.99, -1.0, 2.0]]]),
+            layer_id=3,
+            step_idx=1,
+        )
+        filtered = LeverageScoreHistogramConfig(
+            output_dir=os.path.join(tmpdir, "filtered"),
+            bins=2,
+            min_value=0.0,
+            max_value=1.0,
+            layers={4},
+        )
+        filtered.record(torch.tensor([[0.2, 0.4]]), layer_id=5, step_idx=0)
+        filtered.record(torch.tensor([[0.2, 0.4]]), layer_id=4, step_idx=0)
+        config.flush()
+        filtered.flush()
+
+        hist_path = os.path.join(tmpdir, "leverage_histograms.csv")
+        summary_path = os.path.join(tmpdir, "leverage_histogram_summary.csv")
+        with open(hist_path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        counts = {}
+        for row in rows:
+            counts.setdefault(int(row["layer_id"]), []).append(int(row["count"]))
+        if counts[2] != [2, 0, 0, 2]:
+            raise AssertionError(f"unexpected layer 2 histogram counts: {counts[2]}")
+        if counts[3] != [1, 1, 1, 1]:
+            raise AssertionError(f"unexpected layer 3 histogram counts: {counts[3]}")
+
+        with open(summary_path, newline="", encoding="utf-8") as f:
+            summary = {int(row["layer_id"]): row for row in csv.DictReader(f)}
+        if int(summary[2]["total_tokens"]) != 6 or int(summary[2]["underflow"]) != 1 or int(summary[2]["overflow"]) != 1:
+            raise AssertionError(f"unexpected layer 2 summary: {summary[2]}")
+        if int(summary[3]["total_tokens"]) != 6 or int(summary[3]["underflow"]) != 1 or int(summary[3]["overflow"]) != 1:
+            raise AssertionError(f"unexpected layer 3 summary: {summary[3]}")
+
+        filtered_summary_path = os.path.join(tmpdir, "filtered", "leverage_histogram_summary.csv")
+        with open(filtered_summary_path, newline="", encoding="utf-8") as f:
+            filtered_summary = {int(row["layer_id"]): row for row in csv.DictReader(f)}
+        if set(filtered_summary) != {4}:
+            raise AssertionError(f"layer filter did not skip non-selected layer: {filtered_summary}")
+
+
+
+def check_similarity_topk_reused_projection_features() -> None:
+    k, v = _make_cache()
+    candidate_count = k.shape[2] - 2
+    ridge_dim = 4
+
+    default_raw = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_eviction_selector="similarity_topk",
+        leverage_similarity_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=ridge_dim,
+        leverage_random_seed=123,
+    )
+    explicit_raw = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_eviction_selector="similarity_topk",
+        leverage_similarity_granularity="layer",
+        leverage_similarity_feature_projection="raw",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=ridge_dim,
+        leverage_random_seed=123,
+    )
+    default_result = default_raw.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+    explicit_result = explicit_raw.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+    if not torch.equal(default_result.kept_candidate_indices, explicit_result.kept_candidate_indices):
+        raise AssertionError("explicit raw similarity projection changed default similarity_topk behavior")
+
+    layer_projected = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_eviction_selector="similarity_topk",
+        leverage_similarity_granularity="layer",
+        leverage_similarity_feature_projection="random",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=ridge_dim,
+        leverage_random_seed=123,
+    )
+    layer_result = layer_projected.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+    assert layer_result.kept_candidate_indices.shape == (2, 3, 5)
+    if layer_projected._last_similarity_layer_features is None:
+        raise AssertionError("layer projected similarity features were not stored")
+    if layer_projected._last_similarity_layer_features.shape != (2, candidate_count, ridge_dim):
+        raise AssertionError(
+            f"unexpected layer projected feature shape: {tuple(layer_projected._last_similarity_layer_features.shape)}"
+        )
+    _assert_evicted_subset_of_low_score_pool(layer_result, candidate_count=candidate_count, multiplier=2)
+
+    head_projected = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_eviction_selector="similarity_topk",
+        leverage_similarity_granularity="head",
+        leverage_similarity_feature_projection="random",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=ridge_dim,
+        leverage_random_seed=123,
+    )
+    head_result = head_projected.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+    assert head_result.kept_candidate_indices.shape == (2, 3, 5)
+    if head_projected._last_similarity_head_features is None:
+        raise AssertionError("head projected similarity features were not stored")
+    if head_projected._last_similarity_head_features.shape != (2, 3, candidate_count, ridge_dim):
+        raise AssertionError(
+            f"unexpected head projected feature shape: {tuple(head_projected._last_similarity_head_features.shape)}"
+        )
+    _assert_evicted_subset_of_low_score_pool(head_result, candidate_count=candidate_count, multiplier=2)
+
+    missing_head_projection = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_projection="head_mean",
+        leverage_head_mean_dim=1,
+        leverage_eviction_selector="similarity_topk",
+        leverage_similarity_granularity="head",
+        leverage_similarity_feature_projection="random",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=ridge_dim,
+    )
+    try:
+        missing_head_projection.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+    except ValueError as exc:
+        if "head-wise leverage features" not in str(exc):
+            raise AssertionError(f"unexpected missing projection error: {exc}") from exc
+    else:
+        raise AssertionError("head-wise random similarity should reject missing projected head features")
+
 def check_ridge_invalid_args() -> None:
     invalid_configs = (
         {"leverage_approx_method": "full_d_ridge", "leverage_ridge_lambda": -1e-3},
         {"leverage_approx_method": "full_d_ridge", "leverage_ridge_jitter": 0.0},
         {"leverage_approx_method": "full_d_ridge", "leverage_ridge_score_chunk_size": 0},
         {"leverage_approx_method": "right_sketch_ridge", "leverage_ridge_dim": 0},
-        {"leverage_approx_method": "right_sketch_ridge", "leverage_ridge_dim": None, "leverage_right_jl_dim": 0},
+        {"leverage_approx_method": "right_sketch_ridge", "leverage_ridge_dim": None},
         {"leverage_dpp_quality_beta": -1e-3},
         {"leverage_dpp_diversity_beta": -1e-3},
+        {"leverage_dpp_feature_projection": "bad"},
+        {"leverage_dpp_feature_projection": "random"},
+        {"leverage_dpp_feature_projection": "random", "leverage_ridge_dim": 0},
+        {"leverage_similarity_granularity": "bad"},
+        {"leverage_similarity_feature_projection": "bad"},
+        {"leverage_similarity_feature_projection": "random", "leverage_approx_method": "full_d_ridge"},
         {"leverage_dpp_recency_lambda": -1e-3},
         {"leverage_dpp_recency_window": 0},
         {"leverage_dpp_recency_gate_power": -1e-3},
+        {"leverage_eviction_risk_mode": "unknown"},
+        {"leverage_high_outlier_z": -1e-3},
     )
     for cfg in invalid_configs:
         try:
@@ -1343,9 +1904,17 @@ def main() -> None:
     check_eviction_alignment()
     check_sketch_and_exact_modes()
     check_approx_methods()
-    check_drineas_deterministic()
     check_ridge_invalid_args()
+    check_leverage_score_histogram_config()
+    check_outlier_then_low_risk_mode()
     check_fast_dpp_shapes_and_low_score_pool()
+    check_similarity_topk_shapes_and_low_score_pool()
+    check_similarity_topk_evicts_redundant_pool_key()
+    check_similarity_topk_uses_similarity_over_leverage_ratio()
+    check_similarity_topk_head_granularity_head_specific_eviction()
+    check_similarity_topk_head_granularity_select_and_merge_guard()
+    check_similarity_topk_protection_and_recent_frames()
+    check_similarity_topk_reused_projection_features()
     check_layer_head_fast_dpp_matches_reference()
     check_layer_head_fast_dpp_head_specific_and_protection()
     check_layer_head_fast_dpp_recent_protection_and_edge_cases()
@@ -1353,6 +1922,7 @@ def main() -> None:
     check_fast_dpp_retain_diversity()
     check_fast_dpp_diversity_beta_zero_prefers_quality()
     check_fast_dpp_quality_beta_zero_uses_only_diversity()
+    check_fast_dpp_random_projection_features()
     check_fast_dpp_recency_prior()
     check_fast_dpp_recent_frame_protection()
     check_dpp_shapes_and_full_pool()
@@ -1363,9 +1933,6 @@ def main() -> None:
     check_recent_frame_protection_layer_modes()
     check_recent_frame_eviction_alignment()
     check_protection_disabled_matches_previous_behavior()
-    check_evictable_only_matches_subset_reference()
-    check_evictable_only_disabled_and_recent_only_are_unchanged()
-    check_evictable_only_empty_mask()
     check_special_token_protection_policies()
     check_special_and_recent_protection_combine()
     check_attention_special_token_protection()
@@ -1373,7 +1940,10 @@ def main() -> None:
     check_invalid_special_token_interval()
     check_keep_after_eviction_zero_evict()
     check_small_cache_no_eviction()
+    check_layer_range_fifo_override()
     check_cache_evict_gate_forward()
+    check_attention_anchor_only_special_cache_write()
+    check_attention_first_frame_special_only_anchor_prefix()
     print("leverage granularity sanity checks passed")
 
 

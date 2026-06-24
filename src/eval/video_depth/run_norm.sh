@@ -7,8 +7,6 @@ model_name='SStreamVGGT'
 ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 leverage_approx_method="right_sketch"
-leverage_left_sketch_dim="2048"
-leverage_right_jl_dim="64"
 leverage_random_seed="0"
 max_frames='500'
 eviction_policy='svd_leverage'
@@ -28,8 +26,6 @@ for data in "${datasets[@]}"; do
         --leverage_granularity layer \
         --leverage_projection random \
         --leverage_approx_method "$leverage_approx_method" \
-        --leverage_left_sketch_dim "$leverage_left_sketch_dim" \
-        --leverage_right_jl_dim "$leverage_right_jl_dim" \
         --leverage_random_seed "$leverage_random_seed" \
         --leverage_normalize_rows
 

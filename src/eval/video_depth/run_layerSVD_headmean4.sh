@@ -24,7 +24,7 @@ for data in "${datasets[@]}"; do
         --leverage_granularity layer \
         --leverage_projection head_mean \
         --leverage_head_mean_dim 4 \
-        --leverage_eviction_selector "$leverage_eviction_selector" \
+        --leverage_eviction_selector "$leverage_eviction_selector"
 
     python ../src/eval/video_depth/eval_depth.py \
     --output_dir "$output_dir" \

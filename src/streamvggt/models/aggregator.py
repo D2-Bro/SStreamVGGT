@@ -9,7 +9,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union, List, Dict, Any
+from typing import Optional, Tuple, Union, List, Dict, Any, Set
 
 from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
@@ -18,12 +18,19 @@ from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.eviction import (
     LAYER_BUDGET_SCORE_STRATEGIES,
     VALID_LAYER_BUDGET_STRATEGIES,
+    VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES,
     _allocate_layer_budgets_from_scores,
     _combine_value_weighted_leverage_pr_scores,
 )
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig, EvictionNNAnalysisConfig, PreEvictionSnapshotConfig
+from streamvggt.utils.cache_analysis import (
+    CacheAnalysisConfig,
+    EvictionNNAnalysisConfig,
+    LeverageScoreHistogramConfig,
+    PreEvictionSnapshotConfig,
+    TokenOverlayDumpConfig,
+)
 from streamvggt.utils.global_attn_ranges import (
     GlobalAttnIdxRange,
     is_global_idx_enabled,
@@ -162,7 +169,21 @@ class Aggregator(nn.Module):
         self.last_layer_budget_base_scores = torch.zeros(self.depth)
         self.last_layer_budget_value_norms = torch.zeros(self.depth)
         self.last_global_attn_debug_trace = []
+        self.last_global_special_kv_sidecars = [None] * self.depth
         self.register_buffer("layer_budget_proportions", None, persistent=False)
+
+    def reset_stream_state(self) -> None:
+        """Clear sequence-local streaming state before a new inference sequence."""
+        self.last_scores.zero_()
+        self.last_layer_budget_scores.zero_()
+        self.last_layer_budget_base_scores.zero_()
+        self.last_layer_budget_value_norms.zero_()
+        self.last_global_attn_debug_trace = []
+        self.last_global_special_kv_sidecars = [None] * self.depth
+        for block in list(self.frame_blocks) + list(self.global_blocks):
+            reset = getattr(getattr(block, "attn", None), "_reset_cache_state", None)
+            if reset is not None:
+                reset()
 
 
     def __build_patch_embed__(
@@ -216,7 +237,10 @@ class Aggregator(nn.Module):
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
+        leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
+        eviction_policy_layers: Optional[Set[int]] = None,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -224,21 +248,22 @@ class Aggregator(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
-        leverage_evictable_only: bool = False,
-        leverage_approx_method: str = "right_sketch",
-        leverage_left_sketch_dim: Optional[int] = 2048,
-        leverage_right_jl_dim: Optional[int] = 64,
-        leverage_ridge_lambda: float = 1e-3,
+        leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
+        leverage_similarity_granularity: str = "layer",
+        leverage_similarity_feature_projection: str = "raw",
+        leverage_eviction_risk_mode: str = "low_leverage",
+        leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
         leverage_dpp_quality_beta: float = 1.0,
         leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_feature_projection: str = "raw",
         leverage_dpp_recency_bonus: bool = False,
         leverage_dpp_recency_lambda: float = 0.2,
         leverage_dpp_recency_window: int = 5,
@@ -251,7 +276,8 @@ class Aggregator(nn.Module):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
-        layer_budget_debug: bool = False,
+        slots_per_direction: float = 4.0,
+        hybrid_beta: float = 0.5,
         layer_budget_log_path: Optional[str] = None,
         eviction_protect_recent_frames: int = 0,
         eviction_protect_special_tokens: bool = False,
@@ -267,6 +293,10 @@ class Aggregator(nn.Module):
         global_attn_debug: bool = False,
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
+        global_cache_history_anchor_special_tokens_only: bool = False,
+        history_anchor_frame_ids: Optional[List[int]] = None,
+        history_anchor_patch_topk_per_frame: int = 0,
+        history_anchor_max_frames: int = 0,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -356,6 +386,13 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
+        current_cache_token_count = S * P if cache_write_current_frame else 0
+        if (
+            global_cache_history_anchor_special_tokens_only
+            and cache_write_current_frame
+            and int(past_frame_idx) != 0
+        ):
+            current_cache_token_count = S * max(P - int(self.patch_start_idx), 0)
         current_budgets = self._calculate_dynamic_budgets(
             total_budget,
             enabled_global_idx_ranges=parsed_global_attn_idx_ranges,
@@ -365,11 +402,12 @@ class Aggregator(nn.Module):
             layer_budget_alpha=layer_budget_alpha,
             layer_budget_min_tokens=layer_budget_min_tokens,
             layer_budget_eps=layer_budget_eps,
-            layer_budget_debug=layer_budget_debug,
+            slots_per_direction=slots_per_direction,
+            hybrid_beta=hybrid_beta,
             layer_budget_log_path=layer_budget_log_path,
             layer_budget_step_idx=past_frame_idx,
             past_key_values=past_key_values,
-            current_token_count=S * P if cache_write_current_frame else 0,
+            current_token_count=current_cache_token_count,
         )
         scores = []
         layer_budget_scores = []
@@ -380,6 +418,7 @@ class Aggregator(nn.Module):
         updated_layer_budget_base_scores = self.last_layer_budget_base_scores.clone()
         updated_layer_budget_value_norms = self.last_layer_budget_value_norms.clone()
         self.last_global_attn_debug_trace = []
+        self.last_global_special_kv_sidecars = [None] * self.depth
         raw_block_idx = 0
 
         for _ in range(self.aa_block_num):
@@ -432,7 +471,10 @@ class Aggregator(nn.Module):
                             cache_analysis_config=cache_analysis_config,
                             pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                             eviction_nn_analysis_config=eviction_nn_analysis_config,
+                            leverage_score_histogram_config=leverage_score_histogram_config,
+                            token_overlay_dump_config=token_overlay_dump_config,
                             eviction_policy=eviction_policy,
+                            eviction_policy_layers=eviction_policy_layers,
                             eviction_debug=eviction_debug,
                             leverage_sketch_dim=leverage_sketch_dim,
                             leverage_granularity=leverage_granularity,
@@ -440,21 +482,22 @@ class Aggregator(nn.Module):
                             leverage_projection=leverage_projection,
                             leverage_head_mean_dim=leverage_head_mean_dim,
                             leverage_normalize_rows=leverage_normalize_rows,
-                            leverage_evictable_only=leverage_evictable_only,
-                            leverage_approx_method=leverage_approx_method,
-                            leverage_left_sketch_dim=leverage_left_sketch_dim,
-                            leverage_right_jl_dim=leverage_right_jl_dim,
-                            leverage_ridge_lambda=leverage_ridge_lambda,
+                            leverage_approx_method=leverage_approx_method,                            leverage_ridge_lambda=leverage_ridge_lambda,
                             leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
                             leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=leverage_ridge_jitter,
                             leverage_ridge_dim=leverage_ridge_dim,
                             leverage_random_seed=leverage_random_seed,
                             leverage_eviction_selector=leverage_eviction_selector,
+                            leverage_similarity_granularity=leverage_similarity_granularity,
+                leverage_similarity_feature_projection=leverage_similarity_feature_projection,
+leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                            leverage_high_outlier_z=leverage_high_outlier_z,
                             leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                             leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
                             leverage_dpp_quality_beta=leverage_dpp_quality_beta,
                             leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
+                            leverage_dpp_feature_projection=leverage_dpp_feature_projection,
                             leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
                             leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
                             leverage_dpp_recency_window=leverage_dpp_recency_window,
@@ -465,6 +508,8 @@ class Aggregator(nn.Module):
                             layer_budget_value_norm_type=layer_budget_value_norm_type,
                             layer_budget_norm_source=layer_budget_norm_source,
                             layer_budget_eps=layer_budget_eps,
+                            slots_per_direction=slots_per_direction,
+                            hybrid_beta=hybrid_beta,
                             eviction_protect_recent_frames=eviction_protect_recent_frames,
                             eviction_protect_special_tokens=eviction_protect_special_tokens,
                             eviction_protect_special_token_interval=eviction_protect_special_token_interval,
@@ -478,11 +523,15 @@ class Aggregator(nn.Module):
                             global_attn_debug=global_attn_debug,
                             cache_write_current_frame=cache_write_current_frame,
                             cache_evict_current_frame=cache_evict_current_frame,
+                            global_cache_history_anchor_special_tokens_only=global_cache_history_anchor_special_tokens_only,
+                            history_anchor_frame_ids=history_anchor_frame_ids,
+                            history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
+                            history_anchor_max_frames=history_anchor_max_frames,
                         )
                     elif use_cache:
                         old_global_idx = global_idx
                         old_kv_read = past_key_values[old_global_idx] is not None
-                        tokens, global_idx, global_intermediates, new_kv, current_scores = self._process_global_attention(
+                        tokens, global_idx, global_intermediates, new_kv, current_scores, special_kv_sidecar = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos,
                             past_key_values_block=past_key_values[global_idx] if past_key_values[global_idx] is not None else None,
                             use_cache=True,
@@ -491,7 +540,10 @@ class Aggregator(nn.Module):
                             cache_analysis_config=cache_analysis_config,
                             pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                             eviction_nn_analysis_config=eviction_nn_analysis_config,
+                            leverage_score_histogram_config=leverage_score_histogram_config,
+                            token_overlay_dump_config=token_overlay_dump_config,
                             eviction_policy=eviction_policy,
+                            eviction_policy_layers=eviction_policy_layers,
                             eviction_debug=eviction_debug,
                             leverage_sketch_dim=leverage_sketch_dim,
                             leverage_granularity=leverage_granularity,
@@ -499,21 +551,22 @@ class Aggregator(nn.Module):
                             leverage_projection=leverage_projection,
                             leverage_head_mean_dim=leverage_head_mean_dim,
                             leverage_normalize_rows=leverage_normalize_rows,
-                            leverage_evictable_only=leverage_evictable_only,
-                            leverage_approx_method=leverage_approx_method,
-                            leverage_left_sketch_dim=leverage_left_sketch_dim,
-                            leverage_right_jl_dim=leverage_right_jl_dim,
-                            leverage_ridge_lambda=leverage_ridge_lambda,
+                            leverage_approx_method=leverage_approx_method,                            leverage_ridge_lambda=leverage_ridge_lambda,
                             leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
                             leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=leverage_ridge_jitter,
                             leverage_ridge_dim=leverage_ridge_dim,
                             leverage_random_seed=leverage_random_seed,
                             leverage_eviction_selector=leverage_eviction_selector,
+                            leverage_similarity_granularity=leverage_similarity_granularity,
+                leverage_similarity_feature_projection=leverage_similarity_feature_projection,
+leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                            leverage_high_outlier_z=leverage_high_outlier_z,
                             leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                             leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
                             leverage_dpp_quality_beta=leverage_dpp_quality_beta,
                             leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
+                            leverage_dpp_feature_projection=leverage_dpp_feature_projection,
                             leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
                             leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
                             leverage_dpp_recency_window=leverage_dpp_recency_window,
@@ -524,6 +577,8 @@ class Aggregator(nn.Module):
                             layer_budget_value_norm_type=layer_budget_value_norm_type,
                             layer_budget_norm_source=layer_budget_norm_source,
                             layer_budget_eps=layer_budget_eps,
+                            slots_per_direction=slots_per_direction,
+                            hybrid_beta=hybrid_beta,
                             eviction_protect_recent_frames=eviction_protect_recent_frames,
                             eviction_protect_special_tokens=eviction_protect_special_tokens,
                             eviction_protect_special_token_interval=eviction_protect_special_token_interval,
@@ -536,8 +591,13 @@ class Aggregator(nn.Module):
                             voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                             cache_write_current_frame=cache_write_current_frame,
                             cache_evict_current_frame=cache_evict_current_frame,
+                            global_cache_history_anchor_special_tokens_only=global_cache_history_anchor_special_tokens_only,
+                            history_anchor_frame_ids=history_anchor_frame_ids,
+                            history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
+                            history_anchor_max_frames=history_anchor_max_frames,
                         )
                         past_key_values[global_idx - 1] = new_kv
+                        self.last_global_special_kv_sidecars[global_idx - 1] = special_kv_sidecar
                         current_score, current_layer_budget_score = self._split_score_payload(current_scores)
                         if current_score is not None: # pruning happened
                             scores.append(current_score)
@@ -597,7 +657,7 @@ class Aggregator(nn.Module):
                 device=self.last_layer_budget_value_norms.device,
                 dtype=self.last_layer_budget_value_norms.dtype,
             )
-            if layer_budget_strategy == "value_weighted_leverage_pr":
+            if layer_budget_strategy in VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES:
                 self.last_layer_budget_scores = self._combine_value_weighted_layer_scores(
                     self.last_layer_budget_base_scores,
                     self.last_layer_budget_value_norms,
@@ -621,7 +681,7 @@ class Aggregator(nn.Module):
                 device=self.last_layer_budget_value_norms.device,
                 dtype=self.last_layer_budget_value_norms.dtype,
             )
-            if layer_budget_strategy == "value_weighted_leverage_pr":
+            if layer_budget_strategy in VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES:
                 self.last_layer_budget_scores = self._combine_value_weighted_layer_scores(
                     self.last_layer_budget_base_scores,
                     self.last_layer_budget_value_norms,
@@ -709,7 +769,10 @@ class Aggregator(nn.Module):
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
+        leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
+        eviction_policy_layers: Optional[Set[int]] = None,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -717,21 +780,22 @@ class Aggregator(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
-        leverage_evictable_only: bool = False,
-        leverage_approx_method: str = "right_sketch",
-        leverage_left_sketch_dim: Optional[int] = 2048,
-        leverage_right_jl_dim: Optional[int] = 64,
-        leverage_ridge_lambda: float = 1e-3,
+        leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
+        leverage_similarity_granularity: str = "layer",
+        leverage_similarity_feature_projection: str = "raw",
+        leverage_eviction_risk_mode: str = "low_leverage",
+        leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
         leverage_dpp_quality_beta: float = 1.0,
         leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_feature_projection: str = "raw",
         leverage_dpp_recency_bonus: bool = False,
         leverage_dpp_recency_lambda: float = 0.2,
         leverage_dpp_recency_window: int = 5,
@@ -744,7 +808,8 @@ class Aggregator(nn.Module):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
-        layer_budget_debug: bool = False,
+        slots_per_direction: float = 4.0,
+        hybrid_beta: float = 0.5,
         eviction_protect_recent_frames: int = 0,
         eviction_protect_special_tokens: bool = False,
         eviction_protect_special_token_interval: int = 1,
@@ -758,6 +823,10 @@ class Aggregator(nn.Module):
         global_attn_debug: bool = False,
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
+        global_cache_history_anchor_special_tokens_only: bool = False,
+        history_anchor_frame_ids: Optional[List[int]] = None,
+        history_anchor_patch_topk_per_frame: int = 0,
+        history_anchor_max_frames: int = 0,
     ):
         intermediates = []
 
@@ -774,7 +843,7 @@ class Aggregator(nn.Module):
                         past_key_values_block = past_key_values[current_global_idx]
                         kv_read = True
                     before_cache_shape = _cache_shape(past_key_values_block)
-                    tokens, global_idx, block_intermediates, new_kv, current_scores = self._process_global_attention(
+                    tokens, global_idx, block_intermediates, new_kv, current_scores, special_kv_sidecar = self._process_global_attention(
                         tokens,
                         B,
                         S,
@@ -789,7 +858,10 @@ class Aggregator(nn.Module):
                         cache_analysis_config=cache_analysis_config,
                         pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                         eviction_nn_analysis_config=eviction_nn_analysis_config,
+                        leverage_score_histogram_config=leverage_score_histogram_config,
+                        token_overlay_dump_config=token_overlay_dump_config,
                         eviction_policy=eviction_policy,
+                        eviction_policy_layers=eviction_policy_layers,
                         eviction_debug=eviction_debug,
                         leverage_sketch_dim=leverage_sketch_dim,
                         leverage_granularity=leverage_granularity,
@@ -797,21 +869,22 @@ class Aggregator(nn.Module):
                         leverage_projection=leverage_projection,
                         leverage_head_mean_dim=leverage_head_mean_dim,
                         leverage_normalize_rows=leverage_normalize_rows,
-                        leverage_evictable_only=leverage_evictable_only,
-                        leverage_approx_method=leverage_approx_method,
-                        leverage_left_sketch_dim=leverage_left_sketch_dim,
-                        leverage_right_jl_dim=leverage_right_jl_dim,
-                        leverage_ridge_lambda=leverage_ridge_lambda,
+                        leverage_approx_method=leverage_approx_method,                        leverage_ridge_lambda=leverage_ridge_lambda,
                         leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
                         leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                         leverage_ridge_jitter=leverage_ridge_jitter,
                         leverage_ridge_dim=leverage_ridge_dim,
                         leverage_random_seed=leverage_random_seed,
                         leverage_eviction_selector=leverage_eviction_selector,
+                        leverage_similarity_granularity=leverage_similarity_granularity,
+                leverage_similarity_feature_projection=leverage_similarity_feature_projection,
+leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                        leverage_high_outlier_z=leverage_high_outlier_z,
                         leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                         leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
                         leverage_dpp_quality_beta=leverage_dpp_quality_beta,
                         leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
+                        leverage_dpp_feature_projection=leverage_dpp_feature_projection,
                         leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
                         leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
                         leverage_dpp_recency_window=leverage_dpp_recency_window,
@@ -822,6 +895,8 @@ class Aggregator(nn.Module):
                         layer_budget_value_norm_type=layer_budget_value_norm_type,
                         layer_budget_norm_source=layer_budget_norm_source,
                         layer_budget_eps=layer_budget_eps,
+                        slots_per_direction=slots_per_direction,
+                        hybrid_beta=hybrid_beta,
                         eviction_protect_recent_frames=eviction_protect_recent_frames,
                         eviction_protect_special_tokens=eviction_protect_special_tokens,
                         eviction_protect_special_token_interval=eviction_protect_special_token_interval,
@@ -835,9 +910,14 @@ class Aggregator(nn.Module):
                         block_count=1,
                         cache_write_current_frame=cache_write_current_frame,
                         cache_evict_current_frame=cache_evict_current_frame,
+                        global_cache_history_anchor_special_tokens_only=global_cache_history_anchor_special_tokens_only,
+                        history_anchor_frame_ids=history_anchor_frame_ids,
+                        history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
+                        history_anchor_max_frames=history_anchor_max_frames,
                     )
                     kv_write = cache_write_current_frame
                     past_key_values[current_global_idx] = new_kv
+                    self.last_global_special_kv_sidecars[current_global_idx] = special_kv_sidecar
                     if cache_write_current_frame:
                         self._assert_enabled_cache_compatible(before_cache_shape, new_kv, current_global_idx)
                     current_score, current_layer_budget_score = self._split_score_payload(current_scores)
@@ -934,7 +1014,10 @@ class Aggregator(nn.Module):
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
+        leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
+        eviction_policy_layers: Optional[Set[int]] = None,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -942,21 +1025,22 @@ class Aggregator(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
-        leverage_evictable_only: bool = False,
-        leverage_approx_method: str = "right_sketch",
-        leverage_left_sketch_dim: Optional[int] = 2048,
-        leverage_right_jl_dim: Optional[int] = 64,
-        leverage_ridge_lambda: float = 1e-3,
+        leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
+        leverage_similarity_granularity: str = "layer",
+        leverage_similarity_feature_projection: str = "raw",
+        leverage_eviction_risk_mode: str = "low_leverage",
+        leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
         leverage_dpp_quality_beta: float = 1.0,
         leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_feature_projection: str = "raw",
         leverage_dpp_recency_bonus: bool = False,
         leverage_dpp_recency_lambda: float = 0.2,
         leverage_dpp_recency_window: int = 5,
@@ -969,7 +1053,8 @@ class Aggregator(nn.Module):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
-        layer_budget_debug: bool = False,
+        slots_per_direction: float = 4.0,
+        hybrid_beta: float = 0.5,
         eviction_protect_recent_frames: int = 0,
         eviction_protect_special_tokens: bool = False,
         eviction_protect_special_token_interval: int = 1,
@@ -983,6 +1068,10 @@ class Aggregator(nn.Module):
         block_count: Optional[int] = None,
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
+        global_cache_history_anchor_special_tokens_only: bool = False,
+        history_anchor_frame_ids: Optional[List[int]] = None,
+        history_anchor_patch_topk_per_frame: int = 0,
+        history_anchor_max_frames: int = 0,
     ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
@@ -1010,7 +1099,8 @@ class Aggregator(nn.Module):
             
             scores = None
             if use_cache:
-                tokens, block_kv, scores = self.global_blocks[global_idx](
+                special_kv_sidecar = None
+                block_result = self.global_blocks[global_idx](
                     tokens, 
                     pos=pos, 
                     attn_mask=attn_mask, 
@@ -1020,10 +1110,13 @@ class Aggregator(nn.Module):
                     cache_analysis_config=cache_analysis_config,
                     pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                     eviction_nn_analysis_config=eviction_nn_analysis_config,
+                    leverage_score_histogram_config=leverage_score_histogram_config,
+                    token_overlay_dump_config=token_overlay_dump_config,
                     layer_id=global_idx,
                     step_idx=past_frame_idx,
                     tokens_per_frame=P,
                     eviction_policy=eviction_policy,
+                    eviction_policy_layers=eviction_policy_layers,
                     eviction_debug=eviction_debug,
                     leverage_sketch_dim=leverage_sketch_dim,
                     leverage_granularity=leverage_granularity,
@@ -1031,21 +1124,22 @@ class Aggregator(nn.Module):
                     leverage_projection=leverage_projection,
                     leverage_head_mean_dim=leverage_head_mean_dim,
                     leverage_normalize_rows=leverage_normalize_rows,
-                    leverage_evictable_only=leverage_evictable_only,
-                    leverage_approx_method=leverage_approx_method,
-                    leverage_left_sketch_dim=leverage_left_sketch_dim,
-                    leverage_right_jl_dim=leverage_right_jl_dim,
-                    leverage_ridge_lambda=leverage_ridge_lambda,
+                    leverage_approx_method=leverage_approx_method,                    leverage_ridge_lambda=leverage_ridge_lambda,
                     leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
                     leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                     leverage_ridge_jitter=leverage_ridge_jitter,
                     leverage_ridge_dim=leverage_ridge_dim,
                     leverage_random_seed=leverage_random_seed,
                     leverage_eviction_selector=leverage_eviction_selector,
+                    leverage_similarity_granularity=leverage_similarity_granularity,
+                leverage_similarity_feature_projection=leverage_similarity_feature_projection,
+leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                    leverage_high_outlier_z=leverage_high_outlier_z,
                     leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                     leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
                     leverage_dpp_quality_beta=leverage_dpp_quality_beta,
                     leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
+                    leverage_dpp_feature_projection=leverage_dpp_feature_projection,
                     leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
                     leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
                     leverage_dpp_recency_window=leverage_dpp_recency_window,
@@ -1056,6 +1150,8 @@ class Aggregator(nn.Module):
                     layer_budget_value_norm_type=layer_budget_value_norm_type,
                     layer_budget_norm_source=layer_budget_norm_source,
                     layer_budget_eps=layer_budget_eps,
+                    slots_per_direction=slots_per_direction,
+                    hybrid_beta=hybrid_beta,
                     eviction_protect_recent_frames=eviction_protect_recent_frames,
                     eviction_protect_special_tokens=eviction_protect_special_tokens,
                     eviction_protect_special_token_interval=eviction_protect_special_token_interval,
@@ -1069,7 +1165,15 @@ class Aggregator(nn.Module):
                     voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                     cache_write_current_frame=cache_write_current_frame,
                     cache_evict_current_frame=cache_evict_current_frame,
+                    global_cache_history_anchor_special_tokens_only=global_cache_history_anchor_special_tokens_only,
+                    history_anchor_frame_ids=history_anchor_frame_ids,
+                    history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
+                    history_anchor_max_frames=history_anchor_max_frames,
                 )
+                if len(block_result) == 4:
+                    tokens, block_kv, scores, special_kv_sidecar = block_result
+                else:
+                    tokens, block_kv, scores = block_result
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
 
@@ -1079,7 +1183,7 @@ class Aggregator(nn.Module):
             # if self.use_causal_global:
             #     del attn_mask
         if use_cache:
-            return tokens, global_idx, intermediates, block_kv, scores
+            return tokens, global_idx, intermediates, block_kv, scores, special_kv_sidecar
         return tokens, global_idx, intermediates
 
     def _normalize_global_attn_idx_ranges(self, ranges):
@@ -1156,6 +1260,92 @@ class Aggregator(nn.Module):
             )
         
 
+    def sync_anchor_special_tokens_from_sidecars(
+        self,
+        past_key_values,
+        special_kv_sidecars,
+        anchor_token_count: int,
+        tokens_per_frame: int,
+        is_fifo: bool = False,
+        global_anchor_token_count: Optional[int] = None,
+    ):
+        if past_key_values is None or special_kv_sidecars is None or anchor_token_count is None:
+            return past_key_values
+        anchor_token_count = int(anchor_token_count)
+        tokens_per_frame = int(tokens_per_frame)
+        global_anchor_token_count = (
+            tokens_per_frame
+            if global_anchor_token_count is None
+            else min(max(int(global_anchor_token_count), 0), tokens_per_frame)
+        )
+        if anchor_token_count <= global_anchor_token_count or tokens_per_frame <= 0:
+            return past_key_values
+
+        for idx in range(min(self.depth, len(past_key_values), len(special_kv_sidecars))):
+            layer_kv = past_key_values[idx]
+            sidecar = special_kv_sidecars[idx]
+            if layer_kv is None or sidecar is None:
+                continue
+            if len(layer_kv) == 3:
+                k, v, metadata = layer_kv
+            else:
+                k, v = layer_kv
+                metadata = None
+            side_k, side_v = sidecar[:2]
+            side_metadata = sidecar[2] if len(sidecar) == 3 else None
+            chunk = int(side_k.shape[2])
+            if chunk <= 0:
+                continue
+            B, H, N, D = k.shape
+            if side_k.shape[:2] != (B, H) or side_v.shape[:2] != (B, H):
+                continue
+
+            global_anchor_end = min(global_anchor_token_count, N)
+            if is_fifo:
+                remove_start = global_anchor_end
+                remove_end = min(global_anchor_end + chunk, anchor_token_count, N)
+                if remove_end <= remove_start:
+                    continue
+                k_parts = [k[:, :, :remove_start, :], k[:, :, remove_end:anchor_token_count, :], side_k, k[:, :, anchor_token_count:, :]]
+                v_parts = [v[:, :, :remove_start, :], v[:, :, remove_end:anchor_token_count, :], side_v, v[:, :, anchor_token_count:, :]]
+                metadata_part_specs = [(0, remove_start), (remove_end, min(anchor_token_count, N)), None, (anchor_token_count, N)]
+            else:
+                insert_pos = max(anchor_token_count - chunk, global_anchor_end)
+                insert_pos = min(insert_pos, N)
+                k_parts = [k[:, :, :insert_pos, :], side_k, k[:, :, insert_pos:, :]]
+                v_parts = [v[:, :, :insert_pos, :], side_v, v[:, :, insert_pos:, :]]
+                metadata_part_specs = [(0, insert_pos), None, (insert_pos, N)]
+
+            k_new = torch.cat(k_parts, dim=2)
+            v_new = torch.cat(v_parts, dim=2)
+            if metadata is not None and side_metadata is not None:
+                meta_parts = []
+                for spec in metadata_part_specs:
+                    if spec is None:
+                        meta_parts.append(side_metadata)
+                        continue
+                    start, end = spec
+                    if end > start:
+                        meta_parts.append(Aggregator._metadata_slice(metadata, start, end))
+                if not meta_parts:
+                    past_key_values[idx] = (k_new, v_new, metadata)
+                    continue
+                merged_metadata = meta_parts[0]
+                for part in meta_parts[1:]:
+                    merged_metadata = merged_metadata.concat(part)
+                past_key_values[idx] = (k_new, v_new, merged_metadata)
+            else:
+                past_key_values[idx] = (k_new, v_new)
+        return past_key_values
+
+
+    def _metadata_slice(metadata, start: int, end: int):
+        B, H, _ = metadata.frame_ids.shape
+        indices = torch.arange(int(start), int(end), dtype=torch.long).view(1, 1, -1)
+        indices = indices.expand(B, H, -1)
+        return metadata.gather(indices)
+
+
     def sync_anchor_change(
         self,
         past_key_values,
@@ -1164,6 +1354,7 @@ class Aggregator(nn.Module):
         anchor_keep_ratio: float,
         anchor_token_indices: Optional[torch.Tensor] = None,
         is_fifo: bool = False,
+        global_anchor_token_count: Optional[int] = None,
     ):
         """Promote newest-frame tokens into the protected anchor zone."""
         if past_key_values is None or anchor_token_count is None:
@@ -1171,7 +1362,12 @@ class Aggregator(nn.Module):
 
         anchor_token_count = int(anchor_token_count)
         tokens_per_frame = int(tokens_per_frame)
-        if tokens_per_frame <= 0 or anchor_token_count <= tokens_per_frame:
+        global_anchor_token_count = (
+            tokens_per_frame
+            if global_anchor_token_count is None
+            else min(max(int(global_anchor_token_count), 0), tokens_per_frame)
+        )
+        if tokens_per_frame <= 0 or anchor_token_count <= global_anchor_token_count:
             return past_key_values
 
         if anchor_token_indices is not None:
@@ -1182,7 +1378,7 @@ class Aggregator(nn.Module):
         if anchor_chunk <= 0:
             return past_key_values
 
-        global_anchor_end = tokens_per_frame
+        global_anchor_end = global_anchor_token_count
 
         for idx in range(self.depth):
             if past_key_values[idx] is None:
@@ -1299,7 +1495,7 @@ class Aggregator(nn.Module):
                 float(torch.as_tensor(fallback_value_norm).detach().float().item()),
             )
         payload = torch.as_tensor(layer_budget_payload).detach().float().reshape(-1)
-        if strategy == "value_weighted_leverage_pr" and payload.numel() >= 2:
+        if strategy in VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES and payload.numel() >= 2:
             base_value = float(torch.nan_to_num(payload[0], nan=0.0, posinf=0.0, neginf=0.0).item())
             value_norm = float(torch.nan_to_num(payload[1], nan=0.0, posinf=0.0, neginf=0.0).item())
             return base_value, base_value, value_norm
@@ -1343,26 +1539,6 @@ class Aggregator(nn.Module):
                 past_tokens = 0 if shape is None else int(shape[2])
             capacities[idx] = past_tokens + current_token_count
         return capacities
-
-    def _print_layer_budget_debug(self, strategy, total_budget, alpha, min_tokens, capacities, budgets, details):
-        active_layers = [layer for layer, cap in capacities.items() if cap > 0]
-        print(
-            f"[LayerBudget/{strategy}] "
-            f"total_budget={int(total_budget)} "
-            f"assigned_budget={details.get('assigned_budget', sum(budgets.values()))} "
-            f"active_layers={len(active_layers)} alpha={alpha} min_tokens={min_tokens}"
-        )
-        for event in details.get("events", []):
-            print(f"[LayerBudget/{strategy}] {event}")
-        for layer in active_layers:
-            print(
-                f"[LayerBudget/{strategy}] "
-                f"layer={layer:02d} N={capacities[layer]} "
-                f"score={details.get('scores', {}).get(layer, 0.0):.6g} "
-                f"weight={details.get('weights', {}).get(layer, 0.0):.6g} "
-                f"raw_budget={details.get('raw_budgets', {}).get(layer, 0.0):.3f} "
-                f"final_budget={budgets.get(layer, 0)}"
-            )
 
     def _append_layer_budget_log(
         self,
@@ -1411,7 +1587,8 @@ class Aggregator(nn.Module):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
-        layer_budget_debug: bool = False,
+        slots_per_direction: float = 4.0,
+        hybrid_beta: float = 0.5,
         layer_budget_log_path: Optional[str] = None,
         layer_budget_step_idx: int = 0,
         past_key_values=None,
@@ -1461,7 +1638,7 @@ class Aggregator(nn.Module):
                 active_layer_scores = self.layer_budget_proportions
                 allocation_alpha = 1.0
                 allocation_min_tokens = 0
-            elif layer_budget_strategy == "value_weighted_leverage_pr":
+            elif layer_budget_strategy in VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES:
                 active_layer_scores = self._combine_value_weighted_layer_scores(
                     self.last_layer_budget_base_scores,
                     self.last_layer_budget_value_norms,
@@ -1491,16 +1668,6 @@ class Aggregator(nn.Module):
             budgets = torch.zeros_like(self.last_scores, dtype=torch.int32)
             for idx, budget in budget_dict.items():
                 budgets[idx] = int(budget)
-            if layer_budget_debug:
-                self._print_layer_budget_debug(
-                    layer_budget_strategy,
-                    total_budget,
-                    allocation_alpha,
-                    allocation_min_tokens,
-                    capacities,
-                    budget_dict,
-                    details,
-                )
             self._append_layer_budget_log(
                 layer_budget_log_path,
                 layer_budget_step_idx,

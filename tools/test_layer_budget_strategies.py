@@ -10,7 +10,9 @@ from compute_cosine_layer_budget import compute_cosine_similarity, cosine_to_pro
 from streamvggt.layers.eviction import (
     EvictionManager,
     _allocate_layer_budgets_from_scores,
+    _combine_layer_budget_pr_base,
     _combine_value_weighted_leverage_pr_scores,
+    _covariance_participation_ratio,
     _layer_score_leverage_entropy,
     _layer_score_leverage_pr,
     _layer_value_norm_score,
@@ -118,6 +120,79 @@ def test_cosine_helpers():
     assert torch.allclose(proportions.sum(), torch.tensor(1.0))
     assert importance[1] > importance[0]
 
+
+
+
+def test_covariance_pr_rank_and_scale_properties():
+    rank1 = torch.diag(torch.tensor([10.0, 0.0, 0.0, 0.0]))
+    assert torch.allclose(_covariance_participation_ratio(rank1), torch.tensor(1.0))
+
+    four_equal = torch.diag(torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 0.0]))
+    assert torch.allclose(_covariance_participation_ratio(four_equal), torch.tensor(4.0))
+    assert torch.allclose(
+        _covariance_participation_ratio(four_equal),
+        _covariance_participation_ratio(10.0 * four_equal),
+    )
+
+    zero = torch.zeros(4, 4)
+    zero_pr = _covariance_participation_ratio(zero)
+    assert torch.isfinite(zero_pr)
+    assert zero_pr.item() == 0.0
+
+
+def test_hybrid_budget_pr_base_helpers():
+    leverage_pr = torch.tensor(100.0)
+    covariance_pr = torch.tensor(10.0)
+    cap = _combine_layer_budget_pr_base(
+        leverage_pr,
+        covariance_pr,
+        "hybrid_cap",
+        slots_per_direction=4.0,
+        hybrid_beta=0.5,
+        eps=1e-12,
+    )
+    assert torch.allclose(cap, torch.tensor(40.0))
+
+    geom = _combine_layer_budget_pr_base(
+        leverage_pr,
+        covariance_pr,
+        "hybrid_geom",
+        slots_per_direction=4.0,
+        hybrid_beta=0.5,
+        eps=1e-12,
+    )
+    assert torch.allclose(geom, torch.sqrt(torch.tensor(100.0 * 40.0)))
+
+
+def test_ridge_layer_budget_reuses_raw_gram_for_covariance_pr():
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_approx_method="full_d_ridge",
+        layer_budget_strategy="covariance_pr",
+        slots_per_direction=4.0,
+    )
+    candidate_k = torch.zeros(1, 1, 4, 4)
+    candidate_k[0, 0, :, :] = torch.eye(4)
+    scores = manager._layer_svd_leverage_scores(candidate_k)
+    assert scores.shape == (1, 4)
+    assert manager._last_layer_covariance_pr is not None
+    assert torch.allclose(manager._last_layer_covariance_pr.reshape(()), torch.tensor(4.0), atol=1e-5)
+    payload = manager._compute_layer_budget_score(scores, candidate_k=candidate_k)
+    assert torch.allclose(payload, torch.tensor(16.0), atol=1e-5)
+
+
+def test_new_layer_budget_strategies_are_validated():
+    strategies = (
+        "covariance_pr",
+        "hybrid_cap",
+        "hybrid_geom",
+        "value_weighted_covariance_pr",
+        "value_weighted_hybrid_cap",
+        "value_weighted_hybrid_geom",
+    )
+    for strategy in strategies:
+        EvictionManager(policy="svd_leverage", leverage_granularity="layer", layer_budget_strategy=strategy)
 
 def test_value_norm_helper_mean_and_rms():
     values = torch.tensor([[3.0, 4.0], [0.0, 12.0]])
@@ -305,6 +380,10 @@ if __name__ == "__main__":
     test_cosine_precomputed_is_independent_of_leverage_mode()
     test_cosine_precomputed_capacity_aware_allocation()
     test_cosine_helpers()
+    test_covariance_pr_rank_and_scale_properties()
+    test_hybrid_budget_pr_base_helpers()
+    test_ridge_layer_budget_reuses_raw_gram_for_covariance_pr()
+    test_new_layer_budget_strategies_are_validated()
     test_value_norm_helper_mean_and_rms()
     test_value_norm_helper_empty_and_nonfinite_are_safe()
     test_value_weighted_gamma_zero_matches_pr()

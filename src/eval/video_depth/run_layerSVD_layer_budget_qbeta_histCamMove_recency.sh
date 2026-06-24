@@ -17,15 +17,10 @@ layer_budget_eps=1e-12
 layer_budget_value_gamma=0.7
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
-layer_budget_debug=false
 layer_budget_log_scores=true
 total_budget=200000
 kf_interval=1
 evict_interval=1
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 layer_budget_proportions_args=()
 if [ "$layer_budget_strategy" = cosine_precomputed ]; then
     if [ -z "$layer_budget_proportions_path" ]; then
@@ -106,7 +101,6 @@ for data in "${datasets[@]}"; do
         --evict_interval "$evict_interval" \
         --leverage_dpp_diversity_beta "$leverage_dpp_diversity_beta" \
         --eviction_protect_recent_frames "$eviction_protect_recent_frames" \
-        --leverage_evictable_only   \
         --history_anchor_strategy "$history_anchor_strategy" \
         --camera_motion_threshold "$camera_motion_threshold" \
         --max_anchors "$max_anchors" \
@@ -115,7 +109,6 @@ for data in "${datasets[@]}"; do
         --leverage_dpp_recency_lambda "$leverage_dpp_recency_lambda" \
         --leverage_dpp_recency_window "$leverage_dpp_recency_window" \
         --leverage_dpp_recency_gate_power "$leverage_dpp_recency_gate_power" \
-        "${layer_budget_debug_args[@]}" \
         "${layer_budget_log_args[@]}"
     python ../src/eval/video_depth/eval_depth.py \
         --output_dir "$output_dir" \
@@ -123,5 +116,5 @@ for data in "${datasets[@]}"; do
         --align "scale"
 done
 
-        # --eviction_protect_special_tokens \
+        # --eviction_protect_special_tokens
         # --eviction_protect_special_token_interval "$special_token_interval" \

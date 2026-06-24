@@ -15,30 +15,100 @@ VALID_LAYER_BUDGET_STRATEGIES = (
     "uniform",
     "cosine_precomputed",
     "leverage_pr",
+    "covariance_pr",
+    "hybrid_cap",
+    "hybrid_geom",
     "leverage_entropy",
     "value_weighted_leverage_pr",
+    "value_weighted_covariance_pr",
+    "value_weighted_hybrid_cap",
+    "value_weighted_hybrid_geom",
 )
 
 
 LAYER_BUDGET_SCORE_STRATEGIES = (
     "leverage_pr",
+    "covariance_pr",
+    "hybrid_cap",
+    "hybrid_geom",
     "leverage_entropy",
     "value_weighted_leverage_pr",
+    "value_weighted_covariance_pr",
+    "value_weighted_hybrid_cap",
+    "value_weighted_hybrid_geom",
 )
+
+
+VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES = (
+    "value_weighted_leverage_pr",
+    "value_weighted_covariance_pr",
+    "value_weighted_hybrid_cap",
+    "value_weighted_hybrid_geom",
+)
+
+
+COVARIANCE_LAYER_BUDGET_STRATEGIES = (
+    "covariance_pr",
+    "hybrid_cap",
+    "hybrid_geom",
+    "value_weighted_covariance_pr",
+    "value_weighted_hybrid_cap",
+    "value_weighted_hybrid_geom",
+)
+
+
+def _participation_ratio_from_values(values: Optional[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
+    if values is None or values.numel() == 0:
+        device = values.device if values is not None else "cpu"
+        return torch.tensor(0.0, device=device)
+    values = values.float()
+    values = torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    values = torch.clamp(values, min=0.0)
+    sum_values = values.sum(dim=-1)
+    sum_squares = values.square().sum(dim=-1)
+    pr = sum_values.square() / sum_squares.clamp_min(eps)
+    return torch.where(sum_values > eps, pr, torch.zeros_like(pr))
+
+
+def _covariance_participation_ratio(covariance: Optional[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
+    if covariance is None or covariance.numel() == 0:
+        device = covariance.device if covariance is not None else "cpu"
+        return torch.tensor(0.0, device=device)
+    covariance = torch.nan_to_num(covariance.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    trace = torch.diagonal(covariance, dim1=-2, dim2=-1).sum(dim=-1)
+    frob2 = covariance.square().sum(dim=(-2, -1))
+    pr = trace.square() / frob2.clamp_min(eps)
+    return torch.where(trace.abs() > eps, pr, torch.zeros_like(pr))
 
 
 def _layer_score_leverage_pr(lev: Optional[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
     """Effective count from the participation ratio of QR leverage mass."""
-    if lev is None or lev.numel() == 0:
-        device = lev.device if lev is not None else "cpu"
-        return torch.tensor(0.0, device=device)
-    lev = lev.float()
-    lev = torch.nan_to_num(lev, nan=0.0, posinf=0.0, neginf=0.0)
-    lev = torch.clamp(lev, min=0.0)
-    sum_lev = lev.sum()
-    if sum_lev <= eps:
-        return torch.zeros((), device=lev.device, dtype=lev.dtype)
-    return sum_lev.square() / lev.square().sum().clamp_min(eps)
+    return _participation_ratio_from_values(lev, eps)
+
+
+def _combine_layer_budget_pr_base(
+    leverage_pr: torch.Tensor,
+    covariance_pr: Optional[torch.Tensor],
+    strategy: str,
+    slots_per_direction: float,
+    hybrid_beta: float,
+    eps: float,
+) -> torch.Tensor:
+    if strategy in ("leverage_pr", "value_weighted_leverage_pr"):
+        return leverage_pr
+    if covariance_pr is None:
+        raise ValueError(f"{strategy} requires covariance participation ratio from layer features")
+    covariance_pr = torch.as_tensor(covariance_pr, device=leverage_pr.device, dtype=leverage_pr.dtype)
+    direction_base = covariance_pr.clamp_min(0.0) * float(slots_per_direction)
+    if strategy in ("covariance_pr", "value_weighted_covariance_pr"):
+        return direction_base
+    if strategy in ("hybrid_cap", "value_weighted_hybrid_cap"):
+        return torch.minimum(leverage_pr, direction_base)
+    if strategy in ("hybrid_geom", "value_weighted_hybrid_geom"):
+        lev_base = leverage_pr.clamp_min(eps)
+        dir_base = direction_base.clamp_min(eps)
+        return lev_base.pow(float(hybrid_beta)) * dir_base.pow(1.0 - float(hybrid_beta))
+    raise AssertionError(f"Unhandled layer budget strategy: {strategy}")
 
 
 def _layer_score_leverage_entropy(lev: Optional[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
@@ -328,14 +398,16 @@ class EvictionManager:
     """Dispatches head-wise cache eviction policies."""
 
     VALID_POLICIES = ("mean", "baseline_mean", "svd_leverage", "dpp")
+    VALID_LEVERAGE_EVICTION_RISK_MODES = ("low_leverage", "outlier_then_low")
+    VALID_LEVERAGE_DPP_FEATURE_PROJECTIONS = ("raw", "random")
+    VALID_LEVERAGE_SIMILARITY_FEATURE_PROJECTIONS = ("raw", "random")
+    VALID_LEVERAGE_SIMILARITY_GRANULARITIES = ("layer", "head")
     VALID_LEVERAGE_APPROX_METHODS = (
         "exact_qr",
-        "right_sketch",
-        "drineas_srht",
-        "full_d_ridge",
+        "right_sketch",        "full_d_ridge",
         "right_sketch_ridge",
     )
-    VALID_LEVERAGE_EVICTION_SELECTORS = ("topk", "fast_dpp", "layer_head_fast_dpp")
+    VALID_LEVERAGE_EVICTION_SELECTORS = ("topk", "fast_dpp", "layer_head_fast_dpp", "similarity_topk")
 
     def __init__(
         self,
@@ -347,10 +419,7 @@ class EvictionManager:
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
-        leverage_evictable_only: bool = False,
         leverage_approx_method: str = "right_sketch",
-        leverage_left_sketch_dim: Optional[int] = 2048,
-        leverage_right_jl_dim: Optional[int] = 64,
         leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
@@ -358,10 +427,15 @@ class EvictionManager:
         leverage_ridge_dim: Optional[int] = None,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
+        leverage_similarity_granularity: str = "layer",
+        leverage_similarity_feature_projection: str = "raw",
+        leverage_eviction_risk_mode: str = "low_leverage",
+        leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
         leverage_dpp_quality_beta: float = 1.0,
         leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_feature_projection: str = "raw",
         leverage_dpp_recency_bonus: bool = False,
         leverage_dpp_recency_lambda: float = 0.2,
         leverage_dpp_recency_window: int = 5,
@@ -372,6 +446,8 @@ class EvictionManager:
         layer_budget_value_norm_type: str = "rms",
         layer_budget_norm_source: str = "value",
         layer_budget_eps: float = 1e-12,
+        slots_per_direction: float = 4.0,
+        hybrid_beta: float = 0.5,
     ) -> None:
         if policy not in self.VALID_POLICIES:
             raise ValueError(f"Unknown eviction policy '{policy}'. Valid policies: {self.VALID_POLICIES}")
@@ -402,6 +478,29 @@ class EvictionManager:
                 "leverage_eviction_selector must be one of "
                 f"{self.VALID_LEVERAGE_EVICTION_SELECTORS}, got {leverage_eviction_selector!r}"
             )
+        if leverage_eviction_risk_mode not in self.VALID_LEVERAGE_EVICTION_RISK_MODES:
+            raise ValueError(
+                "leverage_eviction_risk_mode must be one of "
+                f"{self.VALID_LEVERAGE_EVICTION_RISK_MODES}, got {leverage_eviction_risk_mode!r}"
+            )
+        if leverage_dpp_feature_projection not in self.VALID_LEVERAGE_DPP_FEATURE_PROJECTIONS:
+            raise ValueError(
+                "leverage_dpp_feature_projection must be one of "
+                f"{self.VALID_LEVERAGE_DPP_FEATURE_PROJECTIONS}, got {leverage_dpp_feature_projection!r}"
+            )
+        if leverage_similarity_granularity not in self.VALID_LEVERAGE_SIMILARITY_GRANULARITIES:
+            raise ValueError(
+                "leverage_similarity_granularity must be one of "
+                f"{self.VALID_LEVERAGE_SIMILARITY_GRANULARITIES}, got {leverage_similarity_granularity!r}"
+            )
+        if leverage_similarity_feature_projection not in self.VALID_LEVERAGE_SIMILARITY_FEATURE_PROJECTIONS:
+            raise ValueError(
+                "leverage_similarity_feature_projection must be one of "
+                f"{self.VALID_LEVERAGE_SIMILARITY_FEATURE_PROJECTIONS}, "
+                f"got {leverage_similarity_feature_projection!r}"
+            )
+        if leverage_high_outlier_z < 0:
+            raise ValueError(f"leverage_high_outlier_z must be >= 0, got {leverage_high_outlier_z}")
         if leverage_eviction_selector == "layer_head_fast_dpp" and (
             policy != "svd_leverage" or leverage_granularity != "layer"
         ):
@@ -470,16 +569,10 @@ class EvictionManager:
             )
         if layer_budget_eps <= 0:
             raise ValueError(f"layer_budget_eps must be > 0, got {layer_budget_eps}")
-        if leverage_left_sketch_dim is not None and leverage_left_sketch_dim <= 0:
-            raise ValueError(
-                "leverage_left_sketch_dim must be > 0 or None, got "
-                f"{leverage_left_sketch_dim}"
-            )
-        if leverage_right_jl_dim is not None and leverage_right_jl_dim < 0:
-            raise ValueError(
-                "leverage_right_jl_dim must be >= 0 or None, got "
-                f"{leverage_right_jl_dim}"
-            )
+        if not math.isfinite(float(slots_per_direction)) or float(slots_per_direction) <= 0.0:
+            raise ValueError(f"slots_per_direction must be finite and > 0, got {slots_per_direction}")
+        if not math.isfinite(float(hybrid_beta)) or not (0.0 <= float(hybrid_beta) <= 1.0):
+            raise ValueError(f"hybrid_beta must be finite and in [0, 1], got {hybrid_beta}")
         if leverage_ridge_lambda < 0:
             raise ValueError(f"leverage_ridge_lambda must be >= 0, got {leverage_ridge_lambda}")
         if leverage_ridge_lambda_mode not in ("relative", "absolute"):
@@ -496,13 +589,18 @@ class EvictionManager:
             raise ValueError(f"leverage_ridge_jitter must be > 0, got {leverage_ridge_jitter}")
         if leverage_ridge_dim is not None and leverage_ridge_dim < 1:
             raise ValueError(f"leverage_ridge_dim must be >= 1 or None, got {leverage_ridge_dim}")
-        if leverage_approx_method == "right_sketch_ridge":
-            resolved_ridge_dim = leverage_ridge_dim if leverage_ridge_dim is not None else leverage_right_jl_dim
-            if resolved_ridge_dim is None or int(resolved_ridge_dim) < 1:
-                raise ValueError(
-                    "right_sketch_ridge requires leverage_ridge_dim >= 1 or "
-                    "leverage_right_jl_dim >= 1"
-                )
+        if leverage_approx_method == "right_sketch_ridge" and leverage_ridge_dim is None:
+            raise ValueError("right_sketch_ridge requires leverage_ridge_dim >= 1")
+        if leverage_dpp_feature_projection == "random" and leverage_ridge_dim is None:
+            raise ValueError("leverage_dpp_feature_projection='random' requires leverage_ridge_dim >= 1")
+        if (
+            leverage_similarity_feature_projection == "random"
+            and leverage_approx_method not in ("right_sketch", "right_sketch_ridge")
+        ):
+            raise ValueError(
+                "leverage_similarity_feature_projection='random' reuses projected leverage features "
+                "and requires leverage_approx_method='right_sketch' or 'right_sketch_ridge'"
+            )
         self.policy = policy
         self.debug = debug
         self.leverage_sketch_dim = leverage_sketch_dim
@@ -511,10 +609,7 @@ class EvictionManager:
         self.leverage_projection = leverage_projection
         self.leverage_head_mean_dim = int(leverage_head_mean_dim)
         self.leverage_normalize_rows = bool(leverage_normalize_rows)
-        self.leverage_evictable_only = bool(leverage_evictable_only)
         self.leverage_approx_method = leverage_approx_method
-        self.leverage_left_sketch_dim = leverage_left_sketch_dim
-        self.leverage_right_jl_dim = leverage_right_jl_dim
         self.leverage_ridge_lambda = float(leverage_ridge_lambda)
         self.leverage_ridge_lambda_mode = leverage_ridge_lambda_mode
         self.leverage_ridge_score_chunk_size = int(leverage_ridge_score_chunk_size)
@@ -522,10 +617,15 @@ class EvictionManager:
         self.leverage_ridge_dim = leverage_ridge_dim
         self.leverage_random_seed = int(leverage_random_seed)
         self.leverage_eviction_selector = leverage_eviction_selector
+        self.leverage_similarity_granularity = leverage_similarity_granularity
+        self.leverage_similarity_feature_projection = leverage_similarity_feature_projection
+        self.leverage_eviction_risk_mode = leverage_eviction_risk_mode
+        self.leverage_high_outlier_z = float(leverage_high_outlier_z)
         self.leverage_dpp_candidate_multiplier = int(leverage_dpp_candidate_multiplier)
         self.leverage_dpp_greedy_block_size = int(leverage_dpp_greedy_block_size)
         self.leverage_dpp_quality_beta = float(leverage_dpp_quality_beta)
         self.leverage_dpp_diversity_beta = float(leverage_dpp_diversity_beta)
+        self.leverage_dpp_feature_projection = leverage_dpp_feature_projection
         self.leverage_dpp_recency_bonus = bool(leverage_dpp_recency_bonus)
         self.leverage_dpp_recency_lambda = float(leverage_dpp_recency_lambda)
         self.leverage_dpp_recency_window = int(leverage_dpp_recency_window)
@@ -536,12 +636,17 @@ class EvictionManager:
         self.layer_budget_value_norm_type = layer_budget_value_norm_type
         self.layer_budget_norm_source = layer_budget_norm_source
         self.layer_budget_eps = float(layer_budget_eps)
+        self.slots_per_direction = float(slots_per_direction)
+        self.hybrid_beta = float(hybrid_beta)
         self.leverage_dpp_full_sim_max_elements = 4_000_000
         self._leverage_right_sketch_cache = {}
         self._leverage_left_srht_cache = {}
         self._last_leverage_profile: Dict[str, float] = {}
         self._last_layer_feature_shape: Optional[tuple[int, int]] = None
+        self._last_layer_covariance_pr: Optional[torch.Tensor] = None
         self._last_dpp_recency_debug: Dict[str, float] = {}
+        self._last_similarity_layer_features: Optional[torch.Tensor] = None
+        self._last_similarity_head_features: Optional[torch.Tensor] = None
 
     def select(
         self,
@@ -556,8 +661,13 @@ class EvictionManager:
         current_frame_idx: Optional[int] = None,
         protect_recent_frames: int = 0,
         candidate_frame_ids: Optional[torch.Tensor] = None,
+        candidate_token_indices: Optional[torch.Tensor] = None,
         candidate_evictable_mask: Optional[torch.Tensor] = None,
         need_leverage_basis: bool = False,
+        history_anchor_frame_ids=None,
+        history_anchor_patch_topk_per_frame: int = 0,
+        history_anchor_max_frames: int = 0,
+        special_token_count: int = 0,
     ) -> EvictionResult:
         """Select candidate-local indices to retain.
 
@@ -571,7 +681,7 @@ class EvictionManager:
             ``[B, H, K]``. ``K`` may exceed ``cache_budget - num_anchor_tokens``
             when token protection leaves too few evictable candidates.
         """
-        B, H, N, _ = k.shape
+        B, H, N, D = k.shape
         if protect_recent_frames < 0:
             raise ValueError(f"protect_recent_frames must be >= 0, got {protect_recent_frames}")
         num_candidates = N - num_anchor_tokens
@@ -588,11 +698,14 @@ class EvictionManager:
         self._last_leverage_profile = {}
         self._last_layer_feature_shape = None
         self._last_dpp_recency_debug = {}
+        self._last_similarity_layer_features = None
+        self._last_similarity_head_features = None
         need_mean_scores = self.policy in ("mean", "baseline_mean") or need_summary or self.debug
         mean_scores = self._mean_scores(candidate_k) if need_mean_scores else None
 
         leverage_basis = None
         layer_budget_score = None
+        raw_policy_scores = None
         if self.policy in ("mean", "baseline_mean"):
             policy_scores = mean_scores
             if protect_recent_frames > 0 or candidate_evictable_mask is not None:
@@ -611,22 +724,27 @@ class EvictionManager:
                 protection_debug = None
         elif self.policy == "svd_leverage":
             if self.leverage_granularity == "head":
-                if self.leverage_evictable_only and candidate_evictable_mask is not None:
-                    if need_leverage_basis:
-                        policy_scores, leverage_basis = self._evictable_head_svd_leverage_scores(
-                            candidate_k,
-                            candidate_evictable_mask,
-                            return_basis=True,
-                        )
-                    else:
-                        policy_scores = self._evictable_head_svd_leverage_scores(
-                            candidate_k,
-                            candidate_evictable_mask,
-                        )
-                elif need_leverage_basis:
+                if need_leverage_basis:
                     policy_scores, leverage_basis = self._svd_leverage_scores(candidate_k, return_basis=True)
                 else:
                     policy_scores = self._svd_leverage_scores(candidate_k)
+                raw_policy_scores = policy_scores
+                policy_scores = self._apply_recency_score_bonus(
+                    policy_scores,
+                    candidate_frame_ids,
+                    current_frame_idx,
+                    shared_across_heads=False,
+                )
+                candidate_evictable_mask = self._combine_history_anchor_patch_topk_mask(
+                    raw_policy_scores,
+                    candidate_frame_ids,
+                    candidate_token_indices,
+                    candidate_evictable_mask,
+                    history_anchor_frame_ids,
+                    history_anchor_patch_topk_per_frame,
+                    history_anchor_max_frames,
+                    special_token_count,
+                )
                 kept, protection_debug = self._select_svd_leverage_kept(
                     policy_scores,
                     candidate_k,
@@ -637,23 +755,10 @@ class EvictionManager:
                     protect_recent_frames,
                     candidate_evictable_mask,
                     shared_across_heads=False,
+                    raw_outlier_scores=raw_policy_scores,
                 )
             else:
-                if self.leverage_evictable_only and candidate_evictable_mask is not None:
-                    if need_leverage_basis:
-                        policy_scores, leverage_basis = self._evictable_layer_svd_leverage_scores(
-                            candidate_k,
-                            candidate_v,
-                            candidate_evictable_mask,
-                            return_basis=True,
-                        )
-                    else:
-                        policy_scores = self._evictable_layer_svd_leverage_scores(
-                            candidate_k,
-                            candidate_v,
-                            candidate_evictable_mask,
-                        )
-                elif need_leverage_basis:
+                if need_leverage_basis:
                     policy_scores, leverage_basis = self._layer_svd_leverage_scores(
                         candidate_k,
                         candidate_v,
@@ -661,7 +766,30 @@ class EvictionManager:
                     )
                 else:
                     policy_scores = self._layer_svd_leverage_scores(candidate_k, candidate_v)
-                layer_budget_score = self._compute_layer_budget_score(policy_scores, candidate_k, candidate_v)
+                raw_policy_scores = policy_scores
+                layer_budget_score = self._compute_layer_budget_score(raw_policy_scores, candidate_k, candidate_v)
+                candidate_evictable_mask = self._combine_history_anchor_patch_topk_mask(
+                    raw_policy_scores,
+                    candidate_frame_ids,
+                    candidate_token_indices,
+                    candidate_evictable_mask,
+                    history_anchor_frame_ids,
+                    history_anchor_patch_topk_per_frame,
+                    history_anchor_max_frames,
+                    special_token_count,
+                )
+                policy_scores = self._apply_recency_score_bonus(
+                    policy_scores,
+                    candidate_frame_ids,
+                    current_frame_idx,
+                    shared_across_heads=True,
+                )
+                if (
+                    self.leverage_eviction_selector == "layer_head_fast_dpp"
+                    and candidate_evictable_mask is not None
+                    and candidate_evictable_mask.ndim == 2
+                ):
+                    candidate_evictable_mask = candidate_evictable_mask.unsqueeze(1).expand(B, H, num_candidates)
                 if self.leverage_eviction_selector == "layer_head_fast_dpp":
                     kept, protection_debug = self._select_layer_scores_head_dpp_kept(
                         policy_scores,
@@ -672,6 +800,7 @@ class EvictionManager:
                         current_frame_idx,
                         protect_recent_frames,
                         candidate_evictable_mask,
+                        raw_outlier_scores=raw_policy_scores,
                     )
                 else:
                     kept, protection_debug = self._select_svd_leverage_kept(
@@ -685,6 +814,7 @@ class EvictionManager:
                         candidate_evictable_mask,
                         shared_across_heads=True,
                         num_heads=H,
+                        raw_outlier_scores=raw_policy_scores,
                     )
         elif self.policy == "dpp":
             if self.leverage_granularity == "head":
@@ -754,8 +884,6 @@ class EvictionManager:
                     f" layer_budget_strategy={self.layer_budget_strategy} "
                     f"leverage_approx_method={self.leverage_approx_method} "
                     f" leverage_sketch_dim={sketch_label} "
-                    f"leverage_left_sketch_dim={self.leverage_left_sketch_dim} "
-                    f"leverage_right_jl_dim={self.leverage_right_jl_dim} "
                     f"leverage_ridge_lambda={self.leverage_ridge_lambda} "
                     f"leverage_ridge_lambda_mode={self.leverage_ridge_lambda_mode} "
                     f"leverage_ridge_score_chunk_size={self.leverage_ridge_score_chunk_size} "
@@ -766,12 +894,14 @@ class EvictionManager:
                     f"leverage_projection={self.leverage_projection} "
                     f"leverage_head_mean_dim={self.leverage_head_mean_dim} "
                     f"leverage_normalize_rows={self.leverage_normalize_rows} "
-                    f"leverage_evictable_only={self.leverage_evictable_only} "
                     f"leverage_eviction_selector={self.leverage_eviction_selector} "
+                    f"leverage_similarity_granularity={self.leverage_similarity_granularity} "
+                    f"leverage_similarity_feature_projection={self.leverage_similarity_feature_projection} "
                     f"leverage_dpp_candidate_multiplier={self.leverage_dpp_candidate_multiplier} "
                     f"leverage_dpp_greedy_block_size={self.leverage_dpp_greedy_block_size} "
                     f"leverage_dpp_quality_beta={self.leverage_dpp_quality_beta} "
                     f"leverage_dpp_diversity_beta={self.leverage_dpp_diversity_beta} "
+                    f"leverage_dpp_feature_projection={self.leverage_dpp_feature_projection} "
                     f"leverage_dpp_recency_bonus={self.leverage_dpp_recency_bonus} "
                     f"leverage_dpp_recency_lambda={self.leverage_dpp_recency_lambda} "
                     f"leverage_dpp_recency_window={self.leverage_dpp_recency_window} "
@@ -779,6 +909,8 @@ class EvictionManager:
                     f"layer_budget_value_gamma={self.layer_budget_value_gamma} "
                     f"layer_budget_value_norm_type={self.layer_budget_value_norm_type} "
                     f"layer_budget_norm_source={self.layer_budget_norm_source} "
+                    f"slots_per_direction={self.slots_per_direction} "
+                    f"hybrid_beta={self.hybrid_beta} "
                     f"num_heads={H} num_tokens={num_candidates} head_dim={D} feature_dim={feature_dim}"
                 )
                 if self.policy == "dpp":
@@ -870,41 +1002,56 @@ class EvictionManager:
                 )
             layer_scores = []
             layer_value_norms = []
+            covariance_pr = self._last_layer_covariance_pr
+            if covariance_pr is not None:
+                covariance_pr = torch.as_tensor(covariance_pr, device=policy_scores.device).detach().float().reshape(-1)
             for batch_idx, batch_scores in enumerate(score_input):
-                if self.layer_budget_strategy == "leverage_pr":
-                    layer_scores.append(_layer_score_leverage_pr(batch_scores, self.layer_budget_eps))
-                elif self.layer_budget_strategy == "leverage_entropy":
+                if self.layer_budget_strategy == "leverage_entropy":
                     layer_scores.append(_layer_score_leverage_entropy(batch_scores, self.layer_budget_eps))
-                elif self.layer_budget_strategy == "value_weighted_leverage_pr":
-                    layer_scores.append(_layer_score_leverage_pr(batch_scores, self.layer_budget_eps))
-                    norm_source = candidate_v if self.layer_budget_norm_source == "value" else candidate_k
-                    if norm_source is None:
-                        layer_value_norms.append(
-                            torch.zeros((), device=policy_scores.device, dtype=torch.float32)
+                elif self.layer_budget_strategy in LAYER_BUDGET_SCORE_STRATEGIES:
+                    leverage_pr = _layer_score_leverage_pr(batch_scores, self.layer_budget_eps)
+                    batch_covariance_pr = None
+                    if covariance_pr is not None and covariance_pr.numel() > 0:
+                        batch_covariance_pr = covariance_pr[min(batch_idx, covariance_pr.numel() - 1)]
+                    layer_scores.append(
+                        _combine_layer_budget_pr_base(
+                            leverage_pr,
+                            batch_covariance_pr,
+                            self.layer_budget_strategy,
+                            self.slots_per_direction,
+                            self.hybrid_beta,
+                            self.layer_budget_eps,
                         )
-                    else:
-                        if norm_source.ndim != 4:
-                            raise ValueError(
-                                "Layer budget norm source requires tensor shaped [B, H, N, D], "
-                                f"got {tuple(norm_source.shape)}"
+                    )
+                    if self.layer_budget_strategy in VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES:
+                        norm_source = candidate_v if self.layer_budget_norm_source == "value" else candidate_k
+                        if norm_source is None:
+                            layer_value_norms.append(
+                                torch.zeros((), device=policy_scores.device, dtype=torch.float32)
                             )
-                        _, num_heads, num_tokens, head_dim = norm_source.shape
-                        norm_rows = (
-                            norm_source[batch_idx]
-                            .transpose(0, 1)
-                            .reshape(num_tokens, num_heads * head_dim)
-                        )
-                        layer_value_norms.append(
-                            _layer_value_norm_score(
-                                norm_rows,
-                                norm_type=self.layer_budget_value_norm_type,
-                                eps=self.layer_budget_eps,
+                        else:
+                            if norm_source.ndim != 4:
+                                raise ValueError(
+                                    "Layer budget norm source requires tensor shaped [B, H, N, D], "
+                                    f"got {tuple(norm_source.shape)}"
+                                )
+                            _, num_heads, num_tokens, head_dim = norm_source.shape
+                            norm_rows = (
+                                norm_source[batch_idx]
+                                .transpose(0, 1)
+                                .reshape(num_tokens, num_heads * head_dim)
                             )
-                        )
+                            layer_value_norms.append(
+                                _layer_value_norm_score(
+                                    norm_rows,
+                                    norm_type=self.layer_budget_value_norm_type,
+                                    eps=self.layer_budget_eps,
+                                )
+                            )
                 else:
                     raise AssertionError(f"Unhandled layer budget strategy: {self.layer_budget_strategy}")
             base_score = torch.stack(layer_scores).mean()
-            if self.layer_budget_strategy == "value_weighted_leverage_pr":
+            if self.layer_budget_strategy in VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES:
                 value_norm = torch.stack(layer_value_norms).mean()
                 return torch.stack([base_score, value_norm]).detach()
             return base_score.detach()
@@ -921,9 +1068,103 @@ class EvictionManager:
         return kept.sort(dim=-1).values
 
     @staticmethod
-    def _keep_highest_scores(scores: torch.Tensor, num_to_keep: int) -> torch.Tensor:
-        _, kept = torch.topk(scores, k=num_to_keep, dim=-1)
-        return kept.sort(dim=-1).values
+    def _robust_high_outlier_z_scores(scores: torch.Tensor) -> torch.Tensor:
+        clean = torch.nan_to_num(scores.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        clean = torch.clamp(clean, min=0.0)
+        center = clean.median(dim=-1, keepdim=True).values
+        abs_dev = (clean - center).abs()
+        mad = abs_dev.median(dim=-1, keepdim=True).values
+        scale = 1.4826 * mad
+        std = clean.std(dim=-1, keepdim=True, unbiased=False)
+        scale = torch.where(scale > 1e-12, scale, std)
+        valid_scale = torch.isfinite(scale) & (scale > 1e-12)
+        z_scores = torch.zeros_like(clean)
+        return torch.where(valid_scale, (clean - center) / scale.clamp_min(1e-12), z_scores)
+
+    @staticmethod
+    def _low_score_evicted_indices(
+        row_scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+    ) -> torch.Tensor:
+        if num_to_evict <= 0:
+            return torch.empty(0, device=row_scores.device, dtype=torch.long)
+        all_indices = torch.arange(row_scores.shape[-1], device=row_scores.device, dtype=torch.long)
+        evictable = all_indices[evictable_mask]
+        if evictable.numel() < num_to_evict:
+            raise ValueError(
+                f"Cannot evict {num_to_evict} tokens from only {int(evictable.numel())} evictable candidates"
+            )
+        clean_scores = torch.nan_to_num(row_scores.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        order = torch.argsort(clean_scores.index_select(0, evictable), stable=True)
+        return evictable.index_select(0, order[: int(num_to_evict)])
+
+    def _outlier_then_low_evicted_indices(
+        self,
+        row_scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+        low_eviction_fn,
+        *,
+        outlier_scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if num_to_evict <= 0:
+            return torch.empty(0, device=row_scores.device, dtype=torch.long)
+        outlier_source = row_scores if outlier_scores is None else outlier_scores
+        z_scores = self._robust_high_outlier_z_scores(outlier_source.unsqueeze(0)).squeeze(0)
+        all_indices = torch.arange(row_scores.shape[-1], device=row_scores.device, dtype=torch.long)
+        high_outlier_mask = evictable_mask & (z_scores > self.leverage_high_outlier_z)
+        high_outliers = all_indices[high_outlier_mask]
+        direct_count = min(int(num_to_evict), int(high_outliers.numel()))
+        if direct_count > 0:
+            high_order = torch.argsort(z_scores.index_select(0, high_outliers), descending=True, stable=True)
+            direct_evicted = high_outliers.index_select(0, high_order[:direct_count])
+        else:
+            direct_evicted = torch.empty(0, device=row_scores.device, dtype=torch.long)
+        remaining = int(num_to_evict) - int(direct_evicted.numel())
+        if remaining <= 0:
+            return direct_evicted
+        low_evictable = evictable_mask.clone()
+        if direct_evicted.numel() > 0:
+            low_evictable[direct_evicted] = False
+        low_evicted = low_eviction_fn(low_evictable, remaining)
+        return torch.cat([direct_evicted, low_evicted], dim=0)
+
+    def _keep_after_outlier_then_low_topk(
+        self,
+        scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+        raw_outlier_scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        leading_shape = scores.shape[:-1]
+        num_candidates = int(scores.shape[-1])
+        keep_count = num_candidates - int(num_to_evict)
+        all_indices = torch.arange(num_candidates, device=scores.device, dtype=torch.long)
+        if num_to_evict <= 0:
+            return all_indices.expand(*leading_shape, num_candidates)
+        flat_scores = scores.reshape(-1, num_candidates)
+        flat_mask = evictable_mask.reshape(-1, num_candidates)
+        flat_outlier_scores = (
+            raw_outlier_scores.reshape(-1, num_candidates)
+            if raw_outlier_scores is not None
+            else None
+        )
+        kept_rows = []
+        for row_idx in range(flat_scores.shape[0]):
+            evicted = self._outlier_then_low_evicted_indices(
+                flat_scores[row_idx],
+                flat_mask[row_idx],
+                int(num_to_evict),
+                lambda low_mask, remaining, row_idx=row_idx: self._low_score_evicted_indices(
+                    flat_scores[row_idx], low_mask, remaining
+                ),
+                outlier_scores=flat_outlier_scores[row_idx] if flat_outlier_scores is not None else None,
+            )
+            keep_mask = torch.ones(num_candidates, device=scores.device, dtype=torch.bool)
+            keep_mask[evicted] = False
+            kept_rows.append(all_indices[keep_mask].sort(dim=-1).values)
+        return torch.stack(kept_rows, dim=0).reshape(*leading_shape, keep_count)
 
     def _select_svd_leverage_kept(
         self,
@@ -939,6 +1180,7 @@ class EvictionManager:
         shared_across_heads: bool,
         num_heads: Optional[int] = None,
         use_full_dpp_pool: bool = False,
+        raw_outlier_scores: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[Dict[str, int]]]:
         num_candidates = int(scores.shape[-1])
         requested_evict = num_candidates - int(num_to_keep)
@@ -978,9 +1220,18 @@ class EvictionManager:
 
         if self.leverage_eviction_selector == "topk":
             if shared_across_heads:
-                kept_2d = self._keep_after_eviction(scores, evictable_mask, actual_evict, evict_highest=False)
+                if self.leverage_eviction_risk_mode == "outlier_then_low":
+                    kept_2d = self._keep_after_outlier_then_low_topk(
+                        scores, evictable_mask, actual_evict, raw_outlier_scores
+                    )
+                else:
+                    kept_2d = self._keep_after_eviction(scores, evictable_mask, actual_evict, evict_highest=False)
                 H = int(num_heads) if num_heads is not None else int(candidate_k.shape[1])
                 return kept_2d.unsqueeze(1).expand(scores.shape[0], H, kept_2d.shape[-1]), protection_debug
+            if self.leverage_eviction_risk_mode == "outlier_then_low":
+                return self._keep_after_outlier_then_low_topk(
+                    scores, evictable_mask, actual_evict, raw_outlier_scores
+                ), protection_debug
             return self._keep_after_eviction(scores, evictable_mask, actual_evict, evict_highest=False), protection_debug
 
         if self.leverage_eviction_selector == "fast_dpp":
@@ -993,7 +1244,10 @@ class EvictionManager:
                     candidate_v,
                     candidate_frame_ids=candidate_frame_ids,
                     current_frame_id=current_frame_idx,
+                    outlier_then_low=self.leverage_eviction_risk_mode == "outlier_then_low",
+                    raw_outlier_scores=raw_outlier_scores,
                 )
+
                 H = int(num_heads) if num_heads is not None else int(candidate_k.shape[1])
                 return kept_2d.unsqueeze(1).expand(scores.shape[0], H, kept_2d.shape[-1]), protection_debug
             return self._keep_after_head_fast_dpp(
@@ -1003,6 +1257,39 @@ class EvictionManager:
                 candidate_k,
                 candidate_frame_ids=candidate_frame_ids,
                 current_frame_id=current_frame_idx,
+                outlier_then_low=self.leverage_eviction_risk_mode == "outlier_then_low",
+                raw_outlier_scores=raw_outlier_scores,
+            ), protection_debug
+
+        if self.leverage_eviction_selector == "similarity_topk":
+            if shared_across_heads:
+                if self.leverage_similarity_granularity == "head":
+                    return self._keep_after_layer_head_similarity_topk(
+                        scores,
+                        evictable_mask,
+                        actual_evict,
+                        candidate_k,
+                        outlier_then_low=self.leverage_eviction_risk_mode == "outlier_then_low",
+                        raw_outlier_scores=raw_outlier_scores,
+                    ), protection_debug
+                kept_2d = self._keep_after_layer_similarity_topk(
+                    scores,
+                    evictable_mask,
+                    actual_evict,
+                    candidate_k,
+                    candidate_v,
+                    outlier_then_low=self.leverage_eviction_risk_mode == "outlier_then_low",
+                    raw_outlier_scores=raw_outlier_scores,
+                )
+                H = int(num_heads) if num_heads is not None else int(candidate_k.shape[1])
+                return kept_2d.unsqueeze(1).expand(scores.shape[0], H, kept_2d.shape[-1]), protection_debug
+            return self._keep_after_head_similarity_topk(
+                scores,
+                evictable_mask,
+                actual_evict,
+                candidate_k,
+                outlier_then_low=self.leverage_eviction_risk_mode == "outlier_then_low",
+                raw_outlier_scores=raw_outlier_scores,
             ), protection_debug
 
         raise AssertionError(f"Unhandled leverage eviction selector: {self.leverage_eviction_selector}")
@@ -1017,6 +1304,7 @@ class EvictionManager:
         current_frame_idx: Optional[int],
         protect_recent_frames: int,
         candidate_evictable_mask: Optional[torch.Tensor],
+        raw_outlier_scores: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[Dict[str, int]]]:
         """Apply shared layer-wise importance scores with head-wise DPP diversity."""
         B, H, N, _ = candidate_k.shape
@@ -1040,8 +1328,8 @@ class EvictionManager:
             protection_debug["requested_eviction_count"] = int(requested_evict)
             protection_debug["actual_eviction_count"] = int(actual_evict)
             protection_debug["limited_by_protection"] = int(actual_evict < requested_evict)
-        return (
-            self._keep_after_layer_head_fast_dpp(
+        if self.leverage_eviction_risk_mode == "outlier_then_low":
+            kept = self._keep_after_layer_head_outlier_then_low_dpp(
                 scores,
                 evictable_mask,
                 actual_evict,
@@ -1049,9 +1337,66 @@ class EvictionManager:
                 candidate_v,
                 candidate_frame_ids=candidate_frame_ids,
                 current_frame_id=current_frame_idx,
-            ),
-            protection_debug,
-        )
+                raw_outlier_scores=raw_outlier_scores,
+            )
+        else:
+            kept = self._keep_after_layer_head_fast_dpp(
+                scores,
+                evictable_mask,
+                actual_evict,
+                candidate_k,
+                candidate_v,
+                candidate_frame_ids=candidate_frame_ids,
+                current_frame_id=current_frame_idx,
+            )
+        return kept, protection_debug
+
+    def _apply_recency_score_bonus(
+        self,
+        scores: torch.Tensor,
+        candidate_frame_ids: Optional[torch.Tensor],
+        current_frame_id: Optional[int],
+        *,
+        shared_across_heads: bool,
+    ) -> torch.Tensor:
+        if (
+            not self.leverage_dpp_recency_bonus
+            or self.leverage_dpp_recency_lambda <= 0.0
+            or candidate_frame_ids is None
+            or current_frame_id is None
+        ):
+            return scores
+
+        clean_scores = torch.nan_to_num(scores.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        score_min = clean_scores.min(dim=-1, keepdim=True).values
+        score_range = (clean_scores.max(dim=-1, keepdim=True).values - score_min).clamp_min(1e-12)
+        score01 = ((clean_scores - score_min) / score_range).clamp(0.0, 1.0)
+
+        B = int(scores.shape[0])
+        N = int(scores.shape[-1])
+        if shared_across_heads:
+            if scores.ndim != 2:
+                raise ValueError(f"Expected layer-wise scores [B, N], got {tuple(scores.shape)}")
+            H = int(candidate_frame_ids.shape[1]) if candidate_frame_ids.ndim == 3 else 1
+            frame_ids = self._layer_candidate_frame_ids(candidate_frame_ids, B, H, N, scores.device)
+        else:
+            if scores.ndim != 3:
+                raise ValueError(f"Expected head-wise scores [B, H, N], got {tuple(scores.shape)}")
+            H = int(scores.shape[1])
+            frame_ids = self._expand_candidate_frame_ids(candidate_frame_ids, B, H, N, scores.device)
+
+        age = (int(current_frame_id) - frame_ids).float().clamp_min(0.0)
+        window = max(1.0, float(self.leverage_dpp_recency_window))
+        freshness = (1.0 - age / window).clamp(0.0, 1.0)
+        low_score_gate = (1.0 - score01).clamp(0.0, 1.0)
+        gate_power = float(self.leverage_dpp_recency_gate_power)
+        if gate_power == 0.0:
+            low_score_gate = torch.ones_like(low_score_gate)
+        elif gate_power != 1.0:
+            low_score_gate = low_score_gate.pow(gate_power)
+        recency_bonus = float(self.leverage_dpp_recency_lambda) * freshness * low_score_gate
+        self._record_dpp_recency_debug(freshness, low_score_gate, recency_bonus)
+        return score01 + recency_bonus
 
     def _dpp_quality_log(
         self,
@@ -1062,27 +1407,8 @@ class EvictionManager:
         score_min = pool_scores.min(dim=-1, keepdim=True).values
         score_range = (pool_scores.max(dim=-1, keepdim=True).values - score_min).clamp_min(1e-12)
         score01 = ((pool_scores - score_min) / score_range).clamp(0.0, 1.0)
-        quality_log_base = torch.log(score01 + 1e-6)
-
-        if (
-            self.leverage_dpp_recency_bonus
-            and self.leverage_dpp_recency_lambda > 0.0
-            and pool_frame_ids is not None
-            and current_frame_id is not None
-        ):
-            pool_frame_ids = pool_frame_ids.to(device=pool_scores.device)
-            age = (int(current_frame_id) - pool_frame_ids).float().clamp_min(0.0)
-            window = max(1.0, float(self.leverage_dpp_recency_window))
-            freshness = (1.0 - age / window).clamp(0.0, 1.0)
-            low_score_gate = (1.0 - score01).clamp(0.0, 1.0)
-            gate_power = float(self.leverage_dpp_recency_gate_power)
-            if gate_power != 1.0:
-                low_score_gate = low_score_gate.pow(gate_power)
-            recency_bonus = float(self.leverage_dpp_recency_lambda) * low_score_gate * freshness
-            quality_log_base = quality_log_base + recency_bonus
-            self._record_dpp_recency_debug(freshness, low_score_gate, recency_bonus)
-
-        return self.leverage_dpp_quality_beta * quality_log_base
+        leverage_log_quality = torch.log(score01 + 1e-6)
+        return self.leverage_dpp_quality_beta * leverage_log_quality
 
     def _record_dpp_recency_debug(
         self,
@@ -1108,14 +1434,14 @@ class EvictionManager:
         count = max(float(stats.get("count", 0.0)), 1.0)
         bonus_max = float(stats.get("bonus_max", 0.0))
         return (
-            "[FastDPP/recency] "
+            "[EvictionScore/recency] "
             f"lambda={recency_lambda} window={window} gate_power={gate_power} "
             f"freshness_mean={stats.get('freshness_sum', 0.0) / count:.4f} "
             f"freshness_max={stats.get('freshness_max', 0.0):.4f} "
             f"gate_mean={stats.get('gate_sum', 0.0) / count:.4f} "
             f"bonus_mean={stats.get('bonus_sum', 0.0) / count:.4f} "
             f"bonus_max={bonus_max:.4f} quality_beta={quality_beta} "
-            f"effective_bonus_max={float(quality_beta) * bonus_max:.4f}"
+            f"score_bonus_max={bonus_max:.4f}"
         )
     @staticmethod
     def _expand_candidate_frame_ids(
@@ -1258,6 +1584,46 @@ class EvictionManager:
         keep_mask.scatter_(dim=-1, index=evicted, value=False)
         return expanded_indices[keep_mask].reshape(B, H, keep_count)
 
+    def _keep_after_layer_head_outlier_then_low_dpp(
+        self,
+        scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+        candidate_k: torch.Tensor,
+        candidate_v: Optional[torch.Tensor],
+        candidate_frame_ids: Optional[torch.Tensor] = None,
+        current_frame_id: Optional[int] = None,
+        raw_outlier_scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, H, N, _ = candidate_k.shape
+        keep_count = N - int(num_to_evict)
+        kept = torch.empty(B, H, keep_count, device=scores.device, dtype=torch.long)
+        all_indices = torch.arange(N, device=scores.device, dtype=torch.long)
+        frame_ids = None
+        if candidate_frame_ids is not None:
+            frame_ids = self._expand_candidate_frame_ids(candidate_frame_ids, B, H, N, scores.device)
+        for b in range(B):
+            for h in range(H):
+                evicted = self._outlier_then_low_evicted_indices(
+                    scores[b],
+                    evictable_mask[b, h],
+                    int(num_to_evict),
+                    lambda low_mask, remaining, b=b, h=h: self._fast_dpp_evicted_indices(
+                        scores[b],
+                        low_mask,
+                        remaining,
+                        lambda idx, b=b, h=h: self._head_dpp_features(candidate_k, b, h, idx),
+                        row_frame_ids=frame_ids[b, h] if frame_ids is not None else None,
+                        current_frame_id=current_frame_id,
+                        use_full_pool=False,
+                    ),
+                    outlier_scores=raw_outlier_scores[b] if raw_outlier_scores is not None else None,
+                )
+                keep_mask = torch.ones(N, device=scores.device, dtype=torch.bool)
+                keep_mask[evicted] = False
+                kept[b, h] = all_indices[keep_mask].sort(dim=-1).values
+        return kept
+
     @staticmethod
     def _batched_dpp_similarity_sq_to_selected(
         features: torch.Tensor,
@@ -1281,6 +1647,8 @@ class EvictionManager:
         candidate_frame_ids: Optional[torch.Tensor] = None,
         current_frame_id: Optional[int] = None,
         use_full_pool: bool = False,
+        outlier_then_low: bool = False,
+        raw_outlier_scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, H, N = scores.shape
         keep_count = N - int(num_to_evict)
@@ -1291,15 +1659,32 @@ class EvictionManager:
             frame_ids = self._expand_candidate_frame_ids(candidate_frame_ids, B, H, N, scores.device)
         for b in range(B):
             for h in range(H):
-                evicted = self._fast_dpp_evicted_indices(
-                    scores[b, h],
-                    evictable_mask[b, h],
-                    int(num_to_evict),
-                    lambda idx, b=b, h=h: self._head_dpp_features(candidate_k, b, h, idx),
-                    row_frame_ids=frame_ids[b, h] if frame_ids is not None else None,
-                    current_frame_id=current_frame_id,
-                    use_full_pool=use_full_pool,
-                )
+                if outlier_then_low:
+                    evicted = self._outlier_then_low_evicted_indices(
+                        scores[b, h],
+                        evictable_mask[b, h],
+                        int(num_to_evict),
+                        lambda low_mask, remaining, b=b, h=h: self._fast_dpp_evicted_indices(
+                            scores[b, h],
+                            low_mask,
+                            remaining,
+                            lambda idx, b=b, h=h: self._head_dpp_features(candidate_k, b, h, idx),
+                            row_frame_ids=frame_ids[b, h] if frame_ids is not None else None,
+                            current_frame_id=current_frame_id,
+                            use_full_pool=False,
+                        ),
+                        outlier_scores=raw_outlier_scores[b, h] if raw_outlier_scores is not None else None,
+                    )
+                else:
+                    evicted = self._fast_dpp_evicted_indices(
+                        scores[b, h],
+                        evictable_mask[b, h],
+                        int(num_to_evict),
+                        lambda idx, b=b, h=h: self._head_dpp_features(candidate_k, b, h, idx),
+                        row_frame_ids=frame_ids[b, h] if frame_ids is not None else None,
+                        current_frame_id=current_frame_id,
+                        use_full_pool=use_full_pool,
+                    )
                 keep_mask = torch.ones(N, device=scores.device, dtype=torch.bool)
                 keep_mask[evicted] = False
                 kept[b, h] = all_indices[keep_mask].sort(dim=-1).values
@@ -1316,6 +1701,8 @@ class EvictionManager:
         candidate_frame_ids: Optional[torch.Tensor] = None,
         current_frame_id: Optional[int] = None,
         use_full_pool: bool = False,
+        outlier_then_low: bool = False,
+        raw_outlier_scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N = scores.shape
         keep_count = N - int(num_to_evict)
@@ -1325,19 +1712,242 @@ class EvictionManager:
         if candidate_frame_ids is not None:
             frame_ids = self._layer_candidate_frame_ids(candidate_frame_ids, B, candidate_k.shape[1], N, scores.device)
         for b in range(B):
-            evicted = self._fast_dpp_evicted_indices(
-                scores[b],
-                evictable_mask[b],
-                int(num_to_evict),
-                lambda idx, b=b: self._layer_dpp_features(candidate_k, candidate_v, b, idx),
-                row_frame_ids=frame_ids[b] if frame_ids is not None else None,
-                current_frame_id=current_frame_id,
-                use_full_pool=use_full_pool,
-            )
+            if outlier_then_low:
+                evicted = self._outlier_then_low_evicted_indices(
+                    scores[b],
+                    evictable_mask[b],
+                    int(num_to_evict),
+                    lambda low_mask, remaining, b=b: self._fast_dpp_evicted_indices(
+                        scores[b],
+                        low_mask,
+                        remaining,
+                        lambda idx, b=b: self._layer_dpp_features(candidate_k, candidate_v, b, idx),
+                        row_frame_ids=frame_ids[b] if frame_ids is not None else None,
+                        current_frame_id=current_frame_id,
+                        use_full_pool=False,
+                    ),
+                    outlier_scores=raw_outlier_scores[b] if raw_outlier_scores is not None else None,
+                )
+            else:
+                evicted = self._fast_dpp_evicted_indices(
+                    scores[b],
+                    evictable_mask[b],
+                    int(num_to_evict),
+                    lambda idx, b=b: self._layer_dpp_features(candidate_k, candidate_v, b, idx),
+                    row_frame_ids=frame_ids[b] if frame_ids is not None else None,
+                    current_frame_id=current_frame_id,
+                    use_full_pool=use_full_pool,
+                )
             keep_mask = torch.ones(N, device=scores.device, dtype=torch.bool)
             keep_mask[evicted] = False
             kept[b] = all_indices[keep_mask].sort(dim=-1).values
         return kept
+
+
+
+
+    def _similarity_projection_error(self, granularity: str) -> ValueError:
+        return ValueError(
+            "leverage_similarity_feature_projection='random' requires reusable projected "
+            f"{granularity}-wise leverage features from right_sketch or right_sketch_ridge"
+        )
+
+    def _store_projected_similarity_features(self, projected: torch.Tensor, granularity: str) -> None:
+        if self.leverage_similarity_feature_projection != "random":
+            return
+        stored = torch.nan_to_num(
+            projected.detach().to(dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if granularity == "head" and stored.ndim == 4:
+            self._last_similarity_head_features = stored
+        elif granularity == "layer" and stored.ndim == 3:
+            self._last_similarity_layer_features = stored
+
+    def _similarity_feature_fn(self, raw_feature_fn, *, batch_idx: int, head_idx: Optional[int] = None):
+        if self.leverage_similarity_feature_projection == "raw":
+            return raw_feature_fn
+        if head_idx is None:
+            features = self._last_similarity_layer_features
+            if features is None or features.ndim != 3:
+                raise self._similarity_projection_error("layer")
+            row_features = features[int(batch_idx)]
+        else:
+            features = self._last_similarity_head_features
+            if features is None or features.ndim != 4:
+                raise self._similarity_projection_error("head")
+            row_features = features[int(batch_idx), int(head_idx)]
+        return lambda idx, row_features=row_features: torch.nan_to_num(
+            row_features.index_select(0, idx).to(dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    def _keep_after_layer_head_similarity_topk(
+        self,
+        scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+        candidate_k: torch.Tensor,
+        *,
+        outlier_then_low: bool = False,
+        raw_outlier_scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, H, N, _ = candidate_k.shape
+        keep_count = N - int(num_to_evict)
+        kept = torch.empty(B, H, keep_count, device=scores.device, dtype=torch.long)
+        all_indices = torch.arange(N, device=scores.device, dtype=torch.long)
+        for b in range(B):
+            for h in range(H):
+                if outlier_then_low:
+                    evicted = self._outlier_then_low_evicted_indices(
+                        scores[b],
+                        evictable_mask[b],
+                        int(num_to_evict),
+                        lambda low_mask, remaining, b=b, h=h: self._similarity_topk_evicted_indices(
+                            scores[b],
+                            low_mask,
+                            remaining,
+                            self._similarity_feature_fn(
+                                lambda idx, b=b, h=h: self._head_dpp_features(candidate_k, b, h, idx),
+                                batch_idx=b,
+                                head_idx=h,
+                            ),
+                        ),
+                        outlier_scores=raw_outlier_scores[b] if raw_outlier_scores is not None else None,
+                    )
+                else:
+                    evicted = self._similarity_topk_evicted_indices(
+                        scores[b],
+                        evictable_mask[b],
+                        int(num_to_evict),
+                        self._similarity_feature_fn(
+                                lambda idx, b=b, h=h: self._head_dpp_features(candidate_k, b, h, idx),
+                                batch_idx=b,
+                                head_idx=h,
+                            ),
+                    )
+                keep_mask = torch.ones(N, device=scores.device, dtype=torch.bool)
+                keep_mask[evicted] = False
+                kept[b, h] = all_indices[keep_mask].sort(dim=-1).values
+        return kept
+
+    def _keep_after_head_similarity_topk(
+        self,
+        scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+        candidate_k: torch.Tensor,
+        *,
+        outlier_then_low: bool = False,
+        raw_outlier_scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, H, N = scores.shape
+        keep_count = N - int(num_to_evict)
+        kept = torch.empty(B, H, keep_count, device=scores.device, dtype=torch.long)
+        all_indices = torch.arange(N, device=scores.device, dtype=torch.long)
+        for b in range(B):
+            for h in range(H):
+                if outlier_then_low:
+                    evicted = self._outlier_then_low_evicted_indices(
+                        scores[b, h],
+                        evictable_mask[b, h],
+                        int(num_to_evict),
+                        lambda low_mask, remaining, b=b, h=h: self._similarity_topk_evicted_indices(
+                            scores[b, h],
+                            low_mask,
+                            remaining,
+                            self._similarity_feature_fn(
+                                lambda idx, b=b, h=h: self._head_dpp_features(candidate_k, b, h, idx),
+                                batch_idx=b,
+                                head_idx=h,
+                            ),
+                        ),
+                        outlier_scores=raw_outlier_scores[b, h] if raw_outlier_scores is not None else None,
+                    )
+                else:
+                    evicted = self._similarity_topk_evicted_indices(
+                        scores[b, h],
+                        evictable_mask[b, h],
+                        int(num_to_evict),
+                        self._similarity_feature_fn(
+                                lambda idx, b=b, h=h: self._head_dpp_features(candidate_k, b, h, idx),
+                                batch_idx=b,
+                                head_idx=h,
+                            ),
+                    )
+                keep_mask = torch.ones(N, device=scores.device, dtype=torch.bool)
+                keep_mask[evicted] = False
+                kept[b, h] = all_indices[keep_mask].sort(dim=-1).values
+        return kept
+
+    def _keep_after_layer_similarity_topk(
+        self,
+        scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+        candidate_k: torch.Tensor,
+        candidate_v: Optional[torch.Tensor],
+        *,
+        outlier_then_low: bool = False,
+        raw_outlier_scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, N = scores.shape
+        keep_count = N - int(num_to_evict)
+        kept = torch.empty(B, keep_count, device=scores.device, dtype=torch.long)
+        all_indices = torch.arange(N, device=scores.device, dtype=torch.long)
+        for b in range(B):
+            if outlier_then_low:
+                evicted = self._outlier_then_low_evicted_indices(
+                    scores[b],
+                    evictable_mask[b],
+                    int(num_to_evict),
+                    lambda low_mask, remaining, b=b: self._similarity_topk_evicted_indices(
+                        scores[b],
+                        low_mask,
+                        remaining,
+                        self._similarity_feature_fn(
+                            lambda idx, b=b: self._layer_dpp_features(candidate_k, candidate_v, b, idx),
+                            batch_idx=b,
+                        ),
+                    ),
+                    outlier_scores=raw_outlier_scores[b] if raw_outlier_scores is not None else None,
+                )
+            else:
+                evicted = self._similarity_topk_evicted_indices(
+                    scores[b],
+                    evictable_mask[b],
+                    int(num_to_evict),
+                    self._similarity_feature_fn(
+                            lambda idx, b=b: self._layer_dpp_features(candidate_k, candidate_v, b, idx),
+                            batch_idx=b,
+                        ),
+                )
+            keep_mask = torch.ones(N, device=scores.device, dtype=torch.bool)
+            keep_mask[evicted] = False
+            kept[b] = all_indices[keep_mask].sort(dim=-1).values
+        return kept
+
+    def _maybe_project_fast_dpp_features(self, features: torch.Tensor) -> torch.Tensor:
+        if (
+            self.leverage_dpp_feature_projection != "random"
+            or self.leverage_eviction_selector != "fast_dpp"
+        ):
+            return features
+        feature_dim = int(features.shape[-1])
+        sketch_dim = min(int(self.leverage_ridge_dim), feature_dim)
+        omega = self._get_leverage_right_sketch(
+            feature_dim,
+            sketch_dim,
+            device=features.device,
+            seed=self.leverage_random_seed,
+        )
+        projected = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).matmul(omega)
+        self._last_layer_feature_shape = tuple(projected.shape)
+        return projected
 
     def _fast_dpp_evicted_indices(
         self,
@@ -1375,7 +1985,9 @@ class EvictionManager:
         if num_to_retain_from_pool <= 0:
             return pool
 
-        features = F.normalize(feature_fn(pool).float(), p=2, dim=-1, eps=1e-12)
+        features = feature_fn(pool).float()
+        features = self._maybe_project_fast_dpp_features(features)
+        features = F.normalize(features, p=2, dim=-1, eps=1e-12)
         features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
         if use_full_pool:
@@ -1427,6 +2039,53 @@ class EvictionManager:
         retain_mask[selected_local] = True
         return pool[~retain_mask]
 
+    def _similarity_topk_evicted_indices(
+        self,
+        row_scores: torch.Tensor,
+        evictable_mask: torch.Tensor,
+        num_to_evict: int,
+        feature_fn,
+    ) -> torch.Tensor:
+        if num_to_evict <= 0:
+            return torch.empty(0, device=row_scores.device, dtype=torch.long)
+
+        all_indices = torch.arange(row_scores.shape[-1], device=row_scores.device, dtype=torch.long)
+        evictable = all_indices[evictable_mask]
+        if evictable.numel() < num_to_evict:
+            raise ValueError(
+                f"Cannot evict {num_to_evict} tokens from only {int(evictable.numel())} evictable candidates"
+            )
+
+        row_scores = torch.nan_to_num(row_scores.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        pool_size = min(
+            int(evictable.numel()),
+            max(int(num_to_evict), int(num_to_evict) * self.leverage_dpp_candidate_multiplier),
+        )
+        order = torch.argsort(row_scores.index_select(0, evictable), stable=True)
+        pool = evictable.index_select(0, order[:pool_size])
+        if pool_size <= int(num_to_evict):
+            return pool
+
+        retained_mask = torch.ones(row_scores.shape[-1], device=row_scores.device, dtype=torch.bool)
+        retained_mask[pool] = False
+        retained = all_indices[retained_mask]
+        if retained.numel() == 0:
+            return pool[: int(num_to_evict)]
+
+        pool_features = feature_fn(pool).float()
+        retained_features = feature_fn(retained).float()
+        pool_features = F.normalize(pool_features, p=2, dim=-1, eps=1e-12)
+        retained_features = F.normalize(retained_features, p=2, dim=-1, eps=1e-12)
+        pool_features = torch.nan_to_num(pool_features, nan=0.0, posinf=0.0, neginf=0.0)
+        retained_features = torch.nan_to_num(retained_features, nan=0.0, posinf=0.0, neginf=0.0)
+
+        max_similarity = torch.mm(pool_features, retained_features.transpose(0, 1)).max(dim=1).values
+        pool_leverage = row_scores.index_select(0, pool).clamp_min(1e-12)
+        eviction_scores = max_similarity / pool_leverage
+        local_evicted = torch.topk(eviction_scores, k=int(num_to_evict), dim=0).indices
+        return pool.index_select(0, local_evicted)
+
+
     @staticmethod
     def _dpp_similarity_sq_to_selected(features: torch.Tensor, selected_local: torch.Tensor) -> torch.Tensor:
         selected_features = features.index_select(0, selected_local.reshape(-1))
@@ -1451,21 +2110,133 @@ class EvictionManager:
             head_chunks = torch.tensor_split(mat_k, self.leverage_head_mean_dim, dim=-1)
             head_features = torch.stack([chunk.mean(dim=-1) for chunk in head_chunks], dim=-1)
             features = head_features.permute(1, 0, 2).reshape(indices.numel(), H * self.leverage_head_mean_dim)
-            self._last_layer_feature_shape = tuple(features.shape)
-            return features
+        else:
+            features = mat_k.transpose(0, 1).reshape(indices.numel(), H * D)
+            if self.leverage_feature == "key_value":
+                if candidate_v is None:
+                    raise ValueError("leverage_feature=key_value requires value cache tensor")
+                mat_v = candidate_v[batch_idx].index_select(1, indices).to(dtype=torch.float32)
+                mat_v = torch.nan_to_num(mat_v, nan=0.0, posinf=0.0, neginf=0.0)
+                value_features = mat_v.transpose(0, 1).reshape(indices.numel(), H * D)
+                features = torch.cat([features, value_features], dim=-1)
+        self._last_layer_feature_shape = tuple(features.shape)
+        return features
 
-        key_features = mat_k.transpose(0, 1).reshape(indices.numel(), H * D)
-        if self.leverage_feature == "key_value":
-            if candidate_v is None:
-                raise ValueError("leverage_feature=key_value requires value cache tensor")
-            mat_v = candidate_v[batch_idx].index_select(1, indices).to(dtype=torch.float32)
-            mat_v = torch.nan_to_num(mat_v, nan=0.0, posinf=0.0, neginf=0.0)
-            value_features = mat_v.transpose(0, 1).reshape(indices.numel(), H * D)
-            features = torch.cat([key_features, value_features], dim=-1)
-            self._last_layer_feature_shape = tuple(features.shape)
-            return features
-        self._last_layer_feature_shape = tuple(key_features.shape)
-        return key_features
+
+    def _combine_history_anchor_patch_topk_mask(
+        self,
+        scores: torch.Tensor,
+        candidate_frame_ids: Optional[torch.Tensor],
+        candidate_token_indices: Optional[torch.Tensor],
+        candidate_evictable_mask: Optional[torch.Tensor],
+        history_anchor_frame_ids,
+        patch_topk_per_frame: int,
+        max_anchor_frames: int,
+        special_token_count: int,
+    ) -> Optional[torch.Tensor]:
+        patch_topk_per_frame = int(patch_topk_per_frame)
+        max_anchor_frames = int(max_anchor_frames)
+        special_token_count = int(special_token_count)
+        if (
+            patch_topk_per_frame <= 0
+            or max_anchor_frames <= 0
+            or history_anchor_frame_ids is None
+            or candidate_frame_ids is None
+            or candidate_token_indices is None
+            or special_token_count <= 0
+        ):
+            return candidate_evictable_mask
+
+        if not isinstance(history_anchor_frame_ids, torch.Tensor):
+            if len(history_anchor_frame_ids) == 0:
+                return candidate_evictable_mask
+            anchor_ids = torch.as_tensor(history_anchor_frame_ids, device=scores.device, dtype=torch.long)
+        else:
+            anchor_ids = history_anchor_frame_ids.to(device=scores.device, dtype=torch.long).reshape(-1)
+        if anchor_ids.numel() == 0:
+            return candidate_evictable_mask
+        anchor_ids = torch.unique(anchor_ids, sorted=False)
+
+        score_rows = torch.nan_to_num(scores.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        leading_shape = score_rows.shape[:-1]
+        num_candidates = int(score_rows.shape[-1])
+        flat_scores = score_rows.reshape(-1, num_candidates)
+        flat_frames = self._metadata_like_scores(
+            candidate_frame_ids,
+            scores,
+            name="candidate_frame_ids",
+            dtype=torch.long,
+        ).reshape(-1, num_candidates)
+        flat_tokens = self._metadata_like_scores(
+            candidate_token_indices,
+            scores,
+            name="candidate_token_indices",
+            dtype=torch.long,
+        ).reshape(-1, num_candidates)
+
+        membership = flat_frames.unsqueeze(1).eq(anchor_ids.view(1, -1, 1))
+        patch_mask = membership & flat_tokens.unsqueeze(1).ge(special_token_count)
+        valid_patch_counts = patch_mask.sum(dim=-1)
+        if not bool(valid_patch_counts.gt(0).any().item()):
+            return candidate_evictable_mask
+
+        patch_k = min(max(patch_topk_per_frame, 1), num_candidates)
+        masked_patch_scores = flat_scores.unsqueeze(1).masked_fill(~patch_mask, -torch.inf)
+        patch_top_values, patch_top_indices = torch.topk(masked_patch_scores, k=patch_k, dim=-1)
+        finite_patch_values = torch.isfinite(patch_top_values)
+        frame_den = valid_patch_counts.clamp(max=patch_k).clamp_min(1).to(dtype=flat_scores.dtype)
+        frame_scores = patch_top_values.masked_fill(~finite_patch_values, 0.0).sum(dim=-1) / frame_den
+        frame_scores = frame_scores.masked_fill(valid_patch_counts <= 0, -torch.inf)
+
+        frame_k = min(max_anchor_frames, int(anchor_ids.numel()))
+        selected_frame_scores, selected_frame_indices = torch.topk(frame_scores, k=frame_k, dim=-1)
+        selected_anchor_rows = torch.zeros_like(frame_scores, dtype=torch.bool)
+        selected_anchor_rows.scatter_(1, selected_frame_indices, torch.isfinite(selected_frame_scores))
+
+        selected_membership = membership & selected_anchor_rows.unsqueeze(-1)
+        protect_special = selected_membership.any(dim=1) & flat_tokens.lt(special_token_count)
+
+        patch_top_rows = torch.zeros_like(patch_mask, dtype=torch.bool)
+        patch_top_rows.scatter_(2, patch_top_indices, finite_patch_values)
+        protect_patch = (patch_top_rows & selected_anchor_rows.unsqueeze(-1) & patch_mask).any(dim=1)
+        protected = protect_special | protect_patch
+        anchor_evictable_mask = (~protected).reshape(*leading_shape, num_candidates)
+
+        if candidate_evictable_mask is None:
+            return anchor_evictable_mask
+        existing = self._metadata_like_scores(
+            candidate_evictable_mask,
+            scores,
+            name="candidate_evictable_mask",
+            dtype=torch.bool,
+        )
+        return existing & anchor_evictable_mask
+
+    @staticmethod
+    def _metadata_like_scores(
+        metadata: torch.Tensor,
+        scores: torch.Tensor,
+        *,
+        name: str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        B = int(scores.shape[0])
+        N = int(scores.shape[-1])
+        data = metadata.to(device=scores.device, dtype=dtype)
+        if scores.ndim == 2:
+            if data.ndim == 2 and tuple(data.shape) == (B, N):
+                return data
+            if data.ndim == 3 and data.shape[0] == B and data.shape[2] == N:
+                if dtype == torch.bool:
+                    return data.all(dim=1)
+                return data[:, 0]
+        elif scores.ndim == 3:
+            H = int(scores.shape[1])
+            if data.ndim == 3 and tuple(data.shape) == (B, H, N):
+                return data
+            if data.ndim == 2 and tuple(data.shape) == (B, N):
+                return data.unsqueeze(1).expand(B, H, N)
+        raise ValueError(f"{name} shape {tuple(data.shape)} is incompatible with scores {tuple(scores.shape)}")
 
     def _keep_with_recent_protection(
         self,
@@ -1639,101 +2410,17 @@ class EvictionManager:
             return 1
         return 1 << (int(value) - 1).bit_length()
 
-    def _get_left_srht_factors(
-        self,
-        num_tokens: int,
-        padded_tokens: int,
-        sketch_dim: int,
-        *,
-        device: torch.device,
-        seed: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (str(device), int(num_tokens), int(padded_tokens), int(sketch_dim), int(seed), "left_srht")
-        cached = self._leverage_left_srht_cache.get(key)
-        if cached is not None:
-            return cached
-
-        generator = torch.Generator()
-        generator.manual_seed(int(seed))
-        signs = torch.randint(
-            0,
-            2,
-            (int(padded_tokens),),
-            dtype=torch.int8,
-            generator=generator,
-        ).to(dtype=torch.float32)
-        signs = signs.mul_(2.0).sub_(1.0).to(device=device)
-        sample = torch.randperm(int(padded_tokens), generator=generator, dtype=torch.long)[: int(sketch_dim)]
-        sample = sample.to(device=device)
-        cached = (signs, sample)
-        self._leverage_left_srht_cache[key] = cached
-        return cached
-
-    @staticmethod
-    def _fwht_token_dim(x: torch.Tensor, *, normalize: bool = True) -> torch.Tensor:
-        """Pure PyTorch FWHT over the token dimension ``-2``."""
-        num_tokens = int(x.shape[-2])
-        if num_tokens <= 0 or num_tokens & (num_tokens - 1):
-            raise ValueError(f"FWHT token dimension must be a power of two, got {num_tokens}")
-
-        y = x.transpose(-2, -1).contiguous()
-        prefix = y.shape[:-1]
-        stride = 1
-        while stride < num_tokens:
-            y = y.reshape(*prefix, num_tokens // (2 * stride), 2, stride)
-            left = y[..., 0, :].clone()
-            right = y[..., 1, :].clone()
-            y = torch.cat((left + right, left - right), dim=-1).reshape(*prefix, num_tokens)
-            stride *= 2
-        if normalize:
-            y = y / math.sqrt(float(num_tokens))
-        return y.transpose(-2, -1).contiguous()
-
-    def _apply_left_srht(
-        self,
-        mat: torch.Tensor,
-        sketch_dim: int,
-        *,
-        seed: Optional[int] = None,
-        normalize: bool = True,
-    ) -> torch.Tensor:
-        """Apply ``sqrt(N_pad / r1) * S H D`` to token rows without forming it."""
-        num_tokens = int(mat.shape[-2])
-        padded_tokens = self._next_power_of_two(num_tokens)
-        active_sketch_dim = min(int(sketch_dim), padded_tokens)
-        active_seed = self.leverage_random_seed if seed is None else int(seed)
-        signs, sample = self._get_left_srht_factors(
-            num_tokens,
-            padded_tokens,
-            active_sketch_dim,
-            device=mat.device,
-            seed=active_seed,
-        )
-
-        if padded_tokens != num_tokens:
-            work = F.pad(mat, (0, 0, 0, padded_tokens - num_tokens))
-        else:
-            work = mat
-        work = work * signs.view(*((1,) * (work.ndim - 2)), padded_tokens, 1)
-        work = self._fwht_token_dim(work, normalize=normalize)
-        work = work.index_select(-2, sample)
-        scale = math.sqrt(float(padded_tokens) / float(active_sketch_dim))
-        return work * scale
-
     def _resolve_leverage_approx_method(self, sketch_dim: Optional[int]) -> str:
-        if self.leverage_approx_method in ("exact_qr", "drineas_srht", "full_d_ridge", "right_sketch_ridge"):
+        if self.leverage_approx_method in ("exact_qr", "full_d_ridge", "right_sketch_ridge"):
             return self.leverage_approx_method
         if sketch_dim in (None, 0):
             return "exact_qr"
         return "right_sketch"
 
     def _resolve_ridge_sketch_dim(self, feature_dim: int, num_tokens: int) -> int:
-        requested = self.leverage_ridge_dim if self.leverage_ridge_dim is not None else self.leverage_right_jl_dim
+        requested = self.leverage_ridge_dim
         if requested is None or int(requested) < 1:
-            raise ValueError(
-                "right_sketch_ridge requires leverage_ridge_dim >= 1 or "
-                "leverage_right_jl_dim >= 1"
-            )
+            raise ValueError("right_sketch_ridge requires leverage_ridge_dim >= 1")
         return min(int(requested), int(feature_dim), int(num_tokens))
 
     def _empty_leverage_basis(self, mat: torch.Tensor, granularity: str, *, basis_kind: str) -> SvdLeverageBasis:
@@ -1769,6 +2456,18 @@ class EvictionManager:
             return x
         return F.normalize(x, p=2, dim=-1, eps=1e-12)
 
+    def _needs_layer_covariance_pr(self) -> bool:
+        return self.layer_budget_strategy in COVARIANCE_LAYER_BUDGET_STRATEGIES
+
+    def _set_last_layer_covariance_pr_from_gram(self, gram: torch.Tensor) -> None:
+        if self._needs_layer_covariance_pr():
+            self._last_layer_covariance_pr = _covariance_participation_ratio(gram, self.layer_budget_eps).detach()
+
+    def _set_last_layer_covariance_pr_from_matrix(self, mat: torch.Tensor) -> None:
+        if self._needs_layer_covariance_pr():
+            gram = mat.transpose(-2, -1) @ mat
+            self._set_last_layer_covariance_pr_from_gram(gram)
+
     def _ridge_leverage_scores_from_matrix(
         self,
         mat: torch.Tensor,
@@ -1796,6 +2495,7 @@ class EvictionManager:
 
             gram_start = time.perf_counter() if do_profile else 0.0
             gram = work.transpose(-2, -1) @ work
+            self._set_last_layer_covariance_pr_from_gram(gram)
             if do_profile:
                 self._sync_for_timing(gram)
                 profile["gram"] = time.perf_counter() - gram_start
@@ -1895,6 +2595,7 @@ class EvictionManager:
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
             projection_start = time.perf_counter() if do_profile else 0.0
             projected = mat @ omega
+            self._store_projected_similarity_features(projected, granularity)
             if do_profile:
                 self._sync_for_timing(projected)
                 profile["projection_matmul"] = time.perf_counter() - projection_start
@@ -1944,26 +2645,15 @@ class EvictionManager:
                 total_start=total_start,
                 do_profile=do_profile,
             )
-        if method == "drineas_srht":
-            return self._drineas_srht_leverage_scores_from_matrix(
-                mat,
-                eps,
-                return_basis=return_basis,
-                granularity=granularity,
-                profile=profile,
-                total_start=total_start,
-                do_profile=do_profile,
-            )
-
         with torch.cuda.amp.autocast(enabled=False):
             if method == "exact_qr":
                 leverage_matrix = mat
                 if do_profile:
                     profile["sketch"] = 0.0
             else:
-                # Right-sketched leverage / Compactor-style approximation:
+                # Right-sketched leverage / Compactor-style approximation.
                 # QR is applied to K Phi, so scores are leverage scores of the
-                # compressed key matrix rather than Drineas full-space scores.
+                # compressed key matrix.
                 sketch_dim = min(int(active_sketch_dim), feature_dim, num_tokens)
                 sketch_retrieval_start = time.perf_counter() if do_profile else 0.0
                 omega = self._get_leverage_right_sketch(
@@ -1977,11 +2667,13 @@ class EvictionManager:
                     profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
                 projection_start = time.perf_counter() if do_profile else 0.0
                 leverage_matrix = mat @ omega
+                self._store_projected_similarity_features(leverage_matrix, granularity)
                 if do_profile:
                     self._sync_for_timing(leverage_matrix)
                     profile["projection_matmul"] = time.perf_counter() - projection_start
                     profile["sketch"] = profile["sketch_matrix_retrieval"] + profile["projection_matmul"]
 
+            self._set_last_layer_covariance_pr_from_matrix(leverage_matrix)
             try:
                 qr_start = time.perf_counter() if do_profile else 0.0
                 q, r = torch.linalg.qr(leverage_matrix, mode="reduced")
@@ -2015,168 +2707,6 @@ class EvictionManager:
                 basis_kind=method,
             )
         return scores_sq
-
-    def _drineas_srht_leverage_scores_from_matrix(
-        self,
-        mat: torch.Tensor,
-        eps: float,
-        *,
-        return_basis: bool,
-        granularity: str,
-        profile: Dict[str, float],
-        total_start: float,
-        do_profile: bool,
-    ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
-        # Left-sketch Drineas-style approximate full leverage:
-        # Pi1 K -> R^{-1}, Omega = K R^{-1} Pi2, scores = ||Omega_i||_2^2.
-        num_tokens = int(mat.shape[-2])
-        feature_dim = int(mat.shape[-1])
-        requested_r1 = self.leverage_left_sketch_dim if self.leverage_left_sketch_dim is not None else self._next_power_of_two(num_tokens)
-        padded_tokens = self._next_power_of_two(num_tokens)
-        r1 = min(int(requested_r1), padded_tokens)
-        r2 = self.leverage_right_jl_dim
-
-        with torch.cuda.amp.autocast(enabled=False):
-            left_start = time.perf_counter() if do_profile else 0.0
-            b_mat = self._apply_left_srht(mat, r1, seed=self.leverage_random_seed, normalize=True)
-            if do_profile:
-                self._sync_for_timing(b_mat)
-                profile["left_sketch"] = time.perf_counter() - left_start
-
-            try:
-                qr_start = time.perf_counter() if do_profile else 0.0
-                _q_b, r = torch.linalg.qr(b_mat, mode="reduced")
-                if do_profile:
-                    self._sync_for_timing(r)
-                    profile["small_qr"] = time.perf_counter() - qr_start
-                diag = torch.abs(torch.diagonal(r, dim1=-2, dim2=-1))
-                square_r = r.shape[-2] == r.shape[-1]
-                diag_max = diag.max(dim=-1, keepdim=True).values.clamp_min(float(eps)) if diag.ndim > 1 else diag.max().clamp_min(float(eps))
-                ill_conditioned = (not square_r) or bool((diag <= diag_max * float(eps)).any().item())
-                if ill_conditioned:
-                    raise RuntimeError("Drineas SRHT QR produced singular or non-square R")
-
-                solve_start = time.perf_counter() if do_profile else 0.0
-                if r2 is None or int(r2) <= 0 or int(r2) >= feature_dim:
-                    rhs = torch.eye(feature_dim, device=mat.device, dtype=torch.float32)
-                    rhs = rhs.expand(*r.shape[:-2], feature_dim, feature_dim)
-                else:
-                    sketch_retrieval_start = time.perf_counter() if do_profile else 0.0
-                    pi2 = self._get_leverage_right_sketch(
-                        feature_dim,
-                        int(r2),
-                        device=mat.device,
-                        seed=self.leverage_random_seed + 1,
-                    )
-                    if do_profile:
-                        self._sync_for_timing(pi2)
-                        profile["sketch_matrix_retrieval"] = (
-                            profile.get("sketch_matrix_retrieval", 0.0)
-                            + time.perf_counter()
-                            - sketch_retrieval_start
-                        )
-                    rhs = pi2.expand(*r.shape[:-2], feature_dim, int(r2))
-                c = torch.linalg.solve_triangular(r, rhs, upper=True)
-                if do_profile:
-                    self._sync_for_timing(c)
-                    profile["right_jl_solve"] = time.perf_counter() - solve_start
-
-                gemm_start = time.perf_counter() if do_profile else 0.0
-                omega = mat @ c
-                if do_profile:
-                    self._sync_for_timing(omega)
-                    profile["omega_gemm"] = time.perf_counter() - gemm_start
-                profile["fallback"] = 0.0
-            except RuntimeError:
-                scores, basis = self._drineas_svd_fallback(
-                    mat,
-                    b_mat,
-                    eps,
-                    return_basis=return_basis,
-                    granularity=granularity,
-                    profile=profile,
-                    do_profile=do_profile,
-                )
-                self._profile_finish(profile, total_start, scores, do_profile=do_profile)
-                if return_basis:
-                    return scores, basis
-                return scores
-
-        score_start = time.perf_counter() if do_profile else 0.0
-        scores_sq = torch.nan_to_num(omega.square().sum(dim=-1), nan=0.0, posinf=0.0, neginf=0.0)
-        if do_profile:
-            self._sync_for_timing(scores_sq)
-            profile["scoring"] = time.perf_counter() - score_start
-        self._profile_finish(profile, total_start, scores_sq, do_profile=do_profile)
-        if return_basis:
-            # q is not exact QR Q here; it is the Drineas score-space matrix Omega.
-            return scores_sq, SvdLeverageBasis(
-                q=omega.detach(),
-                r_diag=diag.detach(),
-                granularity=granularity,
-                basis_kind="drineas_srht",
-            )
-        return scores_sq
-
-    def _drineas_svd_fallback(
-        self,
-        mat: torch.Tensor,
-        b_mat: torch.Tensor,
-        eps: float,
-        *,
-        return_basis: bool,
-        granularity: str,
-        profile: Dict[str, float],
-        do_profile: bool,
-    ) -> tuple[torch.Tensor, SvdLeverageBasis]:
-        try:
-            svd_start = time.perf_counter() if do_profile else 0.0
-            _u, s, vh = torch.linalg.svd(b_mat, full_matrices=False)
-            max_s = s.max(dim=-1, keepdim=True).values.clamp_min(float(eps)) if s.ndim > 1 else s.max().clamp_min(float(eps))
-            active = s > max_s * float(eps)
-            if not bool(active.any().item()):
-                raise RuntimeError("Drineas SRHT SVD fallback found zero numerical rank")
-            if do_profile:
-                self._sync_for_timing(s)
-                profile["small_qr"] = profile.get("small_qr", 0.0) + time.perf_counter() - svd_start
-
-            coords = mat @ vh.transpose(-2, -1)
-            coords = coords / s.clamp_min(float(eps)).unsqueeze(-2)
-            coords = coords * active.to(dtype=coords.dtype).unsqueeze(-2)
-            r2 = self.leverage_right_jl_dim
-            if r2 is not None and int(r2) > 0 and int(r2) < coords.shape[-1]:
-                solve_start = time.perf_counter() if do_profile else 0.0
-                sketch_retrieval_start = time.perf_counter() if do_profile else 0.0
-                pi2 = self._get_leverage_right_sketch(
-                    int(coords.shape[-1]),
-                    int(r2),
-                    device=mat.device,
-                    seed=self.leverage_random_seed + 1,
-                )
-                if do_profile:
-                    self._sync_for_timing(pi2)
-                    profile["sketch_matrix_retrieval"] = (
-                        profile.get("sketch_matrix_retrieval", 0.0)
-                        + time.perf_counter()
-                        - sketch_retrieval_start
-                    )
-                coords = coords @ pi2
-                if do_profile:
-                    self._sync_for_timing(coords)
-                    profile["right_jl_solve"] = time.perf_counter() - solve_start
-            scores = torch.nan_to_num(coords.square().sum(dim=-1), nan=0.0, posinf=0.0, neginf=0.0)
-            profile["fallback"] = 1.0
-            basis = SvdLeverageBasis(
-                q=coords.detach() if return_basis else torch.empty(*mat.shape[:-1], 0, device=mat.device, dtype=torch.float32),
-                r_diag=s.detach(),
-                granularity=granularity,
-                basis_kind="drineas_srht_svd_fallback",
-            )
-            return scores, basis
-        except RuntimeError:
-            scores = torch.nan_to_num(mat.square().sum(dim=-1), nan=0.0, posinf=0.0, neginf=0.0)
-            profile["fallback"] = 2.0
-            return scores, self._empty_leverage_basis(mat, granularity, basis_kind="row_norm_fallback")
 
     def compute_svd_leverage_scores(
         self,
@@ -2268,137 +2798,6 @@ class EvictionManager:
             do_profile=do_profile,
         )
 
-    def _evictable_head_svd_leverage_scores(
-        self,
-        candidate_k: torch.Tensor,
-        candidate_evictable_mask: torch.Tensor,
-        *,
-        return_basis: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
-        """Compute head-wise leverage from special-token-evictable rows only."""
-        B, H, N, _ = candidate_k.shape
-        mask = candidate_evictable_mask.to(device=candidate_k.device, dtype=torch.bool)
-        if mask.shape != (B, H, N):
-            raise ValueError(
-                "candidate_evictable_mask must match head-wise candidate shape, "
-                f"got {tuple(mask.shape)} vs {(B, H, N)}"
-            )
-        if self._resolve_leverage_approx_method(self.leverage_sketch_dim) in ("full_d_ridge", "right_sketch_ridge"):
-            masked_k = candidate_k * mask.unsqueeze(-1).to(dtype=candidate_k.dtype)
-            result = self._svd_leverage_scores(masked_k, return_basis=return_basis)
-            if return_basis:
-                scores, basis = result
-                return scores.masked_fill(~mask, 0.0), basis
-            return result.masked_fill(~mask, 0.0)
-
-        scores = torch.zeros(B, H, N, device=candidate_k.device, dtype=torch.float32)
-        basis_rows = []
-        basis_kind = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
-        for batch_idx in range(B):
-            for head_idx in range(H):
-                indices = torch.nonzero(mask[batch_idx, head_idx], as_tuple=False).flatten()
-                if indices.numel() == 0:
-                    continue
-                subset_k = candidate_k[batch_idx : batch_idx + 1, head_idx : head_idx + 1].index_select(2, indices)
-                if return_basis:
-                    subset_scores, subset_basis = self._svd_leverage_scores(subset_k, return_basis=True)
-                    basis_rows.append((batch_idx, head_idx, indices, subset_basis.q[0, 0], subset_basis.r_diag[0, 0]))
-                    basis_kind = subset_basis.basis_kind
-                else:
-                    subset_scores = self._svd_leverage_scores(subset_k)
-                scores[batch_idx, head_idx].index_copy_(0, indices, subset_scores[0, 0])
-
-        if not return_basis:
-            return scores
-        max_q_rank = max((int(row[3].shape[-1]) for row in basis_rows), default=0)
-        max_diag_rank = max((int(row[4].shape[-1]) for row in basis_rows), default=0)
-        q = torch.zeros(B, H, N, max_q_rank, device=candidate_k.device, dtype=torch.float32)
-        r_diag = torch.zeros(B, H, max_diag_rank, device=candidate_k.device, dtype=torch.float32)
-        for batch_idx, head_idx, indices, subset_q, subset_diag in basis_rows:
-            q[batch_idx, head_idx, indices, : subset_q.shape[-1]] = subset_q
-            r_diag[batch_idx, head_idx, : subset_diag.shape[-1]] = subset_diag
-        return scores, SvdLeverageBasis(
-            q=q,
-            r_diag=r_diag,
-            granularity="head",
-            basis_kind=basis_kind,
-        )
-
-    def _evictable_layer_svd_leverage_scores(
-        self,
-        candidate_k: torch.Tensor,
-        candidate_v: Optional[torch.Tensor],
-        candidate_evictable_mask: torch.Tensor,
-        *,
-        return_basis: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
-        """Compute layer-wise leverage from rows evictable in every head."""
-        B, H, N, _ = candidate_k.shape
-        mask = candidate_evictable_mask.to(device=candidate_k.device, dtype=torch.bool)
-        if mask.shape == (B, N):
-            shared_mask = mask
-        elif mask.shape == (B, H, N):
-            shared_mask = mask.all(dim=1)
-        else:
-            raise ValueError(
-                "candidate_evictable_mask must be [B, N] or [B, H, N] for layer-wise leverage, "
-                f"got {tuple(mask.shape)} for candidate shape {(B, H, N)}"
-            )
-        if self._resolve_leverage_approx_method(self.leverage_sketch_dim) in ("full_d_ridge", "right_sketch_ridge"):
-            row_mask = shared_mask[:, None, :, None]
-            masked_k = candidate_k * row_mask.to(dtype=candidate_k.dtype)
-            masked_v = (
-                candidate_v * row_mask.to(dtype=candidate_v.dtype)
-                if candidate_v is not None
-                else None
-            )
-            result = self._layer_svd_leverage_scores(masked_k, masked_v, return_basis=return_basis)
-            if return_basis:
-                scores, basis = result
-                return scores.masked_fill(~shared_mask, 0.0), basis
-            return result.masked_fill(~shared_mask, 0.0)
-
-        scores = torch.zeros(B, N, device=candidate_k.device, dtype=torch.float32)
-        basis_rows = []
-        basis_kind = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
-        for batch_idx in range(B):
-            indices = torch.nonzero(shared_mask[batch_idx], as_tuple=False).flatten()
-            if indices.numel() == 0:
-                continue
-            subset_k = candidate_k[batch_idx : batch_idx + 1].index_select(2, indices)
-            subset_v = (
-                candidate_v[batch_idx : batch_idx + 1].index_select(2, indices)
-                if candidate_v is not None
-                else None
-            )
-            if return_basis:
-                subset_scores, subset_basis = self._layer_svd_leverage_scores(
-                    subset_k,
-                    subset_v,
-                    return_basis=True,
-                )
-                basis_rows.append((batch_idx, indices, subset_basis.q[0], subset_basis.r_diag[0]))
-                basis_kind = subset_basis.basis_kind
-            else:
-                subset_scores = self._layer_svd_leverage_scores(subset_k, subset_v)
-            scores[batch_idx].index_copy_(0, indices, subset_scores[0])
-
-        if not return_basis:
-            return scores
-        max_q_rank = max((int(row[2].shape[-1]) for row in basis_rows), default=0)
-        max_diag_rank = max((int(row[3].shape[-1]) for row in basis_rows), default=0)
-        q = torch.zeros(B, N, max_q_rank, device=candidate_k.device, dtype=torch.float32)
-        r_diag = torch.zeros(B, max_diag_rank, device=candidate_k.device, dtype=torch.float32)
-        for batch_idx, indices, subset_q, subset_diag in basis_rows:
-            q[batch_idx, indices, : subset_q.shape[-1]] = subset_q
-            r_diag[batch_idx, : subset_diag.shape[-1]] = subset_diag
-        return scores, SvdLeverageBasis(
-            q=q,
-            r_diag=r_diag,
-            granularity="layer",
-            basis_kind=basis_kind,
-        )
-
     def _layer_svd_leverage_scores(
         self,
         candidate_k: torch.Tensor,
@@ -2441,6 +2840,7 @@ class EvictionManager:
             )
 
         scores = []
+        covariance_prs = []
         qs = []
         diags = []
         basis_kind = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
@@ -2476,6 +2876,8 @@ class EvictionManager:
             else:
                 score = self.compute_svd_leverage_scores(x_layer, self.leverage_sketch_dim)
             scores.append(score)
+            if self._needs_layer_covariance_pr() and self._last_layer_covariance_pr is not None:
+                covariance_prs.append(self._last_layer_covariance_pr.reshape(()))
             if self.debug:
                 aggregate_profile["feature"] += feature_time
                 for name, value in self._last_leverage_profile.items():
@@ -2485,6 +2887,8 @@ class EvictionManager:
                         aggregate_profile[name] = value
         if self.debug:
             self._last_leverage_profile = aggregate_profile
+        if covariance_prs:
+            self._last_layer_covariance_pr = torch.stack(covariance_prs, dim=0).detach()
         stacked = torch.stack(scores, dim=0)
         if return_basis:
             return stacked, SvdLeverageBasis(
@@ -2550,6 +2954,7 @@ class EvictionManager:
                     do_profile=do_profile,
                 )
 
+            self._set_last_layer_covariance_pr_from_matrix(leverage_matrix)
             try:
                 qr_start = time.perf_counter() if do_profile else 0.0
                 q, r = torch.linalg.qr(leverage_matrix, mode="reduced")
@@ -2643,15 +3048,18 @@ class EvictionManager:
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
             projection_start = time.perf_counter() if do_profile else 0.0
             omega_key = omega[: H * D].view(H, D, sketch_dim)
-            leverage_matrix = torch.einsum("bhnd,hds->bns", mat_k, omega_key)
+            head_leverage_matrix = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
             if mat_v is not None:
                 omega_value = omega[H * D :].view(H, D, sketch_dim)
-                leverage_matrix = leverage_matrix + torch.einsum("bhnd,hds->bns", mat_v, omega_value)
+                head_leverage_matrix = head_leverage_matrix + torch.einsum("bhnd,hds->bhns", mat_v, omega_value)
             if self.leverage_normalize_rows:
                 row_norm_sq = mat_k.square().sum(dim=(1, 3))
                 if mat_v is not None:
                     row_norm_sq = row_norm_sq + mat_v.square().sum(dim=(1, 3))
-                leverage_matrix = leverage_matrix / row_norm_sq.sqrt().clamp_min(1e-12).unsqueeze(-1)
+                head_leverage_matrix = head_leverage_matrix / row_norm_sq.sqrt().clamp_min(1e-12).unsqueeze(1).unsqueeze(-1)
+            leverage_matrix = head_leverage_matrix.sum(dim=1)
+            self._store_projected_similarity_features(leverage_matrix, "layer")
+            self._store_projected_similarity_features(head_leverage_matrix, "head")
             if do_profile:
                 self._sync_for_timing(leverage_matrix)
                 profile["feature"] = 0.0
@@ -2672,6 +3080,7 @@ class EvictionManager:
                     sketch_dim=sketch_dim,
                 )
 
+            self._set_last_layer_covariance_pr_from_matrix(leverage_matrix)
             try:
                 qr_start = time.perf_counter() if do_profile else 0.0
                 q, r = torch.linalg.qr(leverage_matrix, mode="reduced")

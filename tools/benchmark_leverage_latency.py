@@ -24,8 +24,6 @@ from streamvggt.layers.eviction import EvictionManager
 class Case:
     name: str
     method: str
-    r1: int | None = None
-    r2: int | None = None
     right_sketch_dim: int | None = None
     ridge_dim: int | None = None
 
@@ -58,8 +56,6 @@ def _manager_scores(mat: torch.Tensor, case: Case, seed: int, profile: bool) -> 
         leverage_sketch_dim=case.right_sketch_dim,
         leverage_granularity="layer",
         leverage_approx_method=case.method,
-        leverage_left_sketch_dim=case.r1,
-        leverage_right_jl_dim=case.r2,
         leverage_ridge_lambda=1e-3,
         leverage_ridge_lambda_mode="relative",
         leverage_ridge_score_chunk_size=4096,
@@ -222,7 +218,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--current_method", choices=("right_sketch", "drineas_srht"), default="right_sketch")
+    parser.add_argument("--current_method", choices=("right_sketch"), default="right_sketch")
     parser.add_argument("--current_right_sketch_dim", type=int, default=16)
     parser.add_argument("--profile", action="store_true", help="Print EvictionManager substage timings")
     parser.add_argument("--benchmark_eviction_selectors", action="store_true", help="Also benchmark topk vs fast_dpp selection latency")
@@ -240,13 +236,9 @@ def main() -> None:
     cases = [
         Case("exact_svd_full", "exact_svd"),
         Case("exact_qr_impl", "exact_qr", right_sketch_dim=0),
-        Case(f"current_{args.current_method}", args.current_method, r1=2048, r2=64, right_sketch_dim=args.current_right_sketch_dim),
+        Case(f"current_{args.current_method}", args.current_method, right_sketch_dim=args.current_right_sketch_dim),
         Case("full_d_ridge", "full_d_ridge", right_sketch_dim=0),
-        Case("right_sketch_ridge_r64", "right_sketch_ridge", r2=64, ridge_dim=64, right_sketch_dim=0),
-        Case("drineas_r1_384_r2_64", "drineas_srht", r1=384, r2=64, right_sketch_dim=0),
-        Case("drineas_r1_512_r2_128", "drineas_srht", r1=512, r2=128, right_sketch_dim=0),
-        Case("drineas_r1_768_r2_128", "drineas_srht", r1=768, r2=128, right_sketch_dim=0),
-        Case("drineas_r1_768_r2_256", "drineas_srht", r1=768, r2=256, right_sketch_dim=0),
+        Case("right_sketch_ridge_r64", "right_sketch_ridge", ridge_dim=64, right_sketch_dim=0),
     ]
 
     print(f"shape=[{args.n}, {args.d}] dtype={dtype} device={device} warmup={args.warmup} repeats={args.repeats}")

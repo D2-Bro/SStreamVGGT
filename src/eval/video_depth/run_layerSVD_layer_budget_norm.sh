@@ -13,14 +13,9 @@ layer_budget_strategy='leverage_pr'
 layer_budget_alpha=1.0
 layer_budget_min_tokens=3000
 layer_budget_eps=1e-12
-layer_budget_debug=false
 layer_budget_log_scores=true
 total_budget=200000
 kf_interval=1
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 layer_budget_log_args=()
 if [ "$layer_budget_log_scores" = true ]; then
     layer_budget_log_args=(--layer_budget_log_scores)
@@ -75,7 +70,6 @@ for data in "${datasets[@]}"; do
         --kf_interval "$kf_interval" \
         --leverage_dpp_diversity_beta "$leverage_dpp_diversity_beta" \
         --leverage_normalize_rows \
-        "${layer_budget_debug_args[@]}" \
         "${layer_budget_log_args[@]}"
     python ../src/eval/video_depth/eval_depth.py \
         --output_dir "$output_dir" \

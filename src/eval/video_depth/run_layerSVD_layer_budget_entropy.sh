@@ -13,12 +13,7 @@ layer_budget_strategy='leverage_entropy'
 layer_budget_alpha=1.0
 layer_budget_min_tokens=0
 layer_budget_eps=1e-12
-layer_budget_debug=false
 layer_budget_log_scores=true
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 layer_budget_log_args=()
 if [ "$layer_budget_log_scores" = true ]; then
     layer_budget_log_args=(--layer_budget_log_scores)
@@ -48,7 +43,6 @@ for data in "${datasets[@]}"; do
         --layer_budget_alpha "$layer_budget_alpha" \
         --layer_budget_min_tokens "$layer_budget_min_tokens" \
         --layer_budget_eps "$layer_budget_eps" \
-        "${layer_budget_debug_args[@]}" \
         "${layer_budget_log_args[@]}"
     python ../src/eval/video_depth/eval_depth.py \
         --output_dir "$output_dir" \

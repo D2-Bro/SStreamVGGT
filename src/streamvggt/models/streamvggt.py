@@ -10,10 +10,16 @@ from streamvggt.heads.camera_head import CameraHead
 from streamvggt.heads.dpt_head import DPTHead
 from streamvggt.heads.track_head import TrackHead
 from transformers.file_utils import ModelOutput
-from typing import Optional, Tuple, List, Any, Callable
+from typing import Optional, Tuple, List, Any, Callable, Sequence, Set
 from dataclasses import dataclass
 
-from streamvggt.utils.cache_analysis import CacheAnalysisConfig, EvictionNNAnalysisConfig, PreEvictionSnapshotConfig
+from streamvggt.utils.cache_analysis import (
+    CacheAnalysisConfig,
+    EvictionNNAnalysisConfig,
+    LeverageScoreHistogramConfig,
+    PreEvictionSnapshotConfig,
+    TokenOverlayDumpConfig,
+)
 from streamvggt.utils.history_anchor import HistoryAnchorConfig, HistoryAnchorManager
 from streamvggt.layers.recent_merge import RecentMergeConfig, RecentSimilarityMerge
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
@@ -24,8 +30,83 @@ class StreamVGGTOutput(ModelOutput):
     ress: Optional[List[dict]] = None
     views: Optional[torch.Tensor] = None
 
+
+def _filter_grouped_camera_kv_cache(
+    past_key_values_camera: List[Optional[Tuple]],
+    cached_frame_ids: Sequence[int],
+    keep_frame_ids: Sequence[int],
+    tokens_per_frame_group: int,
+) -> Tuple[List[Optional[Tuple]], List[int]]:
+    """Keep camera-head KV groups whose frame IDs are active anchors."""
+    tokens_per_frame_group = int(tokens_per_frame_group)
+    if tokens_per_frame_group <= 0:
+        raise ValueError(
+            "tokens_per_frame_group must be positive, "
+            f"got {tokens_per_frame_group}"
+        )
+
+    keep_set = {int(frame_id) for frame_id in keep_frame_ids}
+    keep_group_indices = [
+        group_idx
+        for group_idx, frame_id in enumerate(cached_frame_ids)
+        if int(frame_id) in keep_set
+    ]
+    filtered_frame_ids = [int(cached_frame_ids[idx]) for idx in keep_group_indices]
+    if len(keep_group_indices) == len(cached_frame_ids):
+        return past_key_values_camera, filtered_frame_ids
+
+    filtered_kv = []
+    token_indices_cache = {}
+    for layer_kv in past_key_values_camera:
+        if layer_kv is None:
+            filtered_kv.append(None)
+            continue
+        if len(layer_kv) not in (2, 3):
+            raise ValueError(f"Expected camera KV tuple of length 2 or 3, got {len(layer_kv)}")
+
+        k_cache, v_cache = layer_kv[:2]
+        total_tokens = k_cache.shape[2]
+        expected_tokens = len(cached_frame_ids) * tokens_per_frame_group
+        if total_tokens != expected_tokens:
+            raise ValueError(
+                "Camera KV cache length does not match tracked frame groups: "
+                f"cache_tokens={total_tokens}, tracked_frames={len(cached_frame_ids)}, "
+                f"tokens_per_frame_group={tokens_per_frame_group}"
+            )
+
+        device = k_cache.device
+        token_indices = token_indices_cache.get(device)
+        if token_indices is None:
+            parts = [
+                torch.arange(
+                    group_idx * tokens_per_frame_group,
+                    (group_idx + 1) * tokens_per_frame_group,
+                    device=device,
+                    dtype=torch.long,
+                )
+                for group_idx in keep_group_indices
+            ]
+            token_indices = torch.cat(parts, dim=0) if parts else torch.empty(0, device=device, dtype=torch.long)
+            token_indices_cache[device] = token_indices
+
+        filtered_k = k_cache.index_select(2, token_indices)
+        filtered_v = v_cache.index_select(2, token_indices.to(device=v_cache.device))
+        if len(layer_kv) == 3:
+            metadata = layer_kv[2]
+            metadata_indices = token_indices.detach().cpu().view(1, 1, -1)
+            metadata_indices = metadata_indices.expand(
+                metadata.frame_ids.shape[0],
+                metadata.frame_ids.shape[1],
+                -1,
+            )
+            filtered_kv.append((filtered_k, filtered_v, metadata.gather(metadata_indices)))
+        else:
+            filtered_kv.append((filtered_k, filtered_v))
+
+    return filtered_kv, filtered_frame_ids
+
 class StreamVGGT(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, total_budget=1200000):
+    def __init__(self, img_size=518, patch_size=14, embed_dim=1024, total_budget=200000):
         super().__init__()
 
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
@@ -177,11 +258,15 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         coverage_threshold: float = 0.2,
         camera_motion_threshold: float = 0.2,
         anchor_keep_ratio: float = 0.05,
+        history_anchor_patch_topk_per_frame: int = 0,
         total_budget=None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
+        leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
+        eviction_policy_layers: Optional[Set[int]] = None,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -189,21 +274,22 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
-        leverage_evictable_only: bool = False,
-        leverage_approx_method: str = "right_sketch",
-        leverage_left_sketch_dim: Optional[int] = 2048,
-        leverage_right_jl_dim: Optional[int] = 64,
-        leverage_ridge_lambda: float = 1e-3,
+        leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
+        leverage_similarity_granularity: str = "layer",
+        leverage_similarity_feature_projection: str = "raw",
+        leverage_eviction_risk_mode: str = "low_leverage",
+        leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
         leverage_dpp_greedy_block_size: int = 32,
         leverage_dpp_quality_beta: float = 1.0,
         leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_feature_projection: str = "raw",
         leverage_dpp_recency_bonus: bool = False,
         leverage_dpp_recency_lambda: float = 0.2,
         leverage_dpp_recency_window: int = 5,
@@ -216,7 +302,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
-        layer_budget_debug: bool = False,
+        slots_per_direction: float = 4.0,
+        hybrid_beta: float = 0.5,
         layer_budget_log_path: Optional[str] = None,
         eviction_protect_recent_frames: int = 0,
         eviction_protect_special_tokens: bool = False,
@@ -229,13 +316,23 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         global_attn_debug: bool = False,
         kf_interval: int = 1,
         evict_interval: int = 1,
+        global_cache_history_anchor_special_tokens_only: bool = False,
+        first_frame_special_tokens_only: bool = False,
+        camera_cache_history_anchors_only: bool = False,
+        camera_cache_keep_dropped_anchors: bool = False,
     ):
         past_key_values = [None] * self.aggregator.depth
+        self.aggregator.reset_stream_state()
         past_key_values_camera = [None] * self.camera_head.trunk_depth
+        camera_cache_frame_ids = []
+        camera_cache_tokens_per_frame = None
+        camera_cache_anchor_frame_ids = [0]
         total_budget = self.total_budget
         kf_interval = max(int(kf_interval), 1)
         evict_interval = max(int(evict_interval), 1)
         eviction_protect_special_token_interval = int(eviction_protect_special_token_interval)
+        history_anchor_patch_topk_per_frame = max(int(history_anchor_patch_topk_per_frame), 0)
+        history_anchor_patch_topk_enabled = history_anchor_patch_topk_per_frame > 0 and int(max_anchors) > 0
         if eviction_protect_special_token_interval < 1:
             raise ValueError(
                 "eviction_protect_special_token_interval must be >= 1, "
@@ -282,6 +379,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         patch_w = img_w // patch_size
         tokens_per_frame = 1 + 4 + patch_h * patch_w
         window_token_count = max(int(window_protect_frames), 0) * tokens_per_frame
+        global_anchor_token_count = (
+            min(int(self.aggregator.patch_start_idx), int(tokens_per_frame))
+            if bool(first_frame_special_tokens_only)
+            else int(tokens_per_frame)
+        )
 
         anchor_manager = None
         if history_anchor_strategy != "none":
@@ -293,10 +395,18 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 coverage_threshold=coverage_threshold,
                 camera_motion_threshold=camera_motion_threshold,
                 history_protect_token_count=self.aggregator.patch_start_idx,
+                global_protect_token_count=global_anchor_token_count,
                 anchor_keep_ratio=anchor_keep_ratio,
+                patch_topk_per_anchor_frame=history_anchor_patch_topk_per_frame,
             )
             anchor_manager = HistoryAnchorManager(anchor_config, tokens_per_frame)
             anchor_manager.image_size_hw = (img_h, img_w)
+
+        global_anchor_special_only_active = (
+            bool(global_cache_history_anchor_special_tokens_only)
+            and anchor_manager is not None
+        )
+        global_anchor_special_count = min(int(self.aggregator.patch_start_idx), int(tokens_per_frame))
 
         def _select_history_anchor_token_indices(batch_size: int, device: torch.device) -> torch.Tensor:
             special_count = min(int(self.aggregator.patch_start_idx), int(tokens_per_frame))
@@ -320,16 +430,41 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 if should_register:
                     anchor_manager.register_anchor(i)
                     fixed_interval_registered = True
+                    if int(i) not in camera_cache_anchor_frame_ids:
+                        camera_cache_anchor_frame_ids.append(int(i))
                     fixed_interval_is_fifo = is_fifo
-                    fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
+                    fifo_msg = (
+                        " (leverage candidate pool)"
+                        if history_anchor_patch_topk_enabled
+                        else (" (FIFO: oldest demoted)" if is_fifo else "")
+                    )
                     print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
 
             anchor_token_count = (
                 anchor_manager.get_protected_token_count()
-                if anchor_manager is not None
-                else None
+                if anchor_manager is not None and not history_anchor_patch_topk_enabled
+                else (global_anchor_token_count if bool(first_frame_special_tokens_only) else None)
             )
             effective_window_token_count = window_token_count if anchor_manager is not None else 0
+            forward_anchor_token_count = anchor_token_count
+            if (
+                global_anchor_special_only_active
+                and fixed_interval_registered
+                and not fixed_interval_is_fifo
+                and anchor_token_count is not None
+            ):
+                forward_anchor_token_count = max(
+                    int(anchor_token_count) - int(global_anchor_special_count),
+                    int(global_anchor_token_count),
+                )
+            frame_total_budget = total_budget
+            if (
+                global_anchor_special_only_active
+                and cache_write_current_frame
+                and i != 0
+                and total_budget is not None
+            ):
+                frame_total_budget = max(int(total_budget) - int(global_anchor_special_count), 0)
 
             target_device = next(self.parameters()).device
             frame_img = frame["img"].to(target_device, non_blocking=True)
@@ -358,11 +493,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 past_key_values=past_key_values,
                 use_cache=True, 
                 past_frame_idx=i,
-                total_budget=total_budget,
+                total_budget=frame_total_budget,
                 cache_analysis_config=cache_analysis_config,
                 pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                 eviction_nn_analysis_config=eviction_nn_analysis_config,
+                leverage_score_histogram_config=leverage_score_histogram_config,
+                token_overlay_dump_config=token_overlay_dump_config,
                 eviction_policy=eviction_policy,
+                eviction_policy_layers=eviction_policy_layers,
                 eviction_debug=eviction_debug,
                 leverage_sketch_dim=leverage_sketch_dim,
                 leverage_granularity=leverage_granularity,
@@ -370,21 +508,22 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
                 leverage_normalize_rows=leverage_normalize_rows,
-                leverage_evictable_only=leverage_evictable_only,
-                leverage_approx_method=leverage_approx_method,
-                leverage_left_sketch_dim=leverage_left_sketch_dim,
-                leverage_right_jl_dim=leverage_right_jl_dim,
-                leverage_ridge_lambda=leverage_ridge_lambda,
+                leverage_approx_method=leverage_approx_method,                leverage_ridge_lambda=leverage_ridge_lambda,
                 leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
                 leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                 leverage_ridge_jitter=leverage_ridge_jitter,
                 leverage_ridge_dim=leverage_ridge_dim,
                 leverage_random_seed=leverage_random_seed,
                 leverage_eviction_selector=leverage_eviction_selector,
+                leverage_similarity_granularity=leverage_similarity_granularity,
+                leverage_similarity_feature_projection=leverage_similarity_feature_projection,
+leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                leverage_high_outlier_z=leverage_high_outlier_z,
                 leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                 leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
                 leverage_dpp_quality_beta=leverage_dpp_quality_beta,
                 leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
+                leverage_dpp_feature_projection=leverage_dpp_feature_projection,
                 leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
                 leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
                 leverage_dpp_recency_window=leverage_dpp_recency_window,
@@ -397,12 +536,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 layer_budget_alpha=layer_budget_alpha,
                 layer_budget_min_tokens=layer_budget_min_tokens,
                 layer_budget_eps=layer_budget_eps,
-                layer_budget_debug=layer_budget_debug,
+                slots_per_direction=slots_per_direction,
+                hybrid_beta=hybrid_beta,
                 layer_budget_log_path=layer_budget_log_path,
                 eviction_protect_recent_frames=eviction_protect_recent_frames,
                 eviction_protect_special_tokens=eviction_protect_special_tokens,
                 eviction_protect_special_token_interval=eviction_protect_special_token_interval,
-                anchor_token_count=anchor_token_count,
+                anchor_token_count=forward_anchor_token_count,
                 window_token_count=effective_window_token_count,
                 recent_merge_config=recent_merge_config,
                 svd_eviction_merge_config=svd_eviction_merge_config,
@@ -412,6 +552,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 global_attn_debug=global_attn_debug,
                 cache_write_current_frame=cache_write_current_frame,
                 cache_evict_current_frame=cache_evict_current_frame,
+                global_cache_history_anchor_special_tokens_only=global_anchor_special_only_active,
+                history_anchor_frame_ids=(
+                    anchor_manager.history_anchor_frames
+                    if history_anchor_patch_topk_enabled and anchor_manager is not None
+                    else None
+                ),
+                history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
+                history_anchor_max_frames=max_anchors,
             )
 
             
@@ -419,11 +567,26 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 aggregated_tokens, patch_start_idx, past_key_values = aggregator_output
             else:
                 aggregated_tokens, patch_start_idx = aggregator_output        
+            global_special_kv_sidecars = getattr(self.aggregator, "last_global_special_kv_sidecars", None)
             
             with torch.cuda.amp.autocast(enabled=False):
                 if self.camera_head is not None:
-                    pose_enc, past_key_values_camera = self.camera_head(aggregated_tokens, past_key_values_camera=past_key_values_camera, use_cache=True)
-                    pose_enc = pose_enc[-1]
+                    pose_enc_list, past_key_values_camera = self.camera_head(
+                        aggregated_tokens,
+                        past_key_values_camera=past_key_values_camera,
+                        use_cache=True,
+                    )
+                    current_camera_tokens_per_frame = len(pose_enc_list)
+                    if camera_cache_tokens_per_frame is None:
+                        camera_cache_tokens_per_frame = current_camera_tokens_per_frame
+                    elif camera_cache_tokens_per_frame != current_camera_tokens_per_frame:
+                        raise ValueError(
+                            "Camera cache tokens per frame changed during inference: "
+                            f"previous={camera_cache_tokens_per_frame}, "
+                            f"current={current_camera_tokens_per_frame}"
+                        )
+                    camera_cache_frame_ids.append(i)
+                    pose_enc = pose_enc_list[-1]
                     camera_pose = pose_enc[:, 0, :]
 
                 if self.depth_head is not None:
@@ -449,19 +612,30 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     vis = vis[:, 0]
                     track_conf = conf[:, 0]
 
-            if fixed_interval_registered:
-                anchor_token_indices = _select_history_anchor_token_indices(
-                    camera_pose.shape[0],
-                    camera_pose.device,
-                )
-                past_key_values = self.aggregator.sync_anchor_change(
-                    past_key_values,
-                    anchor_token_count=anchor_token_count,
-                    tokens_per_frame=tokens_per_frame,
-                    anchor_keep_ratio=anchor_keep_ratio,
-                    anchor_token_indices=anchor_token_indices,
-                    is_fifo=fixed_interval_is_fifo,
-                )
+            if fixed_interval_registered and not history_anchor_patch_topk_enabled:
+                if global_anchor_special_only_active:
+                    past_key_values = self.aggregator.sync_anchor_special_tokens_from_sidecars(
+                        past_key_values,
+                        global_special_kv_sidecars,
+                        anchor_token_count=anchor_token_count,
+                        tokens_per_frame=tokens_per_frame,
+                        is_fifo=fixed_interval_is_fifo,
+                        global_anchor_token_count=global_anchor_token_count,
+                    )
+                else:
+                    anchor_token_indices = _select_history_anchor_token_indices(
+                        camera_pose.shape[0],
+                        camera_pose.device,
+                    )
+                    past_key_values = self.aggregator.sync_anchor_change(
+                        past_key_values,
+                        anchor_token_count=anchor_token_count,
+                        tokens_per_frame=tokens_per_frame,
+                        anchor_keep_ratio=anchor_keep_ratio,
+                        anchor_token_indices=anchor_token_indices,
+                        is_fifo=fixed_interval_is_fifo,
+                        global_anchor_token_count=global_anchor_token_count,
+                    )
 
             if anchor_manager is not None and history_anchor_strategy == "coverage":
                 should_register, is_fifo, reason, coverage = anchor_manager.should_become_anchor_coverage(
@@ -471,21 +645,40 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 if should_register:
                     anchor_manager.register_anchor_coverage(i, depth[0], camera_pose[0])
-                    fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
+                    if int(i) not in camera_cache_anchor_frame_ids:
+                        camera_cache_anchor_frame_ids.append(int(i))
+                    fifo_msg = (
+                        " (leverage candidate pool)"
+                        if history_anchor_patch_topk_enabled
+                        else (" (FIFO: oldest demoted)" if is_fifo else "")
+                    )
                     print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
 
-                    anchor_token_indices = _select_history_anchor_token_indices(
-                        camera_pose.shape[0],
-                        camera_pose.device,
-                    )
-                    past_key_values = self.aggregator.sync_anchor_change(
-                        past_key_values,
-                        anchor_token_count=anchor_manager.get_protected_token_count(),
-                        tokens_per_frame=tokens_per_frame,
-                        anchor_keep_ratio=anchor_keep_ratio,
-                        anchor_token_indices=anchor_token_indices,
-                        is_fifo=is_fifo,
-                    )
+                    if history_anchor_patch_topk_enabled:
+                        pass
+                    elif global_anchor_special_only_active:
+                        past_key_values = self.aggregator.sync_anchor_special_tokens_from_sidecars(
+                            past_key_values,
+                            global_special_kv_sidecars,
+                            anchor_token_count=anchor_manager.get_protected_token_count(),
+                            tokens_per_frame=tokens_per_frame,
+                            is_fifo=is_fifo,
+                            global_anchor_token_count=global_anchor_token_count,
+                        )
+                    else:
+                        anchor_token_indices = _select_history_anchor_token_indices(
+                            camera_pose.shape[0],
+                            camera_pose.device,
+                        )
+                        past_key_values = self.aggregator.sync_anchor_change(
+                            past_key_values,
+                            anchor_token_count=anchor_manager.get_protected_token_count(),
+                            tokens_per_frame=tokens_per_frame,
+                            anchor_keep_ratio=anchor_keep_ratio,
+                            anchor_token_indices=anchor_token_indices,
+                            is_fifo=is_fifo,
+                            global_anchor_token_count=global_anchor_token_count,
+                        )
 
             if anchor_manager is not None and history_anchor_strategy == "camera_motion":
                 should_register, is_fifo, reason, _camera_motion = anchor_manager.should_become_anchor_camera_motion(
@@ -494,21 +687,55 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 if should_register:
                     anchor_manager.register_anchor_camera_motion(i, camera_pose[0])
-                    fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
+                    if int(i) not in camera_cache_anchor_frame_ids:
+                        camera_cache_anchor_frame_ids.append(int(i))
+                    fifo_msg = (
+                        " (leverage candidate pool)"
+                        if history_anchor_patch_topk_enabled
+                        else (" (FIFO: oldest demoted)" if is_fifo else "")
+                    )
                     print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
 
-                    anchor_token_indices = _select_history_anchor_token_indices(
-                        camera_pose.shape[0],
-                        camera_pose.device,
-                    )
-                    past_key_values = self.aggregator.sync_anchor_change(
-                        past_key_values,
-                        anchor_token_count=anchor_manager.get_protected_token_count(),
-                        tokens_per_frame=tokens_per_frame,
-                        anchor_keep_ratio=anchor_keep_ratio,
-                        anchor_token_indices=anchor_token_indices,
-                        is_fifo=is_fifo,
-                    )
+                    if history_anchor_patch_topk_enabled:
+                        pass
+                    elif global_anchor_special_only_active:
+                        past_key_values = self.aggregator.sync_anchor_special_tokens_from_sidecars(
+                            past_key_values,
+                            global_special_kv_sidecars,
+                            anchor_token_count=anchor_manager.get_protected_token_count(),
+                            tokens_per_frame=tokens_per_frame,
+                            is_fifo=is_fifo,
+                            global_anchor_token_count=global_anchor_token_count,
+                        )
+                    else:
+                        anchor_token_indices = _select_history_anchor_token_indices(
+                            camera_pose.shape[0],
+                            camera_pose.device,
+                        )
+                        past_key_values = self.aggregator.sync_anchor_change(
+                            past_key_values,
+                            anchor_token_count=anchor_manager.get_protected_token_count(),
+                            tokens_per_frame=tokens_per_frame,
+                            anchor_keep_ratio=anchor_keep_ratio,
+                            anchor_token_indices=anchor_token_indices,
+                            is_fifo=is_fifo,
+                            global_anchor_token_count=global_anchor_token_count,
+                        )
+
+            if camera_cache_history_anchors_only and self.camera_head is not None:
+                if camera_cache_keep_dropped_anchors:
+                    keep_camera_frame_ids = list(camera_cache_anchor_frame_ids)
+                else:
+                    keep_camera_frame_ids = [0]
+                    if anchor_manager is not None:
+                        keep_camera_frame_ids.extend(anchor_manager.history_anchor_frames)
+                keep_camera_frame_ids = list(dict.fromkeys(int(frame_id) for frame_id in keep_camera_frame_ids))
+                past_key_values_camera, camera_cache_frame_ids = _filter_grouped_camera_kv_cache(
+                    past_key_values_camera,
+                    camera_cache_frame_ids,
+                    keep_camera_frame_ids,
+                    camera_cache_tokens_per_frame,
+                )
 
             if recent_merger is not None:
                 tokens_per_frame = int(aggregated_tokens[-1].shape[2])

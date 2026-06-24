@@ -51,6 +51,58 @@ def _vbr_image_files(dir_path):
     return sorted(glob.glob(os.path.join(dir_path, "*.png")))
 
 
+def _replica_root():
+    return os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica")
+
+
+def _replica_sequences(root=None):
+    root = root or _replica_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        seq
+        for seq in os.listdir(root)
+        if os.path.isdir(os.path.join(root, seq))
+        and os.path.exists(os.path.join(root, seq, "traj.txt"))
+    )
+
+
+def _replica_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "frame*.jpg")))
+
+
+def _nrgbd_root():
+    return os.environ.get("SSTREAMVGGT_NRGBD_ROOT", "/home/dongjae/data/neural_rgbd_data")
+
+
+def _nrgbd_sequences(root=None):
+    root = root or _nrgbd_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        seq
+        for seq in os.listdir(root)
+        if os.path.isdir(os.path.join(root, seq, "images"))
+        and os.path.exists(os.path.join(root, seq, "poses.txt"))
+    )
+
+
+def _nrgbd_image_sort_key(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.startswith("img"):
+        suffix = stem[3:]
+        if suffix.isdigit():
+            return (0, int(suffix))
+    return (1, stem)
+
+
+def _nrgbd_image_files(dir_path):
+    return sorted(
+        glob.glob(os.path.join(dir_path, "img*.png")),
+        key=_nrgbd_image_sort_key,
+    )
+
+
 KITTI_ODOMETRY_GT_SEQS = [f"{i:02d}" for i in range(11)]
 KITTI_ODOMETRY_TEST_SEQS = [f"{i:02d}" for i in range(11, 22)]
 VBR_SEQS = [
@@ -145,6 +197,34 @@ dataset_metadata = {
         ),
         "traj_format": "tum",
         "seq_list": VBR_SEQS,
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "replica": {
+        "img_path": _replica_root(),
+        "anno_path": _replica_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "results"),
+        "filelist_func": _replica_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq, "traj.txt"),
+        "traj_format": "replica",
+        "seq_list": _replica_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "NRGBD": {
+        "img_path": _nrgbd_root(),
+        "anno_path": _nrgbd_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "images"),
+        "filelist_func": _nrgbd_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq, "poses.txt"),
+        "traj_format": "nrgbd",
+        "seq_list": _nrgbd_sequences(),
         "full_seq": False,
         "mask_path_seq_func": lambda mask_path, seq: None,
         "skip_condition": None,

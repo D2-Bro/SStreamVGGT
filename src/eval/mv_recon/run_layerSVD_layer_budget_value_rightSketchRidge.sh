@@ -18,11 +18,6 @@ layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
 total_budget=200000
 special_token_interval=5
-layer_budget_debug=false
-layer_budget_debug_args=()
-if [ "$layer_budget_debug" = true ]; then
-    layer_budget_debug_args=(--layer_budget_debug)
-fi
 leverage_eviction_selector=fast_dpp # [topk, fast_dpp, layer_head_fast_dpp]
 leverage_dpp_candidate_multiplier=3
 leverage_dpp_greedy_block_size=64
@@ -67,9 +62,7 @@ accelerate launch --num_processes 3 --main_process_port 29402 ./eval/mv_recon/la
     --layer_budget_value_gamma "$layer_budget_value_gamma" \
     --layer_budget_value_norm_type "$layer_budget_value_norm_type" \
     --layer_budget_norm_source "$layer_budget_norm_source" \
-    --leverage_evictable_only \
-    --budget "$total_budget" \
-    "${layer_budget_debug_args[@]}"
+    --budget "$total_budget"
 # Add --profile_eviction to the launch command above when measuring eviction latency.
-# --eviction_protect_special_tokens \
+# --eviction_protect_special_tokens
 #     --eviction_protect_special_token_interval "$special_token_interval" \

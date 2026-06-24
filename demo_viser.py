@@ -259,11 +259,15 @@ def validate_args(args):
         )
     if args.layer_budget_eps <= 0:
         raise ValueError(f"--layer_budget_eps must be > 0, got {args.layer_budget_eps}")
+    if args.slots_per_direction <= 0:
+        raise ValueError(f"--slots_per_direction must be > 0, got {args.slots_per_direction}")
+    if not (0.0 <= args.hybrid_beta <= 1.0):
+        raise ValueError(f"--hybrid_beta must be in [0, 1], got {args.hybrid_beta}")
     if args.layer_budget_strategy != "uniform" and (
         args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
     ):
         raise ValueError(
-            "--layer_budget_strategy leverage_pr/leverage_entropy requires "
+            "--layer_budget_strategy leverage/covariance-based modes require "
             "--eviction_policy svd_leverage and --leverage_granularity layer"
         )
     if args.eviction_protect_recent_frames < 0:
@@ -417,8 +421,6 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             leverage_projection=args.leverage_projection,
             leverage_head_mean_dim=args.leverage_head_mean_dim,
             leverage_approx_method=args.leverage_approx_method,
-            leverage_left_sketch_dim=args.leverage_left_sketch_dim,
-            leverage_right_jl_dim=args.leverage_right_jl_dim,
             leverage_ridge_lambda=args.leverage_ridge_lambda,
             leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
             leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
@@ -438,7 +440,8 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             layer_budget_alpha=args.layer_budget_alpha,
             layer_budget_min_tokens=args.layer_budget_min_tokens,
             layer_budget_eps=args.layer_budget_eps,
-            layer_budget_debug=args.layer_budget_debug,
+            slots_per_direction=args.slots_per_direction,
+            hybrid_beta=args.hybrid_beta,
             eviction_nn_analysis_config=eviction_nn_analysis_config,
             eviction_protect_recent_frames=args.eviction_protect_recent_frames,
             eviction_protect_special_tokens=args.eviction_protect_special_tokens,
@@ -620,12 +623,13 @@ def main():
         "--layer-budget-strategy",
         type=str,
         default="leverage_pr",
-        choices=("uniform", "leverage_pr", "leverage_entropy"),
+        choices=("uniform", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
     )
     parser.add_argument("--layer_budget_alpha", "--layer-budget-alpha", type=float, default=1.0)
-    parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=3000)
+    parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
-    parser.add_argument("--layer_budget_debug", "--layer-budget-debug", action="store_true")
+    parser.add_argument("--slots_per_direction", "--slots-per-direction", type=float, default=4.0)
+    parser.add_argument("--hybrid_beta", "--hybrid-beta", type=float, default=0.5)
     parser.add_argument("--eviction_protect_recent_frames", "--eviction-protect-recent-frames", type=int, default=0)
     parser.add_argument("--eviction_protect_special_tokens", "--eviction-protect-special-tokens", action="store_true")
     parser.add_argument("--eviction_protect_special_token_interval", "--eviction-protect-special-token-interval", type=int, default=1)

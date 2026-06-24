@@ -36,7 +36,7 @@ accelerate launch --num_processes 4 --main_process_port 29602 ./eval/mv_recon/la
     --svd_eviction_merge_geometry_gate none \
     --svd_eviction_merge_ema_decay 0.9 \
     --no-svd_eviction_merge_use_depth_confidence
-    # --svd_eviction_merge_debug \
+    # --svd_eviction_merge_debug
     # --svd_eviction_merge_profile
 
 

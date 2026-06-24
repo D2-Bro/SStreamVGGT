@@ -22,7 +22,14 @@ from collections import defaultdict
 from streamvggt.layers.recent_merge import RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig
-from streamvggt.utils.cache_analysis import add_eviction_nn_analysis_args, eviction_nn_config_from_args
+from streamvggt.utils.cache_analysis import (
+    add_eviction_nn_analysis_args,
+    add_leverage_score_histogram_args,
+    add_token_overlay_dump_args,
+    eviction_nn_config_from_args,
+    leverage_score_histogram_config_from_args,
+    token_overlay_dump_config_from_args,
+)
 
 
 def wait_for_rank_logs(
@@ -65,6 +72,50 @@ def resolve_global_attn_idx_ranges(args):
     return args.global_attn_idx_ranges
 
 
+def parse_eviction_policy_layers(spec, num_layers):
+    if spec is None:
+        return None
+    spec = str(spec).strip()
+    if not spec:
+        return None
+    selected = set()
+    for raw_part in spec.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError(f"empty layer selector in {spec!r}")
+        if ":" in part:
+            pieces = part.split(":")
+            if len(pieces) != 2 or not pieces[0] or not pieces[1]:
+                raise ValueError(f"invalid layer range {part!r}; expected start:end")
+            try:
+                start = int(pieces[0])
+                end = int(pieces[1])
+            except ValueError as exc:
+                raise ValueError(f"invalid layer range {part!r}; bounds must be integers") from exc
+            if start < 0 or end < 0:
+                raise ValueError(f"invalid layer range {part!r}; bounds must be non-negative")
+            if start >= end:
+                raise ValueError(f"invalid layer range {part!r}; start must be < end")
+            if end > num_layers:
+                raise ValueError(
+                    f"layer range {part!r} ends at {end}, but only {num_layers} global layers exist"
+                )
+            selected.update(range(start, end))
+        else:
+            try:
+                layer = int(part)
+            except ValueError as exc:
+                raise ValueError(f"invalid layer selector {part!r}; expected integer or start:end") from exc
+            if layer < 0:
+                raise ValueError(f"invalid layer selector {part!r}; layer must be non-negative")
+            if layer >= num_layers:
+                raise ValueError(
+                    f"layer selector {part!r} is out of range; only {num_layers} global layers exist"
+                )
+            selected.add(layer)
+    return selected
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser("3D Reconstruction evaluation", add_help=False)
     parser.add_argument(
@@ -90,6 +141,13 @@ def get_args_parser():
     parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
     parser.add_argument("--use_proj", action="store_true")
     parser.add_argument("--eviction_policy", type=str, default="mean", help="Cache eviction policy: mean, baseline_mean, svd_leverage, or dpp")
+    parser.add_argument(
+        "--eviction_policy_layers",
+        "--eviction-policy-layers",
+        type=str,
+        default=None,
+        help="Comma-separated zero-based global layer selectors that use --eviction_policy; other layers use FIFO. Example: 4:12,18,20:24",
+    )
     parser.add_argument(
         "--leverage_sketch_dim",
         type=int,
@@ -131,33 +189,12 @@ def get_args_parser():
         help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
     )
     parser.add_argument(
-        "--leverage_evictable_only",
-        "--leverage-evictable-only",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Compute SVD leverage using only tokens allowed by special-token eviction protection",
-    )
-    parser.add_argument(
         "--leverage_approx_method",
         "--leverage-approx-method",
         type=str,
         default="exact_qr",
-        choices=("exact_qr", "right_sketch", "drineas_srht", "full_d_ridge", "right_sketch_ridge"),
-        help="Leverage approximation: exact QR, right-sketched/Compactor-style, or Drineas left SRHT",
-    )
-    parser.add_argument(
-        "--leverage_left_sketch_dim",
-        "--leverage-left-sketch-dim",
-        type=int,
-        default=2048,
-        help="Left SRHT row count r1 for leverage_approx_method=drineas_srht",
-    )
-    parser.add_argument(
-        "--leverage_right_jl_dim",
-        "--leverage-right-jl-dim",
-        type=int,
-        default=64,
-        help="Right JL dimension r2 for leverage_approx_method=drineas_srht; <=0 uses no right JL",
+        choices=("exact_qr", "right_sketch", "full_d_ridge", "right_sketch_ridge"),
+        help="Leverage approximation: exact QR, right-sketched/Compactor-style, or ridge-based scoring",
     )
     parser.add_argument(
         "--leverage_ridge_lambda",
@@ -193,7 +230,7 @@ def get_args_parser():
         "--leverage-ridge-dim",
         type=int,
         default=None,
-        help="Projection dimension for right_sketch_ridge; defaults to --leverage_right_jl_dim when omitted",
+        help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge",
     )
     parser.add_argument(
         "--leverage_random_seed",
@@ -207,8 +244,39 @@ def get_args_parser():
         "--leverage-eviction-selector",
         type=str,
         default="topk",
-        choices=("topk", "fast_dpp", "layer_head_fast_dpp"),
-        help="Eviction selector for svd_leverage scores: topk, shared Fast DPP, or GPU head-wise Fast DPP with layer scores",
+        choices=("topk", "fast_dpp", "layer_head_fast_dpp", "similarity_topk"),
+        help="Eviction selector for svd_leverage scores: topk, shared Fast DPP, similarity top-k, or GPU head-wise Fast DPP with layer scores",
+    )
+    parser.add_argument(
+        "--leverage_similarity_granularity",
+        "--leverage-similarity-granularity",
+        type=str,
+        default="layer",
+        choices=("layer", "head"),
+        help="Similarity feature granularity for similarity_topk: layer preserves shared layer-wise eviction, head uses head-wise cosine and head-specific eviction",
+    )
+    parser.add_argument(
+        "--leverage_similarity_feature_projection",
+        "--leverage-similarity-feature-projection",
+        type=str,
+        default="raw",
+        choices=("raw", "random"),
+        help="Feature source for similarity_topk cosine: raw key features or random projected leverage features reused from score computation",
+    )
+    parser.add_argument(
+        "--leverage_eviction_risk_mode",
+        "--leverage-eviction-risk-mode",
+        type=str,
+        default="low_leverage",
+        choices=("low_leverage", "outlier_then_low"),
+        help="SVD leverage eviction risk mode: existing low-leverage eviction or direct high-outlier eviction before low-score selection",
+    )
+    parser.add_argument(
+        "--leverage_high_outlier_z",
+        "--leverage-high-outlier-z",
+        type=float,
+        default=3.0,
+        help="Robust z-score threshold for direct high-leverage outlier eviction when leverage_eviction_risk_mode=outlier_then_low",
     )
     parser.add_argument(
         "--leverage_dpp_candidate_multiplier",
@@ -238,17 +306,25 @@ def get_args_parser():
         default=1.0,
         help="Fast DPP diversity log-term weight; 1.0 preserves the default DPP balance",
     )
-    parser.add_argument("--leverage_dpp_recency_bonus", "--leverage-dpp-recency-bonus", action="store_true", help="Add a weak recency quality prior inside Fast DPP retain selection")
-    parser.add_argument("--leverage_dpp_recency_lambda", "--leverage-dpp-recency-lambda", type=float, default=0.2, help="Strength of the Fast DPP recency quality prior")
-    parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=5, help="Frame window for linear Fast DPP freshness")
-    parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for Fast DPP recency")
-    parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print Fast DPP recency prior summary statistics")
+    parser.add_argument(
+        "--leverage_dpp_feature_projection",
+        "--leverage-dpp-feature-projection",
+        type=str,
+        default="raw",
+        choices=("raw", "random"),
+        help="Feature projection for Fast DPP diversity similarity; random reuses leverage_ridge_dim",
+    )
+    parser.add_argument("--leverage_dpp_recency_bonus", "--leverage-dpp-recency-bonus", action="store_true", help="Add a soft recency bonus to SVD leverage eviction scores")
+    parser.add_argument("--leverage_dpp_recency_lambda", "--leverage-dpp-recency-lambda", type=float, default=0.2, help="Strength of the eviction-score recency bonus")
+    parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=5, help="Frame window for linear eviction-score freshness")
+    parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for eviction-score recency")
+    parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print eviction-score recency bonus summary statistics")
     parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
         type=str,
         default="uniform",
-        choices=("uniform", "cosine_precomputed", "leverage_pr", "leverage_entropy", "value_weighted_leverage_pr"),
+        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
         help="Layer-wise KV budget allocation strategy",
     )
     parser.add_argument(
@@ -262,6 +338,8 @@ def get_args_parser():
     parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
     parser.add_argument("--layer_budget_value_gamma", "--layer-budget-value-gamma", type=float, default=0.5)
+    parser.add_argument("--slots_per_direction", "--slots-per-direction", type=float, default=4.0)
+    parser.add_argument("--hybrid_beta", "--hybrid-beta", type=float, default=0.5)
     parser.add_argument(
         "--layer_budget_value_norm_type",
         "--layer-budget-value-norm-type",
@@ -277,12 +355,6 @@ def get_args_parser():
         default="value",
         choices=("value", "key"),
         help="Tensor source for value_weighted_leverage_pr norm prior: value cache or key cache",
-    )
-    parser.add_argument(
-        "--layer_budget_debug",
-        "--layer-budget-debug",
-        action="store_true",
-        help="Print layer-wise budget allocation details",
     )
     parser.add_argument(
         "--eviction_protect_recent_frames",
@@ -322,6 +394,30 @@ def get_args_parser():
         help="Run cache eviction only every N cached keyframes; 1 preserves current behavior",
     )
     parser.add_argument(
+        "--global_cache_history_anchor_special_tokens_only",
+        "--global-cache-history-anchor-special-tokens-only",
+        action="store_true",
+        help="Store global KV special tokens only for frame 0 and active history anchor frames.",
+    )
+    parser.add_argument(
+        "--first_frame_special_tokens_only",
+        "--first-frame-special-tokens-only",
+        action="store_true",
+        help="Protect only first-frame special tokens as the global anchor; first-frame patch tokens can be evicted.",
+    )
+    parser.add_argument(
+        "--camera_cache_history_anchors_only",
+        "--camera-cache-history-anchors-only",
+        action="store_true",
+        help="Keep camera-head KV cache only for frame 0 and active history anchor frames.",
+    )
+    parser.add_argument(
+        "--camera_cache_keep_dropped_anchors",
+        "--camera-cache-keep-dropped-anchors",
+        action="store_true",
+        help="With camera anchor-only cache, keep camera KV for anchors even after FIFO demotion.",
+    )
+    parser.add_argument(
         "--eviction_debug",
         "--eviction-debug",
         action="store_true",
@@ -349,6 +445,8 @@ def get_args_parser():
         help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior",
     )
     add_eviction_nn_analysis_args(parser)
+    add_leverage_score_histogram_args(parser)
+    add_token_overlay_dump_args(parser)
     parser.add_argument(
         "--enable_svd_eviction_merge",
         "--enable-svd-eviction-merge",
@@ -605,6 +703,22 @@ def main(args):
             "Error: --leverage_head_mean_dim must be >= 1, "
             f"got {args.leverage_head_mean_dim}."
         )
+    if args.leverage_high_outlier_z < 0:
+        raise SystemExit(
+            "Error: --leverage_high_outlier_z must be >= 0, "
+            f"got {args.leverage_high_outlier_z}."
+        )
+    if args.leverage_score_histogram_bins < 1:
+        raise SystemExit(
+            "Error: --leverage_score_histogram_bins must be >= 1, "
+            f"got {args.leverage_score_histogram_bins}."
+        )
+    if args.leverage_score_histogram_max <= args.leverage_score_histogram_min:
+        raise SystemExit(
+            "Error: --leverage_score_histogram_max must be greater than --leverage_score_histogram_min, "
+            f"got min={args.leverage_score_histogram_min}, max={args.leverage_score_histogram_max}."
+        )
+
     if args.leverage_dpp_candidate_multiplier < 1:
         raise SystemExit(
             "Error: --leverage_dpp_candidate_multiplier must be >= 1, "
@@ -624,6 +738,11 @@ def main(args):
         raise SystemExit(
             "Error: --leverage_dpp_diversity_beta must be >= 0, "
             f"got {args.leverage_dpp_diversity_beta}."
+        )
+    if args.leverage_dpp_feature_projection == "random" and args.leverage_ridge_dim is None:
+        raise SystemExit(
+            "Error: --leverage_dpp_feature_projection random requires "
+            "--leverage_ridge_dim >= 1."
         )
     if args.leverage_dpp_recency_lambda < 0:
         raise SystemExit(
@@ -680,18 +799,16 @@ def main(args):
             "Error: --leverage_ridge_dim must be >= 1 when provided, "
             f"got {args.leverage_ridge_dim}."
         )
-    if args.leverage_approx_method == "right_sketch_ridge":
-        resolved_ridge_dim = args.leverage_ridge_dim if args.leverage_ridge_dim is not None else args.leverage_right_jl_dim
-        if resolved_ridge_dim is None or int(resolved_ridge_dim) < 1:
-            raise SystemExit(
-                "Error: --leverage_approx_method right_sketch_ridge requires "
-                "--leverage_ridge_dim >= 1 or --leverage_right_jl_dim >= 1."
-            )
-    if args.layer_budget_strategy in ("leverage_pr", "leverage_entropy", "value_weighted_leverage_pr") and (
+    if args.leverage_approx_method == "right_sketch_ridge" and args.leverage_ridge_dim is None:
+        raise SystemExit(
+            "Error: --leverage_approx_method right_sketch_ridge requires "
+            "--leverage_ridge_dim >= 1."
+        )
+    if args.layer_budget_strategy not in ("uniform", "cosine_precomputed") and (
         args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
     ):
         raise SystemExit(
-            "Error: leverage-based --layer_budget_strategy requires "
+            "Error: leverage/covariance-based --layer_budget_strategy requires "
             "--eviction_policy svd_leverage and --leverage_granularity layer."
         )
     if args.layer_budget_strategy == "cosine_precomputed" and not args.layer_budget_proportions_path:
@@ -711,19 +828,20 @@ def main(args):
             f"granularity={args.leverage_granularity}, "
             f"feature={args.leverage_feature}, "
             f"approx={args.leverage_approx_method}, "
-            f"r1={args.leverage_left_sketch_dim}, r2={args.leverage_right_jl_dim}, "
             f"ridge_dim={args.leverage_ridge_dim}, ridge_lambda={args.leverage_ridge_lambda}, "
             f"ridge_lambda_mode={args.leverage_ridge_lambda_mode}, "
             f"ridge_chunk={args.leverage_ridge_score_chunk_size}, ridge_jitter={args.leverage_ridge_jitter}, "
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
-            f"evictable_only={args.leverage_evictable_only}, "
             f"selector={args.leverage_eviction_selector}, "
+            f"risk_mode={args.leverage_eviction_risk_mode}, "
+            f"high_outlier_z={args.leverage_high_outlier_z}, "
             f"dpp_candidate_multiplier={args.leverage_dpp_candidate_multiplier}, "
             f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
             f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
             f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
+            f"dpp_feature_projection={args.leverage_dpp_feature_projection}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
@@ -744,6 +862,7 @@ def main(args):
             f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
             f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
             f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
+            f"dpp_feature_projection={args.leverage_dpp_feature_projection}, "
             f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
     if args.svd_eviction_merge_candidate_axes < 1:
@@ -807,7 +926,7 @@ def main(args):
         )
 
     add_path_to_dust3r(args.weights)
-    from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D
+    from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D, Replica
     from eval.mv_recon.utils import accuracy, completion
 
     if args.size == 512:
@@ -841,6 +960,15 @@ def main(args):
             kf_every=2,
             max_frames=args.max_frames,
         ),
+        # "Replica": Replica(
+        #     split="test",
+        #     ROOT=os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica"),
+        #     resolution=resolution,
+        #     num_seq=1,
+        #     full_video=True,
+        #     kf_every=2,
+        #     max_frames=args.max_frames,
+        # ),
     }
 
     accelerator = Accelerator(
@@ -858,6 +986,7 @@ def main(args):
 
         torch.cuda.set_device(device_index)
     model_name = args.model_name
+    eviction_policy_layers = None
     if model_name == "StreamVGGT":
         # from streamvggt.models.streamvggt import StreamVGGT
         from streamvggt.models.streamvggt import StreamVGGT
@@ -874,6 +1003,19 @@ def main(args):
             print(f"Loaded precomputed layer budget proportions: {args.layer_budget_proportions_path}")
         model.eval()
         model = model.to(device)
+        try:
+            eviction_policy_layers = parse_eviction_policy_layers(
+                args.eviction_policy_layers,
+                model.aggregator.depth,
+            )
+        except ValueError as exc:
+            raise SystemExit(f"Error: --eviction_policy_layers: {exc}") from exc
+        if eviction_policy_layers is not None:
+            print(
+                "Using layer-range eviction override: "
+                f"policy_layers={sorted(eviction_policy_layers)}, "
+                "fallback_policy=fifo"
+            )
     elif model_name == "VGGT":
         from vggt.models.vggt import VGGT
         from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -1033,6 +1175,8 @@ def main(args):
                                     def covis_log_fn(msg):
                                         print(msg)
                                 eviction_nn_analysis_config = None
+                                leverage_score_histogram_config = None
+                                token_overlay_dump_config = None
                                 if args.eviction_nn_analysis_dir:
                                     scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
                                     safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
@@ -1043,26 +1187,54 @@ def main(args):
                                         f"{int(data_idx):04d}_{safe_scene}",
                                     )
                                     eviction_nn_analysis_config = eviction_nn_config_from_args(args, output_dir=nn_dir)
+                                if args.leverage_score_histogram_dir:
+                                    scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
+                                    safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                                    hist_dir = osp.join(
+                                        args.leverage_score_histogram_dir,
+                                        name_data,
+                                        f"rank_{accelerator.process_index}",
+                                        f"{int(data_idx):04d}_{safe_scene}",
+                                    )
+                                    leverage_score_histogram_config = leverage_score_histogram_config_from_args(args, output_dir=hist_dir)
+                                if args.token_overlay_dump_dir:
+                                    scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
+                                    safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                                    overlay_dump_dir = osp.join(
+                                        args.token_overlay_dump_dir,
+                                        name_data,
+                                        f"rank_{accelerator.process_index}",
+                                        f"{int(data_idx):04d}_{safe_scene}",
+                                    )
+                                    token_overlay_dump_config = token_overlay_dump_config_from_args(args, output_dir=overlay_dump_dir)
 
                                 results = model.inference(
                                     batch,
                                     eviction_policy=args.eviction_policy,
+                                    eviction_policy_layers=eviction_policy_layers,
                                     leverage_sketch_dim=args.leverage_sketch_dim,
                                     leverage_granularity=args.leverage_granularity,
                                     leverage_feature=args.leverage_feature,
                                     leverage_projection=args.leverage_projection,
                                     leverage_head_mean_dim=args.leverage_head_mean_dim,
                                     leverage_normalize_rows=args.leverage_normalize_rows,
-                                    leverage_evictable_only=args.leverage_evictable_only,
                                     leverage_approx_method=args.leverage_approx_method,
-                                    leverage_left_sketch_dim=args.leverage_left_sketch_dim,
-                                    leverage_right_jl_dim=args.leverage_right_jl_dim,
+                                    leverage_ridge_lambda=args.leverage_ridge_lambda,
+                                    leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
+                                    leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
+                                    leverage_ridge_jitter=args.leverage_ridge_jitter,
+                                    leverage_ridge_dim=args.leverage_ridge_dim,
                                     leverage_random_seed=args.leverage_random_seed,
                                     leverage_eviction_selector=args.leverage_eviction_selector,
+                                    leverage_similarity_granularity=args.leverage_similarity_granularity,
+                                    leverage_similarity_feature_projection=args.leverage_similarity_feature_projection,
+                                    leverage_eviction_risk_mode=args.leverage_eviction_risk_mode,
+                                    leverage_high_outlier_z=args.leverage_high_outlier_z,
                                     leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
                                     leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
                                     leverage_dpp_quality_beta=args.leverage_dpp_quality_beta,
                                     leverage_dpp_diversity_beta=args.leverage_dpp_diversity_beta,
+                                    leverage_dpp_feature_projection=args.leverage_dpp_feature_projection,
                                     leverage_dpp_recency_bonus=args.leverage_dpp_recency_bonus,
                                     leverage_dpp_recency_lambda=args.leverage_dpp_recency_lambda,
                                     leverage_dpp_recency_window=args.leverage_dpp_recency_window,
@@ -1075,7 +1247,8 @@ def main(args):
                                     layer_budget_alpha=args.layer_budget_alpha,
                                     layer_budget_min_tokens=args.layer_budget_min_tokens,
                                     layer_budget_eps=args.layer_budget_eps,
-                                    layer_budget_debug=args.layer_budget_debug,
+                                    slots_per_direction=args.slots_per_direction,
+                                    hybrid_beta=args.hybrid_beta,
                                     eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                                     eviction_protect_special_tokens=args.eviction_protect_special_tokens,
                                     eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
@@ -1089,6 +1262,8 @@ def main(args):
                                     anchor_keep_ratio=args.anchor_keep_ratio,
                                     eviction_debug=args.eviction_debug or args.profile_eviction,
                                     eviction_nn_analysis_config=eviction_nn_analysis_config,
+                                    leverage_score_histogram_config=leverage_score_histogram_config,
+                                    token_overlay_dump_config=token_overlay_dump_config,
                                     recent_merge_config=recent_merge_config,
                                     svd_eviction_merge_config=svd_eviction_merge_config,
                                     voxel_covis_config=voxel_covis_config,
@@ -1097,7 +1272,14 @@ def main(args):
                                     global_attn_debug=args.global_attn_debug,
                                     kf_interval=args.kf_interval,
                                     evict_interval=args.evict_interval,
+                                    global_cache_history_anchor_special_tokens_only=args.global_cache_history_anchor_special_tokens_only,
+
+                                    first_frame_special_tokens_only=args.first_frame_special_tokens_only,
+                                    camera_cache_history_anchors_only=args.camera_cache_history_anchors_only,
+                                    camera_cache_keep_dropped_anchors=args.camera_cache_keep_dropped_anchors,
                                 )
+                                if leverage_score_histogram_config is not None:
+                                    leverage_score_histogram_config.flush()
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize(device)
                                 infer_time = time.perf_counter() - infer_start
