@@ -231,6 +231,12 @@ def run_inference(args: argparse.Namespace):
             f"got {args.leverage_ridge_lambda}."
         )
         return
+    if args.leverage_diag_interval < 0:
+        print(
+            "Error: --leverage_diag_interval must be >= 0, "
+            f"got {args.leverage_diag_interval}."
+        )
+        return
     if args.leverage_ridge_jitter <= 0:
         print(
             "Error: --leverage_ridge_jitter must be > 0, "
@@ -448,6 +454,8 @@ def run_inference(args: argparse.Namespace):
                 leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                 leverage_ridge_jitter=args.leverage_ridge_jitter,
                 leverage_ridge_dim=args.leverage_ridge_dim,
+                leverage_diag=args.leverage_diag,
+                leverage_diag_interval=args.leverage_diag_interval,
                 leverage_random_seed=args.leverage_random_seed,
                 leverage_eviction_selector=args.leverage_eviction_selector,
                 leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
@@ -757,6 +765,19 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Projection dimension for right_sketch_ridge; defaults to --leverage_right_jl_dim when omitted",
+    )
+    parser.add_argument(
+        "--leverage_diag",
+        "--leverage-diag",
+        action="store_true",
+        help="Print ridge leverage diagnostic statistics at selected eviction steps",
+    )
+    parser.add_argument(
+        "--leverage_diag_interval",
+        "--leverage-diag-interval",
+        type=int,
+        default=0,
+        help="Diagnostic interval; 0 prints only the first eviction step, positive values print every N steps",
     )
     parser.add_argument(
         "--leverage_random_seed",

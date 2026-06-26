@@ -1,0 +1,36 @@
+{
+  "metadata": {
+    "bins": 100,
+    "conf_shape": [
+      20,
+      378,
+      518
+    ],
+    "conf_source": "world_points_conf",
+    "device": "cuda",
+    "frame_stride": 2,
+    "image_dir": "/home/dongjae/data/neural_rgbd_data/complete_kitchen/images/",
+    "input_images": 20,
+    "max_frames": 20,
+    "model_name": "StreamVGGT",
+    "num_frames": 20,
+    "size": 518,
+    "weights": "SStreamVGGT/ckpt/checkpoints.pth"
+  },
+  "overall": {
+    "count": 3916080,
+    "max": 19.0972843170166,
+    "mean": 8.923838768365233,
+    "min": 1.414773941040039,
+    "p1": 3.8426434993743896,
+    "p10": 5.328274488449097,
+    "p25": 6.669285893440247,
+    "p5": 4.658776044845581,
+    "p50": 8.565832138061523,
+    "p75": 10.791158676147461,
+    "p90": 13.135923576354982,
+    "p95": 14.439263343811035,
+    "p99": 16.512671012878418,
+    "std": 2.95932284017695
+  }
+}

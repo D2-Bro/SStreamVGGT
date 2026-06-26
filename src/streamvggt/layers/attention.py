@@ -21,6 +21,7 @@ from streamvggt.utils.cache_analysis import (
     dump_token_overlay_event,
 )
 from streamvggt.layers.eviction import EvictionManager
+from streamvggt.layers.confidence_state import KVConfidenceState, pack_kv_cache, unpack_kv_cache
 from streamvggt.layers.recent_merge import KVCacheMetadata, RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig, SvdEvictionMerger
 
@@ -69,6 +70,7 @@ class Attention(nn.Module):
         metadata: Optional[KVCacheMetadata],
         cache_budget: int,
         num_anchor_tokens: int,
+        confidence_state: Optional[KVConfidenceState] = None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
@@ -91,10 +93,13 @@ class Attention(nn.Module):
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        leverage_diag: bool = False,
+        leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
         leverage_similarity_granularity: str = "layer",
         leverage_similarity_feature_projection: str = "raw",
+        leverage_similarity_leverage_gamma: float = 1.0,
         leverage_eviction_risk_mode: str = "low_leverage",
         leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
@@ -107,6 +112,10 @@ class Attention(nn.Module):
         leverage_dpp_recency_window: int = 5,
         leverage_dpp_recency_gate_power: float = 1.0,
         leverage_dpp_recency_debug: bool = False,
+        leverage_conf_gate: bool = False,
+        leverage_conf_gate_floor: float = 0.2,
+        leverage_conf_gate_depth_alpha: float = 1.0,
+        leverage_conf_gate_point_beta: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -123,7 +132,7 @@ class Attention(nn.Module):
         history_anchor_frame_ids: Optional[Sequence[int]] = None,
         history_anchor_patch_topk_per_frame: int = 0,
         history_anchor_max_frames: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVCacheMetadata], float]:
+    ):
         """
         Evicts tokens from the key-value cache based on key cosine similarity.
 
@@ -148,6 +157,8 @@ class Attention(nn.Module):
         special_token_count = max(int(special_token_count), 0)
 
         if N <= cache_budget or N <= num_anchor_tokens:
+            if confidence_state is not None:
+                return k, v, metadata, confidence_state, 0.0
             return k, v, metadata, 0.0
 
         use_fifo_override = (
@@ -174,13 +185,22 @@ class Attention(nn.Module):
                 if metadata is not None
                 else None
             )
+            final_confidence_state = (
+                confidence_state.gather(keep_indices)
+                if confidence_state is not None
+                else None
+            )
             if eviction_debug:
                 print(
                     f"[Attention] fifo_eviction layer={layer_id} step={step_idx} "
                     f"cache={N} budget={cache_budget} anchors={num_anchor_tokens} "
                     f"keep_candidates={keep_candidate_count}"
                 )
-            return torch.gather(k, 2, expanded_indices), torch.gather(v, 2, expanded_indices), final_metadata, 0.0
+            final_k = torch.gather(k, 2, expanded_indices)
+            final_v = torch.gather(v, 2, expanded_indices)
+            if confidence_state is not None:
+                return final_k, final_v, final_metadata, final_confidence_state, 0.0
+            return final_k, final_v, final_metadata, 0.0
 
         window_token_count = 0 if window_token_count is None else int(window_token_count)
         window_token_count = max(window_token_count, 0)
@@ -193,15 +213,25 @@ class Attention(nn.Module):
             keep_indices = keep_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
             expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, num_anchor_tokens, D)
             final_metadata = metadata.gather(keep_indices.detach().cpu()) if metadata is not None else None
-            return torch.gather(k, 2, expanded_indices), torch.gather(v, 2, expanded_indices), final_metadata, 0.0
+            final_confidence_state = confidence_state.gather(keep_indices) if confidence_state is not None else None
+            final_k = torch.gather(k, 2, expanded_indices)
+            final_v = torch.gather(v, 2, expanded_indices)
+            if confidence_state is not None:
+                return final_k, final_v, final_metadata, final_confidence_state, 0.0
+            return final_k, final_v, final_metadata, 0.0
 
         select_k = k[:, :, :tail_start, :]
         select_v = v[:, :, :tail_start, :]
         select_metadata = metadata
+        select_confidence_state = confidence_state
         if metadata is not None and tail_count > 0:
             prefix_indices = torch.arange(tail_start, dtype=torch.long).view(1, 1, tail_start)
             prefix_indices = prefix_indices.expand(B, H, tail_start)
             select_metadata = metadata.gather(prefix_indices)
+        if confidence_state is not None and tail_count > 0:
+            prefix_indices = torch.arange(tail_start, device=k.device, dtype=torch.long).view(1, tail_start)
+            prefix_indices = prefix_indices.expand(B, tail_start)
+            select_confidence_state = confidence_state.gather(prefix_indices)
         select_budget = cache_budget - tail_count
         selection_budget = max(select_budget, num_anchor_tokens) if eviction_protect_special_tokens else select_budget
         if eviction_protect_special_tokens and select_metadata is None:
@@ -244,10 +274,13 @@ class Attention(nn.Module):
             leverage_ridge_score_chunk_size,
             leverage_ridge_jitter,
             leverage_ridge_dim,
+            leverage_diag,
+            leverage_diag_interval,
             leverage_random_seed,
             leverage_eviction_selector,
             leverage_similarity_granularity,
             leverage_similarity_feature_projection,
+            leverage_similarity_leverage_gamma,
             leverage_eviction_risk_mode,
             leverage_high_outlier_z,
             leverage_dpp_candidate_multiplier,
@@ -260,6 +293,10 @@ class Attention(nn.Module):
             leverage_dpp_recency_window,
             leverage_dpp_recency_gate_power,
             leverage_dpp_recency_debug,
+            leverage_conf_gate,
+            leverage_conf_gate_floor,
+            leverage_conf_gate_depth_alpha,
+            leverage_conf_gate_point_beta,
             layer_budget_strategy,
             layer_budget_value_gamma,
             layer_budget_value_norm_type,
@@ -284,10 +321,13 @@ class Attention(nn.Module):
                 leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                 leverage_ridge_jitter=leverage_ridge_jitter,
                 leverage_ridge_dim=leverage_ridge_dim,
+                leverage_diag=leverage_diag,
+                leverage_diag_interval=leverage_diag_interval,
                 leverage_random_seed=leverage_random_seed,
                 leverage_eviction_selector=leverage_eviction_selector,
                 leverage_similarity_granularity=leverage_similarity_granularity,
                 leverage_similarity_feature_projection=leverage_similarity_feature_projection,
+                leverage_similarity_leverage_gamma=leverage_similarity_leverage_gamma,
                 leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                 leverage_high_outlier_z=leverage_high_outlier_z,
                 leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
@@ -300,6 +340,10 @@ class Attention(nn.Module):
                 leverage_dpp_recency_window=leverage_dpp_recency_window,
                 leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
                 leverage_dpp_recency_debug=leverage_dpp_recency_debug,
+                leverage_conf_gate=leverage_conf_gate,
+                leverage_conf_gate_floor=leverage_conf_gate_floor,
+                leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
+                leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                 layer_budget_strategy=layer_budget_strategy,
                 layer_budget_value_gamma=layer_budget_value_gamma,
                 layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -328,6 +372,39 @@ class Attention(nn.Module):
                 candidate_evictable_mask = candidate_evictable_mask.all(dim=1)
             candidate_evictable_mask = candidate_evictable_mask.to(device=select_k.device)
         selection_start = time.perf_counter() if profile_eviction else 0.0
+        candidate_frame_ids = (
+            select_metadata.frame_ids[:, :, num_anchor_tokens:]
+            if select_metadata is not None
+            else (
+                select_confidence_state.frame_ids[:, num_anchor_tokens:]
+                if select_confidence_state is not None
+                else None
+            )
+        )
+        candidate_token_indices = (
+            select_metadata.token_indices[:, :, num_anchor_tokens:]
+            if select_metadata is not None
+            else (
+                select_confidence_state.token_indices[:, num_anchor_tokens:]
+                if select_confidence_state is not None
+                else None
+            )
+        )
+        candidate_conf_gate = (
+            select_confidence_state.confidence_gate[:, num_anchor_tokens:]
+            if select_confidence_state is not None
+            else None
+        )
+        candidate_depth_confidence = (
+            select_metadata.accumulated_depth_confidence[:, :, num_anchor_tokens:]
+            if select_confidence_state is None and select_metadata is not None
+            else None
+        )
+        candidate_point_confidence = (
+            select_metadata.accumulated_point_confidence[:, :, num_anchor_tokens:]
+            if select_confidence_state is None and select_metadata is not None
+            else None
+        )
         eviction_result = eviction.select(
             select_k,
             selection_budget,
@@ -338,16 +415,11 @@ class Attention(nn.Module):
             step_idx=step_idx,
             current_frame_idx=step_idx,
             protect_recent_frames=eviction_protect_recent_frames,
-            candidate_frame_ids=(
-                select_metadata.frame_ids[:, :, num_anchor_tokens:]
-                if select_metadata is not None
-                else None
-            ),
-            candidate_token_indices=(
-                select_metadata.token_indices[:, :, num_anchor_tokens:]
-                if select_metadata is not None
-                else None
-            ),
+            candidate_frame_ids=candidate_frame_ids,
+            candidate_token_indices=candidate_token_indices,
+            candidate_depth_confidence=candidate_depth_confidence,
+            candidate_point_confidence=candidate_point_confidence,
+            candidate_conf_gate=candidate_conf_gate,
             candidate_evictable_mask=candidate_evictable_mask,
             history_anchor_frame_ids=history_anchor_frame_ids,
             history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
@@ -464,6 +536,11 @@ class Attention(nn.Module):
             if metadata is not None
             else None
         )
+        final_confidence_state = (
+            confidence_state.gather(keep_indices)
+            if confidence_state is not None
+            else None
+        )
         if profile_eviction:
             if final_k.is_cuda and torch.cuda.is_available():
                 torch.cuda.synchronize(final_k.device)
@@ -477,7 +554,11 @@ class Attention(nn.Module):
             )
 
         if layer_budget_score is not None:
+            if confidence_state is not None:
+                return final_k, final_v, final_metadata, final_confidence_state, (avg_scores, layer_budget_score)
             return final_k, final_v, final_metadata, (avg_scores, layer_budget_score)
+        if confidence_state is not None:
+            return final_k, final_v, final_metadata, final_confidence_state, avg_scores
         return final_k, final_v, final_metadata, avg_scores
 
     def forward(self, 
@@ -509,10 +590,13 @@ class Attention(nn.Module):
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        leverage_diag: bool = False,
+        leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
         leverage_similarity_granularity: str = "layer",
         leverage_similarity_feature_projection: str = "raw",
+        leverage_similarity_leverage_gamma: float = 1.0,
         leverage_eviction_risk_mode: str = "low_leverage",
         leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
@@ -525,6 +609,10 @@ class Attention(nn.Module):
         leverage_dpp_recency_window: int = 5,
         leverage_dpp_recency_gate_power: float = 1.0,
         leverage_dpp_recency_debug: bool = False,
+        leverage_conf_gate: bool = False,
+        leverage_conf_gate_floor: float = 0.2,
+        leverage_conf_gate_depth_alpha: float = 1.0,
+        leverage_conf_gate_point_beta: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -571,6 +659,8 @@ class Attention(nn.Module):
             current_v = v
             current_special_kv = None
             metadata = None
+            confidence_state = None
+            confidence_needed = bool(leverage_conf_gate)
             metadata_needed = (
                 (recent_merge_config is not None and recent_merge_config.enabled)
                 or (svd_eviction_merge_config is not None and svd_eviction_merge_config.enabled and eviction_policy == "svd_leverage")
@@ -590,10 +680,28 @@ class Attention(nn.Module):
                     num_tokens=current_k.shape[2],
                     frame_id=step_idx if step_idx is not None else 0,
                 )
+            initial_confidence_gate = None
+            if confidence_needed and past_key_values is not None:
+                _, _, _, past_confidence_for_init = unpack_kv_cache(past_key_values)
+                if past_confidence_for_init is not None:
+                    initial_confidence_gate = past_confidence_for_init.mean_gate().to(
+                        device=current_k.device,
+                        dtype=torch.float32,
+                    )
+            if confidence_needed:
+                confidence_state = KVConfidenceState.for_current_frame(
+                    batch_size=B,
+                    num_heads=self.num_heads,
+                    num_tokens=current_k.shape[2],
+                    frame_id=step_idx if step_idx is not None else 0,
+                    device=current_k.device,
+                    initial_gate=initial_confidence_gate,
+                )
 
             write_k = current_k
             write_v = current_v
             write_metadata = metadata
+            write_confidence_state = confidence_state
             skip_current_special_tokens = (
                 bool(global_cache_history_anchor_special_tokens_only)
                 and cache_write_current_frame
@@ -604,31 +712,33 @@ class Attention(nn.Module):
                 current_special_count = min(int(special_token_count), current_k.shape[2])
                 if current_special_count > 0:
                     sidecar_metadata = None
+                    sidecar_confidence_state = None
+                    sidecar_indices = torch.arange(current_special_count, device=current_k.device, dtype=torch.long).view(1, 1, -1)
+                    sidecar_indices = sidecar_indices.expand(B, self.num_heads, current_special_count)
+                    write_indices = torch.arange(
+                        current_special_count,
+                        current_k.shape[2],
+                        device=current_k.device,
+                        dtype=torch.long,
+                    ).view(1, 1, -1)
+                    write_indices = write_indices.expand(B, self.num_heads, -1)
                     if metadata is not None:
-                        sidecar_indices = torch.arange(current_special_count, dtype=torch.long).view(1, 1, -1)
-                        sidecar_indices = sidecar_indices.expand(B, self.num_heads, current_special_count)
-                        sidecar_metadata = metadata.gather(sidecar_indices)
-                        write_indices = torch.arange(
-                            current_special_count,
-                            current_k.shape[2],
-                            dtype=torch.long,
-                        ).view(1, 1, -1)
-                        write_indices = write_indices.expand(B, self.num_heads, -1)
-                        write_metadata = metadata.gather(write_indices)
-                    current_special_kv = (
+                        sidecar_metadata = metadata.gather(sidecar_indices.detach().cpu())
+                        write_metadata = metadata.gather(write_indices.detach().cpu())
+                    if confidence_state is not None:
+                        sidecar_confidence_state = confidence_state.gather(sidecar_indices[:, 0, :])
+                        write_confidence_state = confidence_state.gather(write_indices[:, 0, :])
+                    current_special_kv = pack_kv_cache(
                         current_k[:, :, :current_special_count, :],
                         current_v[:, :, :current_special_count, :],
                         sidecar_metadata,
+                        sidecar_confidence_state,
                     )
                     write_k = current_k[:, :, current_special_count:, :]
                     write_v = current_v[:, :, current_special_count:, :]
 
             if past_key_values is not None:
-                if len(past_key_values) == 3:
-                    past_k, past_v, past_metadata = past_key_values
-                else:
-                    past_k, past_v = past_key_values
-                    past_metadata = None
+                past_k, past_v, past_metadata, past_confidence_state = unpack_kv_cache(past_key_values)
                 if cache_write_current_frame:
                     k = torch.cat([past_k, write_k], dim=2)
                     v = torch.cat([past_v, write_v], dim=2)
@@ -642,16 +752,31 @@ class Attention(nn.Module):
                         num_tokens=past_k.shape[2],
                         frame_id=-1,
                     )
+                if write_confidence_state is not None and past_confidence_state is None:
+                    past_confidence_state = KVConfidenceState.for_current_frame(
+                        batch_size=B,
+                        num_heads=self.num_heads,
+                        num_tokens=past_k.shape[2],
+                        frame_id=-1,
+                        device=past_k.device,
+                    )
                 if cache_write_current_frame and write_metadata is not None and past_metadata is not None:
                     metadata = past_metadata.concat(write_metadata)
                 elif cache_write_current_frame and write_metadata is not None:
                     metadata = None
                 else:
                     metadata = past_metadata
+                if cache_write_current_frame and write_confidence_state is not None and past_confidence_state is not None:
+                    confidence_state = past_confidence_state.concat(write_confidence_state)
+                elif cache_write_current_frame and write_confidence_state is not None:
+                    confidence_state = None
+                else:
+                    confidence_state = past_confidence_state
             else:
                 k = write_k if cache_write_current_frame else current_k
                 v = write_v if cache_write_current_frame else current_v
                 metadata = write_metadata if cache_write_current_frame else metadata
+                confidence_state = write_confidence_state if cache_write_current_frame else confidence_state
 
             if (
                 cache_write_current_frame
@@ -705,10 +830,13 @@ class Attention(nn.Module):
                     "leverage_ridge_score_chunk_size": leverage_ridge_score_chunk_size,
                     "leverage_ridge_jitter": leverage_ridge_jitter,
                     "leverage_ridge_dim": leverage_ridge_dim,
+                    "leverage_diag": leverage_diag,
+                    "leverage_diag_interval": leverage_diag_interval,
                     "leverage_random_seed": leverage_random_seed,
                     "leverage_eviction_selector": leverage_eviction_selector,
                     "leverage_similarity_granularity": leverage_similarity_granularity,
                     "leverage_similarity_feature_projection": leverage_similarity_feature_projection,
+                    "leverage_similarity_leverage_gamma": leverage_similarity_leverage_gamma,
                     "leverage_eviction_risk_mode": leverage_eviction_risk_mode,
                     "leverage_high_outlier_z": leverage_high_outlier_z,
                     "leverage_dpp_candidate_multiplier": leverage_dpp_candidate_multiplier,
@@ -721,6 +849,10 @@ class Attention(nn.Module):
                     "leverage_dpp_recency_window": leverage_dpp_recency_window,
                     "leverage_dpp_recency_gate_power": leverage_dpp_recency_gate_power,
                     "leverage_dpp_recency_debug": leverage_dpp_recency_debug,
+                    "leverage_conf_gate": leverage_conf_gate,
+                    "leverage_conf_gate_floor": leverage_conf_gate_floor,
+                    "leverage_conf_gate_depth_alpha": leverage_conf_gate_depth_alpha,
+                    "leverage_conf_gate_point_beta": leverage_conf_gate_point_beta,
                     "layer_budget_strategy": layer_budget_strategy,
                     "layer_budget_value_gamma": layer_budget_value_gamma,
                     "layer_budget_value_norm_type": layer_budget_value_norm_type,
@@ -745,23 +877,29 @@ class Attention(nn.Module):
                     if anchor_token_count is not None
                     else self.num_anchor_tokens
                 )
-                k, v, metadata, scores = self.eviction(
+                eviction_result = self.eviction(
                     k,
                     v,
                     metadata,
                     cache_budget,
                     effective_anchor_count,
+                    confidence_state=confidence_state,
                     **eviction_kwargs,
                 )
+                if confidence_state is not None:
+                    k, v, metadata, confidence_state, scores = eviction_result
+                else:
+                    k, v, metadata, scores = eviction_result
 
             if cache_write_current_frame:
-                new_kv = (k, v, metadata) if metadata is not None else (k, v)
+                new_kv = pack_kv_cache(k, v, metadata, confidence_state)
             else:
                 new_kv = original_past_key_values
 
             read_k = k
             read_v = v
             read_metadata = metadata
+            read_confidence_state = confidence_state
             if not cache_write_current_frame:
                 if past_key_values is not None:
                     read_k = torch.cat([k, current_k], dim=2)
@@ -774,15 +912,26 @@ class Attention(nn.Module):
                             frame_id=step_idx if step_idx is not None else 0,
                         )
                         read_metadata = metadata.concat(current_read_metadata)
+                    if confidence_state is not None:
+                        current_read_confidence = KVConfidenceState.for_current_frame(
+                            batch_size=B,
+                            num_heads=self.num_heads,
+                            num_tokens=current_k.shape[2],
+                            frame_id=step_idx if step_idx is not None else 0,
+                            device=current_k.device,
+                        )
+                        read_confidence_state = confidence_state.concat(current_read_confidence)
                 else:
                     read_k = current_k
                     read_v = current_v
             elif current_special_kv is not None:
-                sidecar_k, sidecar_v, sidecar_metadata = current_special_kv
+                sidecar_k, sidecar_v, sidecar_metadata, sidecar_confidence_state = unpack_kv_cache(current_special_kv)
                 read_k = torch.cat([k, sidecar_k], dim=2)
                 read_v = torch.cat([v, sidecar_v], dim=2)
                 if metadata is not None and sidecar_metadata is not None:
                     read_metadata = metadata.concat(sidecar_metadata)
+                if confidence_state is not None and sidecar_confidence_state is not None:
+                    read_confidence_state = confidence_state.concat(sidecar_confidence_state)
 
             if voxel_covis_enabled and read_metadata is not None and voxel_covis_frame_ids is not None:
                 k_read, v_read, covis_attn_mask = _filter_kv_for_voxel_covis(

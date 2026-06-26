@@ -6,10 +6,10 @@ model_name='StreamVGGT'
 ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
-max_frames='300'
+max_frames='500'
 eviction_policy='svd_leverage'
 # Switch to leverage_entropy to test the entropy effective-count allocator.
-layer_budget_strategy='leverage_pr' #[leverage_pr, uniform, leverage_entropy, value_weighted_leverage_pr]
+layer_budget_strategy='value_weighted_leverage_pr' #[leverage_pr, uniform, leverage_entropy, value_weighted_leverage_pr]
 layer_budget_alpha=0.7
 layer_budget_min_tokens=0
 layer_budget_eps=1e-12
@@ -17,7 +17,10 @@ layer_budget_value_gamma=0.7
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
 total_budget=200000
-leverage_eviction_selector=topk # [topk, fast_dpp, layer_head_fast_dpp, similarity_topk]
+leverage_eviction_selector=similarity_topk # [topk, fast_dpp, layer_head_fast_dpp, similarity_topk]
+leverage_similarity_granularity=layer # [layer, head]
+leverage_similarity_feature_projection=raw # [raw, random]
+leverage_similarity_leverage_gamma=0.5
 leverage_eviction_risk_mode=low_leverage # [low_leverage, outlier_then_low]
 leverage_high_outlier_z=3.0
 leverage_dpp_candidate_multiplier=3
@@ -27,11 +30,11 @@ leverage_dpp_diversity_beta=1.0
 leverage_dpp_feature_projection=random
 
 leverage_approx_method=right_sketch_ridge
-leverage_ridge_lambda=0
+leverage_ridge_lambda=1e-5
 leverage_ridge_lambda_mode=relative
 leverage_ridge_score_chunk_size=4096
 leverage_ridge_jitter=1e-6
-leverage_ridge_dim=64
+leverage_ridge_dim=128
 leverage_random_seed=42
 
 history_anchor_strategy=none
@@ -49,7 +52,11 @@ leverage_dpp_recency_window=10
 leverage_dpp_recency_gate_power=0.0
 icp_voxel_size=0.02
 
-output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject_a${layer_budget_alpha}_518"
+leverage_conf_gate_floor=0.2
+leverage_conf_gate_depth_alpha=1.0
+leverage_conf_gate_point_beta=1.0
+
+output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject_a${layer_budget_alpha}_SimTopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_conf"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=4
@@ -57,7 +64,7 @@ export OPENBLAS_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 export NUMEXPR_NUM_THREADS=4
 
-nice -n 10 taskset -c 0-31 accelerate launch --num_processes 2 --main_process_port 29502 ./eval/mv_recon/launch.py \
+accelerate launch --num_processes 3 --main_process_port 29102 ./eval/mv_recon/launch.py \
     --weights "$model_weights" \
     --output_dir "$output_dir" \
     --model_name "$model_name" \
@@ -66,6 +73,9 @@ nice -n 10 taskset -c 0-31 accelerate launch --num_processes 2 --main_process_po
     --leverage_granularity layer \
     --leverage_projection random \
     --leverage_eviction_selector "$leverage_eviction_selector" \
+    --leverage_similarity_granularity "$leverage_similarity_granularity" \
+    --leverage_similarity_feature_projection "$leverage_similarity_feature_projection" \
+    --leverage_similarity_leverage_gamma "$leverage_similarity_leverage_gamma" \
     --leverage_eviction_risk_mode "$leverage_eviction_risk_mode" \
     --leverage_high_outlier_z "$leverage_high_outlier_z" \
     --leverage_dpp_candidate_multiplier "$leverage_dpp_candidate_multiplier" \
@@ -93,5 +103,9 @@ nice -n 10 taskset -c 0-31 accelerate launch --num_processes 2 --main_process_po
     --camera_motion_threshold "$camera_motion_threshold" \
     --max_anchors "$max_anchors" \
     --min_anchor_interval "$min_anchor_interval" \
+    --leverage_conf_gate \
+    --leverage_conf_gate_floor "$leverage_conf_gate_floor" \
+    --leverage_conf_gate_depth_alpha "$leverage_conf_gate_depth_alpha" \
+    --leverage_conf_gate_point_beta "$leverage_conf_gate_point_beta" \
     "${first_frame_special_args[@]}" \
 # Add --profile_eviction to the launch command above when measuring eviction latency.

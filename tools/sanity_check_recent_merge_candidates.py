@@ -29,6 +29,7 @@ def _geometry(voxels, patch_height: int, patch_width: int, confidence=None) -> F
     return FrameGeometry(
         voxel_ids=voxel_tensor,
         confidence=confidence_tensor,
+        point_confidence=confidence_tensor.clone(),
         valid=valid,
         patch_height=patch_height,
         patch_width=patch_width,
@@ -182,6 +183,8 @@ def test_dtype_shape_metadata_and_no_nans():
     assert not torch.isnan(k_out).any()
     assert not torch.isnan(v_out).any()
     assert not torch.isnan(meta_out.accumulated_confidence).any()
+    assert meta_out.accumulated_point_confidence.shape == meta_out.accumulated_confidence.shape
+    assert not torch.isnan(meta_out.accumulated_point_confidence).any()
 
 
 def main():

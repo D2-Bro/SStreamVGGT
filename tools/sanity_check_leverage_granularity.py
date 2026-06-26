@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
 import os
 import sys
 import tempfile
@@ -17,9 +19,11 @@ if SRC_ROOT not in sys.path:
     sys.path.insert(0, SRC_ROOT)
 
 from streamvggt.layers.attention import Attention
+from streamvggt.layers.confidence_state import KVConfidenceState, make_token_confidence_gate, sample_token_confidence
 from streamvggt.layers.eviction import EvictionManager
 from streamvggt.layers.recent_merge import KVCacheMetadata
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
+from streamvggt.models.aggregator import Aggregator
 from streamvggt.utils.cache_analysis import LeverageScoreHistogramConfig
 
 
@@ -174,6 +178,164 @@ def check_low_precision_inputs() -> None:
         )
         result = manager.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
         _assert_finite(result.policy_scores, f"{dtype} layer scores")
+
+
+def check_confidence_state_sidecar() -> None:
+    default_state = KVConfidenceState.for_current_frame(1, 2, 3, frame_id=-1, device=torch.device("cpu"))
+    if not torch.allclose(default_state.confidence_gate, torch.ones(1, 3)):
+        raise AssertionError("default confidence gate should initialize to 1.0")
+    init_state = KVConfidenceState.for_current_frame(2, 2, 3, frame_id=-1, device=torch.device("cpu"), initial_gate=torch.tensor([0.4, 0.8]))
+    if not torch.allclose(init_state.confidence_gate, torch.tensor([[0.4, 0.4, 0.4], [0.8, 0.8, 0.8]])):
+        raise AssertionError(f"initial gate [B] did not broadcast: {init_state.confidence_gate}")
+
+    state0 = KVConfidenceState.for_current_frame(1, 2, 4, frame_id=0, device=torch.device("cpu"), initial_gate=0.5)
+    state1 = KVConfidenceState.for_current_frame(1, 2, 4, frame_id=1, device=torch.device("cpu"), initial_gate=0.5)
+    combined = state0.concat(state1)
+    depth_tokens = torch.tensor([[10.0, 11.0, 12.0, 13.0]])
+    point_tokens = torch.tensor([[1.0, 0.5, 0.25, 0.125]])
+    gate_tokens = make_token_confidence_gate(
+        depth_tokens,
+        point_tokens,
+        floor=0.2,
+        depth_alpha=1.0,
+        point_beta=1.0,
+        preserve_prefix_tokens=1,
+    )
+    expected_depth = depth_tokens / (depth_tokens + 1.0)
+    expected_point = point_tokens / (point_tokens + 1.0)
+    expected_gate = 0.2 + 0.8 * expected_depth * expected_point
+    expected_gate[:, 0] = expected_gate[:, 1:].mean(dim=1)
+    if not torch.allclose(gate_tokens, expected_gate):
+        raise AssertionError(f"normalized confidence gate mismatch: {gate_tokens} vs {expected_gate}")
+    if not torch.isclose(gate_tokens[0, 0], gate_tokens[0, 1:].mean()):
+        raise AssertionError("prefix token gate should use patch gate mean")
+    combined.update_frame_gate(1, gate_tokens)
+    if not torch.isclose(combined.confidence_gate[0, 6], gate_tokens[0, 2]):
+        raise AssertionError("confidence gate update did not use frame/token provenance")
+    if not torch.isclose(combined.confidence_gate[0, 7], gate_tokens[0, 3]):
+        raise AssertionError("confidence gate update did not broadcast across heads")
+
+    indices = torch.tensor([[[0, 5, 7], [1, 4, 6]]], dtype=torch.long)
+    gathered = combined.gather(indices)
+    assert gathered.frame_ids.shape == (1, 3)
+    if gathered.frame_ids[0].tolist() != [0, 1, 1]:
+        raise AssertionError(f"unexpected gathered frame ids: {gathered.frame_ids}")
+
+    dense_conf = torch.arange(16, dtype=torch.float32).view(1, 4, 4)
+    sampled = sample_token_confidence(
+        dense_conf,
+        image_hw=(4, 4),
+        tokens_per_frame=5,
+        patch_start_idx=1,
+        patch_size=2,
+    )
+    expected = torch.tensor([[1.0, 2.5, 4.5, 10.5, 12.5]])
+    if not torch.allclose(sampled, expected):
+        raise AssertionError(f"unexpected sampled confidence: {sampled} vs {expected}")
+
+    k = torch.randn(1, 1, 6, 2)
+    v = torch.randn_like(k)
+    attention = Attention(dim=2, num_heads=1)
+    conf_state = KVConfidenceState.for_current_frame(1, 1, 6, frame_id=3, device=k.device)
+    final_k, final_v, final_metadata, final_conf_state, _ = attention.eviction(
+        k,
+        v,
+        None,
+        cache_budget=4,
+        num_anchor_tokens=1,
+        confidence_state=conf_state,
+        eviction_policy="svd_leverage",
+        layer_id=0,
+        leverage_conf_gate=True,
+    )
+    assert final_k.shape == final_v.shape == (1, 1, 4, 2)
+    if final_metadata is not None:
+        raise AssertionError("confidence sidecar path should not create KV metadata")
+    if final_conf_state.frame_ids.shape != (1, 4):
+        raise AssertionError("confidence sidecar was not gathered with KV cache")
+
+    attention2 = Attention(dim=2, num_heads=1)
+    x0 = torch.randn(1, 4, 2)
+    x1 = torch.randn(1, 4, 2)
+    _, kv0, _ = attention2(
+        x0,
+        use_cache=True,
+        cache_budget=8,
+        anchor_token_count=1,
+        eviction_policy="svd_leverage",
+        layer_id=0,
+        step_idx=0,
+        leverage_conf_gate=True,
+    )
+    kv0[3].confidence_gate[:] = torch.tensor([[0.2, 0.4, 0.6, 0.8]])
+    kv0[3].gate_sum, kv0[3].gate_count = KVConfidenceState._stats_from_gate(kv0[3].confidence_gate)
+    _, kv1, _ = attention2(
+        x1,
+        past_key_values=kv0,
+        use_cache=True,
+        cache_budget=8,
+        anchor_token_count=1,
+        eviction_policy="svd_leverage",
+        layer_id=0,
+        step_idx=1,
+        leverage_conf_gate=True,
+    )
+    if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.full((1, 4), 0.5)):
+        raise AssertionError(f"new frame temporary gate should use cached mean: {kv1[3].confidence_gate}")
+    kv1[3].update_frame_gate(1, torch.tensor([[0.9, 0.8, 0.7, 0.6]]))
+    if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.tensor([[0.9, 0.8, 0.7, 0.6]])):
+        raise AssertionError("post-head update did not replace temporary current-frame gate")
+
+    agg = object.__new__(Aggregator)
+    agg.depth = 1
+    base_k = torch.randn(1, 1, 6, 2)
+    base_v = torch.randn_like(base_k)
+    base_conf = KVConfidenceState.for_current_frame(1, 1, 6, frame_id=4, device=base_k.device)
+    side_k = torch.randn(1, 1, 2, 2)
+    side_v = torch.randn_like(side_k)
+    side_conf = KVConfidenceState.for_current_frame(1, 1, 2, frame_id=9, device=base_k.device)
+    past = [(base_k, base_v, None, base_conf)]
+    agg.sync_anchor_special_tokens_from_sidecars(
+        past,
+        [(side_k, side_v, None, side_conf)],
+        anchor_token_count=3,
+        tokens_per_frame=6,
+        global_anchor_token_count=1,
+    )
+    synced = past[0]
+    if len(synced) != 4 or synced[3].frame_ids.shape[1] != synced[0].shape[2]:
+        raise AssertionError("special-token sidecar sync did not preserve confidence state alignment")
+
+
+def check_confidence_gate_head_mode() -> None:
+    B, H, N, D = 1, 1, 4, 2
+    k = torch.zeros(B, H, N, D)
+    v = torch.zeros_like(k)
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="head",
+        leverage_conf_gate=True,
+        leverage_conf_gate_floor=0.2,
+        leverage_conf_gate_depth_alpha=1.0,
+        leverage_conf_gate_point_beta=1.0,
+    )
+    base_scores = torch.tensor([[[0.20, 0.21, 0.22, 0.23]]], dtype=torch.float32)
+    manager._svd_leverage_scores = lambda candidate_k, return_basis=False: base_scores.clone()
+    result = manager.select(
+        k,
+        cache_budget=2,
+        num_anchor_tokens=0,
+        v=v,
+        current_frame_idx=1,
+        candidate_frame_ids=torch.tensor([[[0, 0, 1, 1]]], dtype=torch.long),
+        candidate_conf_gate=torch.tensor([[[1.0, 0.208, 0.208, 0.208]]], dtype=torch.float32),
+    )
+    kept = result.kept_candidate_indices[0, 0].tolist()
+    if kept != [2, 3]:
+        raise AssertionError(f"confidence gate/current-frame exclusion selected {kept}, expected [2, 3]")
+    expected = torch.tensor([[[0.20, 0.21 * 0.208, 0.22, 0.23]]], dtype=torch.float32)
+    if not torch.allclose(result.policy_scores, expected, atol=1e-6):
+        raise AssertionError(f"unexpected gated scores: {result.policy_scores} vs {expected}")
 
 
 def _frame_metadata(batch_size: int, num_heads: int, frame_ids: torch.Tensor) -> KVCacheMetadata:
@@ -400,6 +562,32 @@ def check_similarity_topk_uses_similarity_over_leverage_ratio() -> None:
     evicted = set(range(candidate_k.shape[2])) - set(kept.reshape(-1).tolist())
     if evicted != {0}:
         raise AssertionError(f"similarity_topk should evict by max_cosine/leverage ratio, got {evicted}")
+
+
+
+def check_similarity_topk_leverage_gamma_controls_denominator() -> None:
+    scores = torch.tensor([[[0.2, 0.9, 1.0, 1.1]]], dtype=torch.float32)
+    mask = torch.ones_like(scores, dtype=torch.bool)
+    candidate_k = torch.tensor(
+        [[[
+            [0.8, 0.6],
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]]],
+        dtype=torch.float32,
+    )
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="head",
+        leverage_eviction_selector="similarity_topk",
+        leverage_similarity_leverage_gamma=0.0,
+        leverage_dpp_candidate_multiplier=2,
+    )
+    kept = manager._keep_after_head_similarity_topk(scores, mask, 1, candidate_k)
+    evicted = set(range(candidate_k.shape[2])) - set(kept.reshape(-1).tolist())
+    if evicted != {1}:
+        raise AssertionError(f"gamma=0 should reduce similarity_topk to max-cosine ranking, got {evicted}")
 
 
 def check_similarity_topk_head_granularity_head_specific_eviction() -> None:
@@ -1868,6 +2056,43 @@ def check_similarity_topk_reused_projection_features() -> None:
     else:
         raise AssertionError("head-wise random similarity should reject missing projected head features")
 
+
+def check_leverage_diag_output_and_invariance() -> None:
+    k, v = _make_cache()
+    base = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=4,
+        leverage_random_seed=99,
+    )
+    diag = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=4,
+        leverage_random_seed=99,
+        leverage_diag=True,
+        leverage_diag_interval=0,
+    )
+    base_result = base.select(k, cache_budget=7, num_anchor_tokens=2, v=v, layer_id=3, step_idx=0)
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        diag_result = diag.select(k, cache_budget=7, num_anchor_tokens=2, v=v, layer_id=3, step_idx=0)
+    output = buffer.getvalue()
+    for expected in ("[LeverageDiag]", "effective_dim", "lambda/mean_eig", "deff sweep"):
+        if expected not in output:
+            raise AssertionError(f"missing leverage diagnostic output: {expected}")
+    if not torch.equal(base_result.kept_candidate_indices, diag_result.kept_candidate_indices):
+        raise AssertionError("leverage diagnostics changed kept candidate indices")
+    if not torch.allclose(base_result.policy_scores, diag_result.policy_scores):
+        raise AssertionError("leverage diagnostics changed policy scores")
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        diag.select(k, cache_budget=7, num_anchor_tokens=2, v=v, layer_id=3, step_idx=1)
+    if "[LeverageDiag]" in buffer.getvalue():
+        raise AssertionError("leverage_diag_interval=0 should only print once per manager")
+
 def check_ridge_invalid_args() -> None:
     invalid_configs = (
         {"leverage_approx_method": "full_d_ridge", "leverage_ridge_lambda": -1e-3},
@@ -1882,12 +2107,14 @@ def check_ridge_invalid_args() -> None:
         {"leverage_dpp_feature_projection": "random", "leverage_ridge_dim": 0},
         {"leverage_similarity_granularity": "bad"},
         {"leverage_similarity_feature_projection": "bad"},
+        {"leverage_similarity_leverage_gamma": -1e-3},
         {"leverage_similarity_feature_projection": "random", "leverage_approx_method": "full_d_ridge"},
         {"leverage_dpp_recency_lambda": -1e-3},
         {"leverage_dpp_recency_window": 0},
         {"leverage_dpp_recency_gate_power": -1e-3},
         {"leverage_eviction_risk_mode": "unknown"},
         {"leverage_high_outlier_z": -1e-3},
+        {"leverage_diag_interval": -1},
     )
     for cfg in invalid_configs:
         try:
@@ -1904,6 +2131,7 @@ def main() -> None:
     check_eviction_alignment()
     check_sketch_and_exact_modes()
     check_approx_methods()
+    check_leverage_diag_output_and_invariance()
     check_ridge_invalid_args()
     check_leverage_score_histogram_config()
     check_outlier_then_low_risk_mode()
@@ -1911,6 +2139,7 @@ def main() -> None:
     check_similarity_topk_shapes_and_low_score_pool()
     check_similarity_topk_evicts_redundant_pool_key()
     check_similarity_topk_uses_similarity_over_leverage_ratio()
+    check_similarity_topk_leverage_gamma_controls_denominator()
     check_similarity_topk_head_granularity_head_specific_eviction()
     check_similarity_topk_head_granularity_select_and_merge_guard()
     check_similarity_topk_protection_and_recent_frames()
@@ -1929,6 +2158,8 @@ def main() -> None:
     check_dpp_recent_frame_protection()
     check_key_value_feature()
     check_low_precision_inputs()
+    check_confidence_state_sidecar()
+    check_confidence_gate_head_mode()
     check_recent_frame_protection_head_mode()
     check_recent_frame_protection_layer_modes()
     check_recent_frame_eviction_alignment()

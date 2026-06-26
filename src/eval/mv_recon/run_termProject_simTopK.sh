@@ -20,6 +20,7 @@ total_budget=200000
 leverage_eviction_selector=similarity_topk # [topk, fast_dpp, layer_head_fast_dpp, similarity_topk]
 leverage_similarity_granularity=layer # [layer, head]
 leverage_similarity_feature_projection=raw # [raw, random]
+leverage_similarity_leverage_gamma=0.5
 leverage_eviction_risk_mode=low_leverage # [low_leverage, outlier_then_low]
 leverage_high_outlier_z=3.0
 leverage_dpp_candidate_multiplier=3
@@ -49,8 +50,9 @@ fi
 leverage_dpp_recency_lambda=1.0
 leverage_dpp_recency_window=10
 leverage_dpp_recency_gate_power=0.0
+icp_voxel_size=0.02
 
-output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject_a${layer_budget_alpha}_SimTopK_ridge${leverage_ridge_lambda}"
+output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject_a${layer_budget_alpha}_SimTopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}"
 echo "$output_dir"
 
 accelerate launch --num_processes 3 --main_process_port 29402 ./eval/mv_recon/launch.py \
@@ -64,6 +66,7 @@ accelerate launch --num_processes 3 --main_process_port 29402 ./eval/mv_recon/la
     --leverage_eviction_selector "$leverage_eviction_selector" \
     --leverage_similarity_granularity "$leverage_similarity_granularity" \
     --leverage_similarity_feature_projection "$leverage_similarity_feature_projection" \
+    --leverage_similarity_leverage_gamma "$leverage_similarity_leverage_gamma" \
     --leverage_eviction_risk_mode "$leverage_eviction_risk_mode" \
     --leverage_high_outlier_z "$leverage_high_outlier_z" \
     --leverage_dpp_candidate_multiplier "$leverage_dpp_candidate_multiplier" \
@@ -86,6 +89,7 @@ accelerate launch --num_processes 3 --main_process_port 29402 ./eval/mv_recon/la
     --layer_budget_value_norm_type "$layer_budget_value_norm_type" \
     --layer_budget_norm_source "$layer_budget_norm_source" \
     --budget "$total_budget" \
+    --icp_voxel_size "$icp_voxel_size" \
     --history_anchor_strategy "$history_anchor_strategy" \
     --camera_motion_threshold "$camera_motion_threshold" \
     --max_anchors "$max_anchors" \

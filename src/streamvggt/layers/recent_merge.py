@@ -52,6 +52,7 @@ class KVCacheMetadata:
     last_updated_frame: torch.Tensor
     voxel_ids: Optional[torch.Tensor] = None
     voxel_valid: Optional[torch.Tensor] = None
+    accumulated_point_confidence: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         shape = self.frame_ids.shape
@@ -59,6 +60,12 @@ class KVCacheMetadata:
             self.voxel_ids = torch.full((*shape, 3), _INVALID_VOXEL, dtype=torch.int32)
         if self.voxel_valid is None:
             self.voxel_valid = torch.zeros(shape, dtype=torch.bool)
+        if self.accumulated_point_confidence is None:
+            self.accumulated_point_confidence = torch.ones_like(self.accumulated_confidence)
+
+    @property
+    def accumulated_depth_confidence(self) -> torch.Tensor:
+        return self.accumulated_confidence
 
     @classmethod
     def for_current_frame(
@@ -78,6 +85,7 @@ class KVCacheMetadata:
             last_updated_frame=torch.full(shape, int(frame_id), dtype=torch.int32),
             voxel_ids=torch.full((*shape, 3), _INVALID_VOXEL, dtype=torch.int32),
             voxel_valid=torch.zeros(shape, dtype=torch.bool),
+            accumulated_point_confidence=torch.ones(shape, dtype=torch.float32),
         )
 
     def concat(self, other: "KVCacheMetadata") -> "KVCacheMetadata":
@@ -91,6 +99,9 @@ class KVCacheMetadata:
             last_updated_frame=torch.cat([self.last_updated_frame, other.last_updated_frame], dim=2),
             voxel_ids=torch.cat([self.voxel_ids, other.voxel_ids], dim=2),
             voxel_valid=torch.cat([self.voxel_valid, other.voxel_valid], dim=2),
+            accumulated_point_confidence=torch.cat(
+                [self.accumulated_point_confidence, other.accumulated_point_confidence], dim=2
+            ),
         )
 
     def gather(self, indices: torch.Tensor) -> "KVCacheMetadata":
@@ -107,6 +118,7 @@ class KVCacheMetadata:
                 indices.unsqueeze(-1).expand(*indices.shape, 3),
             ),
             voxel_valid=torch.gather(self.voxel_valid, 2, indices),
+            accumulated_point_confidence=torch.gather(self.accumulated_point_confidence, 2, indices),
         )
 
     def prune_after_eviction(self, kept_candidate_indices: torch.Tensor, num_anchor_tokens: int) -> "KVCacheMetadata":
@@ -116,8 +128,14 @@ class KVCacheMetadata:
         kept = kept_candidate_indices.detach().cpu().to(torch.long) + int(num_anchor_tokens)
         return self.gather(torch.cat([anchor, kept], dim=2))
 
-    def update_frame_confidence(self, frame_id: int, token_confidence: torch.Tensor) -> None:
+    def update_frame_confidence(
+        self,
+        frame_id: int,
+        token_confidence: torch.Tensor,
+        point_confidence: Optional[torch.Tensor] = None,
+    ) -> None:
         token_confidence = token_confidence.detach().cpu().float()
+        point_confidence = point_confidence.detach().cpu().float() if point_confidence is not None else None
         B, H, _ = self.frame_ids.shape
         max_tokens = token_confidence.shape[1]
         mask = self.frame_ids == int(frame_id)
@@ -131,6 +149,12 @@ class KVCacheMetadata:
         values = torch.ones_like(self.accumulated_confidence)
         values[valid] = token_confidence[batch_ids[valid], token_ids[valid]]
         self.accumulated_confidence[mask] = values[mask]
+        if point_confidence is not None:
+            point_values = torch.ones_like(self.accumulated_point_confidence)
+            point_max_tokens = point_confidence.shape[1]
+            point_valid = mask & (token_ids >= 0) & (token_ids < point_max_tokens)
+            point_values[point_valid] = point_confidence[batch_ids[point_valid], token_ids[point_valid]]
+            self.accumulated_point_confidence[mask] = point_values[mask]
 
     def update_frame_geometry(self, frame_id: int, geom: "FrameGeometry") -> None:
         if geom is None:
@@ -157,6 +181,7 @@ class FrameGeometry:
 
     voxel_ids: torch.Tensor
     confidence: torch.Tensor
+    point_confidence: torch.Tensor
     valid: torch.Tensor
     patch_height: int
     patch_width: int
@@ -214,6 +239,7 @@ class RecentSimilarityMerge:
         frame_id: int,
         depth: torch.Tensor,
         depth_conf: Optional[torch.Tensor],
+        point_conf: Optional[torch.Tensor],
         pose_enc: torch.Tensor,
         image_hw: Tuple[int, int],
         tokens_per_frame: int,
@@ -245,6 +271,12 @@ class RecentSimilarityMerge:
             depth_conf = depth_conf.detach()
             if depth_conf.ndim == 4 and depth_conf.shape[-1] == 1:
                 depth_conf = depth_conf[..., 0]
+        if point_conf is None:
+            point_conf = torch.ones_like(depth_conf)
+        else:
+            point_conf = point_conf.detach()
+            if point_conf.ndim == 4 and point_conf.shape[-1] == 1:
+                point_conf = point_conf[..., 0]
 
         intrinsic = None
         cam_to_world = None
@@ -269,11 +301,13 @@ class RecentSimilarityMerge:
 
         voxel_ids = torch.full((B, tokens_per_frame, 3), _INVALID_VOXEL, dtype=torch.int32)
         confidence = torch.zeros((B, tokens_per_frame), dtype=torch.float32)
+        point_confidence = torch.ones((B, tokens_per_frame), dtype=torch.float32)
         valid = torch.zeros((B, tokens_per_frame), dtype=torch.bool)
         if patch_tokens <= 0:
             self._geometry[int(frame_id)] = FrameGeometry(
                 voxel_ids,
                 confidence,
+                point_confidence,
                 valid,
                 patch_height=patch_h,
                 patch_width=patch_w,
@@ -290,6 +324,7 @@ class RecentSimilarityMerge:
 
         sampled_depth = depth[:, ys, xs].float()
         sampled_conf = depth_conf[:, ys, xs].float()
+        sampled_point_conf = point_conf[:, ys, xs].float()
         finite = torch.isfinite(sampled_depth) & (sampled_depth > 1e-8)
         if self.config.use_depth_confidence:
             finite = finite & torch.isfinite(sampled_conf) & (sampled_conf > 0)
@@ -315,11 +350,13 @@ class RecentSimilarityMerge:
         token_slice = slice(self.patch_start_idx, self.patch_start_idx + patch_tokens)
         voxel_ids[:, token_slice] = patch_voxels.detach().cpu()
         confidence[:, token_slice] = sampled_conf.detach().cpu().float().clamp_min(0)
+        point_confidence[:, token_slice] = sampled_point_conf.detach().cpu().float().clamp_min(0)
         valid[:, token_slice] = finite.detach().cpu()
 
         geom = FrameGeometry(
             voxel_ids=voxel_ids,
             confidence=confidence,
+            point_confidence=point_confidence,
             valid=valid,
             patch_height=patch_h,
             patch_width=patch_w,
@@ -336,7 +373,7 @@ class RecentSimilarityMerge:
     def update_metadata_for_frame(self, metadata: KVCacheMetadata, frame_id: int) -> None:
         geom = self._geometry.get(int(frame_id))
         if geom is not None:
-            metadata.update_frame_confidence(frame_id, geom.confidence)
+            metadata.update_frame_confidence(frame_id, geom.confidence, geom.point_confidence)
             metadata.update_frame_geometry(frame_id, geom)
 
     def merge_layer(
@@ -412,7 +449,10 @@ class RecentSimilarityMerge:
                         dtype=metadata.accumulated_confidence.dtype,
                     )
                     cand_pos_cpu = cand_pos.cpu()
+                    cur_pos_cpu = cur_pos.cpu()
                     old_conf = metadata.accumulated_confidence[b, h, cand_pos_cpu]
+                    old_point_conf = metadata.accumulated_point_confidence[b, h, cand_pos_cpu]
+                    new_point_conf = metadata.accumulated_point_confidence[b, h, cur_pos_cpu]
                     if self.config.use_depth_confidence:
                         old_w = torch.nan_to_num(
                             old_conf.to(device=k.device, dtype=k.dtype), nan=0.0, posinf=0.0, neginf=0.0
@@ -434,6 +474,9 @@ class RecentSimilarityMerge:
                     v[b, h, cand_pos] = torch.nan_to_num(merged_v).to(dtype=v.dtype)
                     metadata.accumulated_confidence[b, h, cand_pos_cpu] = torch.nan_to_num(
                         old_conf + new_conf.cpu(), nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    metadata.accumulated_point_confidence[b, h, cand_pos_cpu] = torch.nan_to_num(
+                        old_point_conf + new_point_conf, nan=0.0, posinf=0.0, neginf=0.0
                     )
                     metadata.merge_counts[b, h, cand_pos_cpu] += 1
                     metadata.last_updated_frame[b, h, cand_pos_cpu] = int(frame_id)

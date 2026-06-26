@@ -20,8 +20,10 @@ from tqdm import tqdm
 from streamvggt.utils.cache_analysis import (
     add_eviction_nn_analysis_args,
     add_leverage_score_histogram_args,
+    add_token_overlay_dump_args,
     eviction_nn_config_from_args,
     leverage_score_histogram_config_from_args,
+    token_overlay_dump_config_from_args,
 )
 
 def get_args_parser():
@@ -143,6 +145,19 @@ def get_args_parser():
         default=None,
         help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge",
     )
+    parser.add_argument(
+        "--leverage_diag",
+        "--leverage-diag",
+        action="store_true",
+        help="Print ridge leverage diagnostic statistics at selected eviction steps",
+    )
+    parser.add_argument(
+        "--leverage_diag_interval",
+        "--leverage-diag-interval",
+        type=int,
+        default=0,
+        help="Diagnostic interval; 0 prints only the first eviction step, positive values print every N steps",
+    )
     parser.add_argument("--leverage_random_seed", "--leverage-random-seed", type=int, default=0)
     parser.add_argument(
         "--leverage_eviction_selector",
@@ -167,6 +182,13 @@ def get_args_parser():
         default="raw",
         choices=("raw", "random"),
         help="Feature source for similarity_topk cosine: raw key features or random projected leverage features reused from score computation",
+    )
+    parser.add_argument(
+        "--leverage_similarity_leverage_gamma",
+        "--leverage-similarity-leverage-gamma",
+        type=float,
+        default=1.0,
+        help="Exponent gamma in similarity_topk eviction score: max_cosine / leverage**gamma",
     )
     parser.add_argument(
         "--leverage_eviction_risk_mode",
@@ -365,6 +387,7 @@ def get_args_parser():
     )
     add_eviction_nn_analysis_args(parser)
     add_leverage_score_histogram_args(parser)
+    add_token_overlay_dump_args(parser)
     parser.add_argument(
         "--budget",
         type=int,
@@ -519,31 +542,39 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 for view in views:
                     view["img"] = (view["img"] + 1.0) / 2.0
                 start = time.time()
+                safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                rank_label = f"rank_{distributed_state.process_index}"
                 eviction_nn_analysis_config = None
                 if args.eviction_nn_analysis_dir:
-                    safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                     nn_dir = os.path.join(
                         args.eviction_nn_analysis_dir,
                         args.eval_dataset,
-                        f"rank_{distributed_state.process_index}",
+                        rank_label,
                         safe_seq,
                     )
                     eviction_nn_analysis_config = eviction_nn_config_from_args(args, output_dir=nn_dir)
                 leverage_score_histogram_config = None
                 if args.leverage_score_histogram_dir:
-                    safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                     hist_dir = os.path.join(
                         args.leverage_score_histogram_dir,
                         args.eval_dataset,
-                        f"rank_{distributed_state.process_index}",
+                        rank_label,
                         safe_seq,
                     )
                     leverage_score_histogram_config = leverage_score_histogram_config_from_args(args, output_dir=hist_dir)
+                token_overlay_dump_config = None
+                if args.token_overlay_dump_dir:
+                    overlay_dump_dir = os.path.join(
+                        args.token_overlay_dump_dir,
+                        args.eval_dataset,
+                        rank_label,
+                        safe_seq,
+                    )
+                    token_overlay_dump_config = token_overlay_dump_config_from_args(args, output_dir=overlay_dump_dir)
                 layer_budget_log_path = None
                 if args.layer_budget_log_path:
                     layer_budget_log_path = args.layer_budget_log_path
                 elif args.layer_budget_log_scores:
-                    safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                     layer_budget_log_path = os.path.join(save_dir, safe_seq, "layer_budget_scores.csv")
                 seq_save_dir = f"{save_dir}/{seq}"
                 frame_writer = None
@@ -571,10 +602,13 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                         leverage_ridge_jitter=args.leverage_ridge_jitter,
                         leverage_ridge_dim=args.leverage_ridge_dim,
+                        leverage_diag=args.leverage_diag,
+                        leverage_diag_interval=args.leverage_diag_interval,
                         leverage_random_seed=args.leverage_random_seed,
                         leverage_eviction_selector=args.leverage_eviction_selector,
                         leverage_similarity_granularity=args.leverage_similarity_granularity,
                         leverage_similarity_feature_projection=args.leverage_similarity_feature_projection,
+                        leverage_similarity_leverage_gamma=args.leverage_similarity_leverage_gamma,
                         leverage_eviction_risk_mode=args.leverage_eviction_risk_mode,
                         leverage_high_outlier_z=args.leverage_high_outlier_z,
                         leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
@@ -612,6 +646,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         eviction_debug=args.profile_eviction,
                         eviction_nn_analysis_config=eviction_nn_analysis_config,
                         leverage_score_histogram_config=leverage_score_histogram_config,
+                        token_overlay_dump_config=token_overlay_dump_config,
                         kf_interval=args.kf_interval,
                         evict_interval=args.evict_interval,
                         global_cache_history_anchor_special_tokens_only=args.global_cache_history_anchor_special_tokens_only,
@@ -762,6 +797,11 @@ if __name__ == "__main__":
         raise SystemExit(
             "Error: --leverage_ridge_lambda must be >= 0, "
             f"got {args.leverage_ridge_lambda}."
+        )
+    if args.leverage_diag_interval < 0:
+        raise SystemExit(
+            "Error: --leverage_diag_interval must be >= 0, "
+            f"got {args.leverage_diag_interval}."
         )
     if args.leverage_ridge_jitter <= 0:
         raise SystemExit(

@@ -25,12 +25,15 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "eval_results" / "mv_recon" / "SStreamVGGT_100_termProject_a0.7_SimTopK_ridge1e-5"
-ACTIVE_MV_RECON_DATASETS = ("7scenes", "NRGBD")
+MV_RECON_RUN_DATASETS = ("7scenes", "NRGBD")
+ACTIVE_DATASETS = ("7scenes", "NRGBD", "kitti_s1_500")
 DATASET_ROOTS = {
     "7scenes": Path("/home/dongjae/data/7scenes_sfm"),
     "NRGBD": Path("/home/dongjae/data/neural_rgbd_data"),
     "Replica": Path(os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica")),
+    "kitti": Path(os.environ.get("SSTREAMVGGT_KITTI_DEPTH_ROOT", "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered")),
 }
+_KITTI_IMAGE_CACHE: dict[tuple[str, str], list[Path]] = {}
 
 
 def parse_csv(value: str | None) -> list[str]:
@@ -43,10 +46,10 @@ def shell_join(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
-def add_common_paths(parser: argparse.ArgumentParser) -> None:
+def add_common_paths(parser: argparse.ArgumentParser, *, default_datasets: tuple[str, ...] = ACTIVE_DATASETS) -> None:
     parser.add_argument("--output_dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--datasets", type=str, default=",".join(ACTIVE_MV_RECON_DATASETS))
-    parser.add_argument("--kf_every", type=int, default=2)
+    parser.add_argument("--datasets", type=str, default=",".join(default_datasets))
+    parser.add_argument("--kf_every", type=int, default=0, help="Frame stride for source image lookup; 0 uses dataset defaults")
     parser.add_argument("--image_width", type=int, default=518)
     parser.add_argument("--image_height", type=int, default=392)
     parser.add_argument("--patch_start_idx", type=int, default=5)
@@ -184,12 +187,12 @@ def build_run_command(args: argparse.Namespace) -> list[str]:
 
 def run_command(args: argparse.Namespace) -> int:
     requested = tuple(parse_csv(args.datasets))
-    unsupported = [name for name in requested if name not in ACTIVE_MV_RECON_DATASETS]
+    unsupported = [name for name in requested if name not in MV_RECON_RUN_DATASETS]
     if unsupported:
         print(
             "Warning: mv_recon/launch.py does not expose a dataset selector. "
             f"Requested {unsupported}, but the unchanged launcher will run its active dataset scope: "
-            f"{', '.join(ACTIVE_MV_RECON_DATASETS)}."
+            f"7scenes, NRGBD."
         )
 
     command = build_run_command(args)
@@ -220,6 +223,21 @@ def event_metadata_from_path(path: Path, analysis_root: Path) -> dict[str, str]:
     return {"dataset": dataset, "rank": rank, "scene_key": scene_key, "safe_scene": safe_scene}
 
 
+def is_kitti_dataset(dataset: str) -> bool:
+    return dataset == "kitti" or dataset.startswith("kitti_s1_")
+
+
+def kitti_dataset_root(dataset: str) -> Path:
+    if dataset == "kitti":
+        return DATASET_ROOTS["kitti"]
+    match = re.match(r"kitti_s1_(?P<count>\d+)$", dataset)
+    if match:
+        env_key = f"SSTREAMVGGT_KITTI_DEPTH_ROOT_{match.group('count')}"
+        default = f"/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_{match.group('count')}"
+        return Path(os.environ.get(env_key, default))
+    return DATASET_ROOTS["kitti"]
+
+
 def parse_scene(dataset: str, safe_scene: str) -> str:
     if dataset == "7scenes":
         match = re.match(r"(?P<scene>.+)_seq-(?P<seq>\d+)$", safe_scene)
@@ -228,14 +246,36 @@ def parse_scene(dataset: str, safe_scene: str) -> str:
     return safe_scene
 
 
+def resolve_kf_every(dataset: str, kf_every: int) -> int:
+    if int(kf_every) > 0:
+        return int(kf_every)
+    return 1 if is_kitti_dataset(dataset) else 2
+
+
+def kitti_frame_image_path(dataset: str, scene: str, frame_id: int, kf_every: int) -> Path | None:
+    root = kitti_dataset_root(dataset)
+    key = (dataset, scene)
+    images = _KITTI_IMAGE_CACHE.get(key)
+    if images is None:
+        seq_dir = root / scene
+        images = sorted(seq_dir.glob("*.png"))
+        _KITTI_IMAGE_CACHE[key] = images
+    frame_no = int(frame_id) * resolve_kf_every(dataset, kf_every)
+    if frame_no < 0 or frame_no >= len(images):
+        return None
+    return images[frame_no]
+
+
 def frame_image_path(dataset: str, scene: str, frame_id: int, kf_every: int) -> Path | None:
-    frame_no = int(frame_id) * max(int(kf_every), 1)
+    frame_no = int(frame_id) * resolve_kf_every(dataset, kf_every)
     if dataset == "7scenes":
         return DATASET_ROOTS[dataset] / scene / f"frame-{frame_no:06d}.color.png"
     if dataset == "NRGBD":
         return DATASET_ROOTS[dataset] / scene / "images" / f"img{frame_no}.png"
     if dataset == "Replica":
         return DATASET_ROOTS[dataset] / scene / "results" / f"frame{frame_no}.jpg"
+    if is_kitti_dataset(dataset):
+        return kitti_frame_image_path(dataset, scene, frame_id, kf_every)
     return None
 
 
@@ -513,9 +553,17 @@ def visualize(args: argparse.Namespace) -> int:
         scene_key = str(event_meta["scene_key"])
         scene = str(event_meta["scene"])
         step_idx = int(event_meta.get("step_idx", 0))
+        layer_id = int(event_meta.get("layer_id", -1))
+        layer_label = f"layer_{layer_id:02d}" if layer_id >= 0 else "layer_unknown"
+        head_label = str(event_meta.get("head_label", "layer_shared"))
         step_dir = out_dir / dataset / rank / scene_key / f"step_{step_idx:06d}"
-        evict_dir = step_dir / "evict_overlay"
-        leverage_dir = step_dir / "leverage_score_overlay"
+        evict_dir = step_dir / "evict_overlay" / layer_label
+        leverage_dir = step_dir / "leverage_score_overlay" / layer_label
+        csv_dir = step_dir / "csv" / layer_label
+        if head_label != "layer_shared":
+            evict_dir = evict_dir / head_label
+            leverage_dir = leverage_dir / head_label
+            csv_dir = csv_dir / head_label
 
         frame_maps, evicted_rows, leverage_rows, non_patch_rows = patch_maps_for_event(args, event_meta, payload)
         all_evicted_rows.extend(evicted_rows)
@@ -550,7 +598,7 @@ def visualize(args: argparse.Namespace) -> int:
                     image_path,
                     evict_count,
                     evict_dir / f"frame_{frame_id:06d}.png",
-                    f"{dataset} {scene} step={step_idx} frame={frame_id} evicted={int(evict_count.sum())}",
+                    f"{dataset} {scene} step={step_idx} layer={layer_id} frame={frame_id} evicted={int(evict_count.sum())}",
                     args.overlay_alpha,
                     args.patch_size,
                 )
@@ -561,16 +609,16 @@ def visualize(args: argparse.Namespace) -> int:
                 maps["missing_mask"],
                 maps["current_evict_mask"],
                 leverage_dir / f"frame_{frame_id:06d}.png",
-                f"{dataset} {scene} step={step_idx} frame={frame_id} leverage/missing/current-evict",
+                f"{dataset} {scene} step={step_idx} layer={layer_id} frame={frame_id} leverage/missing/current-evict",
                 args.overlay_alpha,
                 args.patch_size,
             )
             saved += 1
 
-        write_csv(step_dir / "evicted_tokens.csv", evicted_rows)
-        write_csv(step_dir / "leverage_tokens.csv", leverage_rows)
-        write_csv(step_dir / "non_patch_or_protected_tokens.csv", non_patch_rows)
-        write_csv(step_dir / "frame_summary.csv", frame_summary_rows)
+        write_csv(csv_dir / "evicted_tokens.csv", evicted_rows)
+        write_csv(csv_dir / "leverage_tokens.csv", leverage_rows)
+        write_csv(csv_dir / "non_patch_or_protected_tokens.csv", non_patch_rows)
+        write_csv(csv_dir / "frame_summary.csv", frame_summary_rows)
 
     write_csv(out_dir / "all_evicted_tokens.csv", all_evicted_rows)
     write_csv(out_dir / "all_leverage_tokens.csv", all_leverage_rows)
@@ -585,6 +633,8 @@ def visualize(args: argparse.Namespace) -> int:
         "non_patch_or_protected_tokens": len(all_non_patch_rows),
         "frame_rows": len(all_frame_summary_rows),
         "overlays_saved": saved,
+        "overlay_layout": "<dataset>/<rank>/<scene>/step_<step>/evict_overlay|leverage_score_overlay/layer_<layer>/frame_<frame>.png",
+        "csv_layout": "<dataset>/<rank>/<scene>/step_<step>/csv/layer_<layer>/*.csv",
         "patch_start_idx": int(args.patch_start_idx),
         "patch_size": int(args.patch_size),
         "image_width": int(args.image_width),
@@ -601,7 +651,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run_parser = subparsers.add_parser("run", help="Run mv_recon with leverage diagnostics enabled")
-    add_common_paths(run_parser)
+    add_common_paths(run_parser, default_datasets=MV_RECON_RUN_DATASETS)
     run_parser.add_argument("--weights", type=str, default="../ckpt/checkpoints.pth")
     run_parser.add_argument("--max_frames", type=int, default=100)
     run_parser.add_argument("--num_processes", type=int, default=3)
@@ -624,7 +674,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(func=run_command)
 
     vis_parser = subparsers.add_parser("visualize", help="Build step-wise image overlays from saved full token diagnostics")
-    add_common_paths(vis_parser)
+    add_common_paths(vis_parser, default_datasets=ACTIVE_DATASETS)
     vis_parser.add_argument("--overlay_alpha", type=float, default=0.55)
     vis_parser.add_argument("--overlay_top_frames", type=int, default=100)
     vis_parser.add_argument("--overlay_min_count", type=int, default=1)

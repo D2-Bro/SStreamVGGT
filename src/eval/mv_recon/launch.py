@@ -233,6 +233,19 @@ def get_args_parser():
         help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge",
     )
     parser.add_argument(
+        "--leverage_diag",
+        "--leverage-diag",
+        action="store_true",
+        help="Print ridge leverage diagnostic statistics at selected eviction steps",
+    )
+    parser.add_argument(
+        "--leverage_diag_interval",
+        "--leverage-diag-interval",
+        type=int,
+        default=0,
+        help="Diagnostic interval; 0 prints only the first eviction step, positive values print every N steps",
+    )
+    parser.add_argument(
         "--leverage_random_seed",
         "--leverage-random-seed",
         type=int,
@@ -262,6 +275,13 @@ def get_args_parser():
         default="raw",
         choices=("raw", "random"),
         help="Feature source for similarity_topk cosine: raw key features or random projected leverage features reused from score computation",
+    )
+    parser.add_argument(
+        "--leverage_similarity_leverage_gamma",
+        "--leverage-similarity-leverage-gamma",
+        type=float,
+        default=1.0,
+        help="Exponent gamma in similarity_topk eviction score: max_cosine / leverage**gamma",
     )
     parser.add_argument(
         "--leverage_eviction_risk_mode",
@@ -319,6 +339,10 @@ def get_args_parser():
     parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=5, help="Frame window for linear eviction-score freshness")
     parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for eviction-score recency")
     parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print eviction-score recency bonus summary statistics")
+    parser.add_argument("--leverage_conf_gate", "--leverage-conf-gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
+    parser.add_argument("--leverage_conf_gate_floor", "--leverage-conf-gate-floor", type=float, default=0.2, help="Minimum multiplicative confidence gate value")
+    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to normalized depth_conf / (depth_conf + 1) in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + 1) in the confidence gate")
     parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
@@ -643,6 +667,13 @@ def get_args_parser():
         help="Print per-block global-to-frame and KV cache decisions",
     )
     parser.add_argument(
+        "--icp_voxel_size",
+        "--icp-voxel-size",
+        type=float,
+        default=0.0,
+        help="Voxel size for downsampling only the point clouds used by ICP; <=0 disables downsampling",
+    )
+    parser.add_argument(
         "--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)"
     )
     return parser
@@ -749,6 +780,11 @@ def main(args):
             "Error: --leverage_dpp_recency_lambda must be >= 0, "
             f"got {args.leverage_dpp_recency_lambda}."
         )
+    if args.icp_voxel_size < 0:
+        raise SystemExit(
+            "Error: --icp_voxel_size must be >= 0, "
+            f"got {args.icp_voxel_size}."
+        )
     if args.leverage_dpp_recency_window < 1:
         raise SystemExit(
             "Error: --leverage_dpp_recency_window must be >= 1, "
@@ -758,6 +794,21 @@ def main(args):
         raise SystemExit(
             "Error: --leverage_dpp_recency_gate_power must be >= 0, "
             f"got {args.leverage_dpp_recency_gate_power}."
+        )
+    if not (0.0 <= args.leverage_conf_gate_floor <= 1.0):
+        raise SystemExit(
+            "Error: --leverage_conf_gate_floor must be in [0, 1], "
+            f"got {args.leverage_conf_gate_floor}."
+        )
+    if args.leverage_conf_gate_depth_alpha < 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_depth_alpha must be >= 0, "
+            f"got {args.leverage_conf_gate_depth_alpha}."
+        )
+    if args.leverage_conf_gate_point_beta < 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_point_beta must be >= 0, "
+            f"got {args.leverage_conf_gate_point_beta}."
         )
     if args.layer_budget_alpha < 0:
         raise SystemExit(
@@ -783,6 +834,11 @@ def main(args):
         raise SystemExit(
             "Error: --leverage_ridge_lambda must be >= 0, "
             f"got {args.leverage_ridge_lambda}."
+        )
+    if args.leverage_diag_interval < 0:
+        raise SystemExit(
+            "Error: --leverage_diag_interval must be >= 0, "
+            f"got {args.leverage_diag_interval}."
         )
     if args.leverage_ridge_jitter <= 0:
         raise SystemExit(
@@ -842,6 +898,10 @@ def main(args):
             f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
             f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
             f"dpp_feature_projection={args.leverage_dpp_feature_projection}, "
+            f"conf_gate={args.leverage_conf_gate}, "
+            f"conf_gate_floor={args.leverage_conf_gate_floor}, "
+            f"conf_gate_depth_alpha={args.leverage_conf_gate_depth_alpha}, "
+            f"conf_gate_point_beta={args.leverage_conf_gate_point_beta}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
@@ -939,16 +999,16 @@ def main(args):
     else:
         raise NotImplementedError
     datasets_all = {
-        "7scenes": SevenScenes(
-            split="test",
-            ROOT="/home/dongjae/data/7scenes_sfm",
-            # ROOT="/data2/dongjae/datasets/7scenes_sfm",
-            resolution=resolution,
-            num_seq=1,
-            full_video=True,
-            kf_every=2,
-            max_frames=args.max_frames,
-        ),
+        # "7scenes": SevenScenes(
+        #     split="test",
+        #     ROOT="/home/dongjae/data/7scenes_sfm",
+        #     # ROOT="/data2/dongjae/datasets/7scenes_sfm",
+        #     resolution=resolution,
+        #     num_seq=1,
+        #     full_video=True,
+        #     kf_every=2,
+        #     max_frames=args.max_frames,
+        # ),
         # "ETH3D": ETH3D
             # 20),
         "NRGBD": NRGBD(
@@ -1224,10 +1284,13 @@ def main(args):
                                     leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                                     leverage_ridge_jitter=args.leverage_ridge_jitter,
                                     leverage_ridge_dim=args.leverage_ridge_dim,
+                                    leverage_diag=args.leverage_diag,
+                                    leverage_diag_interval=args.leverage_diag_interval,
                                     leverage_random_seed=args.leverage_random_seed,
                                     leverage_eviction_selector=args.leverage_eviction_selector,
                                     leverage_similarity_granularity=args.leverage_similarity_granularity,
                                     leverage_similarity_feature_projection=args.leverage_similarity_feature_projection,
+                                    leverage_similarity_leverage_gamma=args.leverage_similarity_leverage_gamma,
                                     leverage_eviction_risk_mode=args.leverage_eviction_risk_mode,
                                     leverage_high_outlier_z=args.leverage_high_outlier_z,
                                     leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
@@ -1240,6 +1303,10 @@ def main(args):
                                     leverage_dpp_recency_window=args.leverage_dpp_recency_window,
                                     leverage_dpp_recency_gate_power=args.leverage_dpp_recency_gate_power,
                                     leverage_dpp_recency_debug=args.leverage_dpp_recency_debug,
+                                    leverage_conf_gate=args.leverage_conf_gate,
+                                    leverage_conf_gate_floor=args.leverage_conf_gate_floor,
+                                    leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
+                                    leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
                                     layer_budget_strategy=args.layer_budget_strategy,
                                     layer_budget_value_gamma=args.layer_budget_value_gamma,
                                     layer_budget_value_norm_type=args.layer_budget_value_norm_type,
@@ -1347,15 +1414,15 @@ def main(args):
 
                             pts_gt = gt_pts[j].detach().cpu().numpy()[0]
 
-                            H, W = image.shape[:2]
-                            cx = W // 2
-                            cy = H // 2
-                            l, t = cx - 112, cy - 112
-                            r, b = cx + 112, cy + 112
-                            image = image[t:b, l:r]
-                            mask = mask[t:b, l:r]
-                            pts = pts[t:b, l:r]
-                            pts_gt = pts_gt[t:b, l:r]
+                            # H, W = image.shape[:2]
+                            # cx = W // 2
+                            # cy = H // 2
+                            # l, t = cx - 112, cy - 112
+                            # r, b = cx + 112, cy + 112
+                            # image = image[t:b, l:r]
+                            # mask = mask[t:b, l:r]
+                            # pts = pts[t:b, l:r]
+                            # pts_gt = pts_gt[t:b, l:r]
 
                             # Align predicted 3D points to the ground truth
                             # pts = geotrf(in_camera1, pts)
@@ -1465,9 +1532,28 @@ def main(args):
 
                     trans_init = np.eye(4)
 
+                    icp_source = pcd
+                    icp_target = pcd_gt
+                    if args.icp_voxel_size > 0:
+                        icp_source = pcd.voxel_down_sample(args.icp_voxel_size)
+                        icp_target = pcd_gt.voxel_down_sample(args.icp_voxel_size)
+                        if len(icp_source.points) == 0 or len(icp_target.points) == 0:
+                            print(
+                                f"Warning: ICP voxel downsample produced an empty cloud "
+                                f"at voxel_size={args.icp_voxel_size}; using full point clouds"
+                            )
+                            icp_source = pcd
+                            icp_target = pcd_gt
+                        else:
+                            print(
+                                f"ICP downsample: voxel_size={args.icp_voxel_size}, "
+                                f"pred {len(pcd.points)}->{len(icp_source.points)}, "
+                                f"gt {len(pcd_gt.points)}->{len(icp_target.points)}"
+                            )
+
                     reg_p2p = o3d.pipelines.registration.registration_icp(
-                        pcd,
-                        pcd_gt,
+                        icp_source,
+                        icp_target,
                         threshold,
                         trans_init,
                         o3d.pipelines.registration.TransformationEstimationPointToPoint(),

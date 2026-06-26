@@ -13,6 +13,7 @@ from typing import Optional, Tuple, Union, List, Dict, Any, Set
 
 from streamvggt.layers import PatchEmbed
 from streamvggt.layers.block import Block
+from streamvggt.layers.confidence_state import pack_kv_cache, unpack_kv_cache
 from streamvggt.layers.recent_merge import KVCacheMetadata, RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.eviction import (
@@ -253,10 +254,13 @@ class Aggregator(nn.Module):
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        leverage_diag: bool = False,
+        leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
         leverage_similarity_granularity: str = "layer",
         leverage_similarity_feature_projection: str = "raw",
+        leverage_similarity_leverage_gamma: float = 1.0,
         leverage_eviction_risk_mode: str = "low_leverage",
         leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
@@ -269,6 +273,10 @@ class Aggregator(nn.Module):
         leverage_dpp_recency_window: int = 5,
         leverage_dpp_recency_gate_power: float = 1.0,
         leverage_dpp_recency_debug: bool = False,
+        leverage_conf_gate: bool = False,
+        leverage_conf_gate_floor: float = 0.2,
+        leverage_conf_gate_depth_alpha: float = 1.0,
+        leverage_conf_gate_point_beta: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -487,11 +495,14 @@ class Aggregator(nn.Module):
                             leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=leverage_ridge_jitter,
                             leverage_ridge_dim=leverage_ridge_dim,
+                            leverage_diag=leverage_diag,
+                            leverage_diag_interval=leverage_diag_interval,
                             leverage_random_seed=leverage_random_seed,
                             leverage_eviction_selector=leverage_eviction_selector,
                             leverage_similarity_granularity=leverage_similarity_granularity,
                 leverage_similarity_feature_projection=leverage_similarity_feature_projection,
-leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                leverage_similarity_leverage_gamma=leverage_similarity_leverage_gamma,
+                leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                             leverage_high_outlier_z=leverage_high_outlier_z,
                             leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                             leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
@@ -503,6 +514,10 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                             leverage_dpp_recency_window=leverage_dpp_recency_window,
                             leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
                             leverage_dpp_recency_debug=leverage_dpp_recency_debug,
+                            leverage_conf_gate=leverage_conf_gate,
+                            leverage_conf_gate_floor=leverage_conf_gate_floor,
+                            leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
+                            leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                             layer_budget_strategy=layer_budget_strategy,
                             layer_budget_value_gamma=layer_budget_value_gamma,
                             layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -556,11 +571,14 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                             leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=leverage_ridge_jitter,
                             leverage_ridge_dim=leverage_ridge_dim,
+                            leverage_diag=leverage_diag,
+                            leverage_diag_interval=leverage_diag_interval,
                             leverage_random_seed=leverage_random_seed,
                             leverage_eviction_selector=leverage_eviction_selector,
                             leverage_similarity_granularity=leverage_similarity_granularity,
                 leverage_similarity_feature_projection=leverage_similarity_feature_projection,
-leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                leverage_similarity_leverage_gamma=leverage_similarity_leverage_gamma,
+                leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                             leverage_high_outlier_z=leverage_high_outlier_z,
                             leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                             leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
@@ -572,6 +590,10 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                             leverage_dpp_recency_window=leverage_dpp_recency_window,
                             leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
                             leverage_dpp_recency_debug=leverage_dpp_recency_debug,
+                            leverage_conf_gate=leverage_conf_gate,
+                            leverage_conf_gate_floor=leverage_conf_gate_floor,
+                            leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
+                            leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                             layer_budget_strategy=layer_budget_strategy,
                             layer_budget_value_gamma=layer_budget_value_gamma,
                             layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -785,10 +807,13 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        leverage_diag: bool = False,
+        leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
         leverage_similarity_granularity: str = "layer",
         leverage_similarity_feature_projection: str = "raw",
+        leverage_similarity_leverage_gamma: float = 1.0,
         leverage_eviction_risk_mode: str = "low_leverage",
         leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
@@ -801,6 +826,10 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
         leverage_dpp_recency_window: int = 5,
         leverage_dpp_recency_gate_power: float = 1.0,
         leverage_dpp_recency_debug: bool = False,
+        leverage_conf_gate: bool = False,
+        leverage_conf_gate_floor: float = 0.2,
+        leverage_conf_gate_depth_alpha: float = 1.0,
+        leverage_conf_gate_point_beta: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -874,11 +903,14 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                         leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                         leverage_ridge_jitter=leverage_ridge_jitter,
                         leverage_ridge_dim=leverage_ridge_dim,
+                        leverage_diag=leverage_diag,
+                        leverage_diag_interval=leverage_diag_interval,
                         leverage_random_seed=leverage_random_seed,
                         leverage_eviction_selector=leverage_eviction_selector,
                         leverage_similarity_granularity=leverage_similarity_granularity,
                 leverage_similarity_feature_projection=leverage_similarity_feature_projection,
-leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                leverage_similarity_leverage_gamma=leverage_similarity_leverage_gamma,
+                leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                         leverage_high_outlier_z=leverage_high_outlier_z,
                         leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                         leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
@@ -890,6 +922,10 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                         leverage_dpp_recency_window=leverage_dpp_recency_window,
                         leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
                         leverage_dpp_recency_debug=leverage_dpp_recency_debug,
+                        leverage_conf_gate=leverage_conf_gate,
+                        leverage_conf_gate_floor=leverage_conf_gate_floor,
+                        leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
+                        leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                         layer_budget_strategy=layer_budget_strategy,
                         layer_budget_value_gamma=layer_budget_value_gamma,
                         layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -1030,10 +1066,13 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        leverage_diag: bool = False,
+        leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
         leverage_similarity_granularity: str = "layer",
         leverage_similarity_feature_projection: str = "raw",
+        leverage_similarity_leverage_gamma: float = 1.0,
         leverage_eviction_risk_mode: str = "low_leverage",
         leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
@@ -1046,6 +1085,10 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
         leverage_dpp_recency_window: int = 5,
         leverage_dpp_recency_gate_power: float = 1.0,
         leverage_dpp_recency_debug: bool = False,
+        leverage_conf_gate: bool = False,
+        leverage_conf_gate_floor: float = 0.2,
+        leverage_conf_gate_depth_alpha: float = 1.0,
+        leverage_conf_gate_point_beta: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -1129,11 +1172,14 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                     leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                     leverage_ridge_jitter=leverage_ridge_jitter,
                     leverage_ridge_dim=leverage_ridge_dim,
+                    leverage_diag=leverage_diag,
+                    leverage_diag_interval=leverage_diag_interval,
                     leverage_random_seed=leverage_random_seed,
                     leverage_eviction_selector=leverage_eviction_selector,
                     leverage_similarity_granularity=leverage_similarity_granularity,
                 leverage_similarity_feature_projection=leverage_similarity_feature_projection,
-leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                leverage_similarity_leverage_gamma=leverage_similarity_leverage_gamma,
+                leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                     leverage_high_outlier_z=leverage_high_outlier_z,
                     leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                     leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
@@ -1145,6 +1191,10 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                     leverage_dpp_recency_window=leverage_dpp_recency_window,
                     leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
                     leverage_dpp_recency_debug=leverage_dpp_recency_debug,
+                    leverage_conf_gate=leverage_conf_gate,
+                    leverage_conf_gate_floor=leverage_conf_gate_floor,
+                    leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
+                    leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                     layer_budget_strategy=layer_budget_strategy,
                     layer_budget_value_gamma=layer_budget_value_gamma,
                     layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -1286,13 +1336,8 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
             sidecar = special_kv_sidecars[idx]
             if layer_kv is None or sidecar is None:
                 continue
-            if len(layer_kv) == 3:
-                k, v, metadata = layer_kv
-            else:
-                k, v = layer_kv
-                metadata = None
-            side_k, side_v = sidecar[:2]
-            side_metadata = sidecar[2] if len(sidecar) == 3 else None
+            k, v, metadata, confidence_state = unpack_kv_cache(layer_kv)
+            side_k, side_v, side_metadata, side_confidence_state = unpack_kv_cache(sidecar)
             chunk = int(side_k.shape[2])
             if chunk <= 0:
                 continue
@@ -1308,34 +1353,51 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                     continue
                 k_parts = [k[:, :, :remove_start, :], k[:, :, remove_end:anchor_token_count, :], side_k, k[:, :, anchor_token_count:, :]]
                 v_parts = [v[:, :, :remove_start, :], v[:, :, remove_end:anchor_token_count, :], side_v, v[:, :, anchor_token_count:, :]]
-                metadata_part_specs = [(0, remove_start), (remove_end, min(anchor_token_count, N)), None, (anchor_token_count, N)]
+                sidecar_part_specs = [(0, remove_start), (remove_end, min(anchor_token_count, N)), None, (anchor_token_count, N)]
             else:
                 insert_pos = max(anchor_token_count - chunk, global_anchor_end)
                 insert_pos = min(insert_pos, N)
                 k_parts = [k[:, :, :insert_pos, :], side_k, k[:, :, insert_pos:, :]]
                 v_parts = [v[:, :, :insert_pos, :], side_v, v[:, :, insert_pos:, :]]
-                metadata_part_specs = [(0, insert_pos), None, (insert_pos, N)]
+                sidecar_part_specs = [(0, insert_pos), None, (insert_pos, N)]
 
             k_new = torch.cat(k_parts, dim=2)
             v_new = torch.cat(v_parts, dim=2)
+            merged_metadata = None
             if metadata is not None and side_metadata is not None:
                 meta_parts = []
-                for spec in metadata_part_specs:
+                for spec in sidecar_part_specs:
                     if spec is None:
                         meta_parts.append(side_metadata)
                         continue
-                    start, end = spec
-                    if end > start:
-                        meta_parts.append(Aggregator._metadata_slice(metadata, start, end))
-                if not meta_parts:
-                    past_key_values[idx] = (k_new, v_new, metadata)
-                    continue
-                merged_metadata = meta_parts[0]
-                for part in meta_parts[1:]:
-                    merged_metadata = merged_metadata.concat(part)
-                past_key_values[idx] = (k_new, v_new, merged_metadata)
-            else:
-                past_key_values[idx] = (k_new, v_new)
+                    start_pos, end_pos = spec
+                    if end_pos > start_pos:
+                        meta_parts.append(Aggregator._metadata_slice(metadata, start_pos, end_pos))
+                if meta_parts:
+                    merged_metadata = meta_parts[0]
+                    for part in meta_parts[1:]:
+                        merged_metadata = merged_metadata.concat(part)
+                else:
+                    merged_metadata = metadata
+
+            merged_confidence_state = None
+            if confidence_state is not None and side_confidence_state is not None:
+                conf_parts = []
+                for spec in sidecar_part_specs:
+                    if spec is None:
+                        conf_parts.append(side_confidence_state)
+                        continue
+                    start_pos, end_pos = spec
+                    if end_pos > start_pos:
+                        conf_parts.append(confidence_state.slice(start_pos, end_pos))
+                if conf_parts:
+                    merged_confidence_state = conf_parts[0]
+                    for part in conf_parts[1:]:
+                        merged_confidence_state = merged_confidence_state.concat(part)
+                else:
+                    merged_confidence_state = confidence_state
+
+            past_key_values[idx] = pack_kv_cache(k_new, v_new, merged_metadata, merged_confidence_state)
         return past_key_values
 
 
@@ -1385,11 +1447,7 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                 continue
 
             layer_kv = past_key_values[idx]
-            if len(layer_kv) == 3:
-                k, v, metadata = layer_kv
-            else:
-                k, v = layer_kv
-                metadata = None
+            k, v, metadata, confidence_state = unpack_kv_cache(layer_kv)
 
             B, H, N, D = k.shape
             if N <= anchor_token_count:
@@ -1466,9 +1524,9 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
             v_new = torch.gather(v, 2, expanded_indices)
             if metadata is not None:
                 metadata = metadata.gather(gather_indices.detach().cpu())
-                past_key_values[idx] = (k_new, v_new, metadata)
-            else:
-                past_key_values[idx] = (k_new, v_new)
+            if confidence_state is not None:
+                confidence_state = confidence_state.gather(gather_indices)
+            past_key_values[idx] = pack_kv_cache(k_new, v_new, metadata, confidence_state)
 
         return past_key_values
 

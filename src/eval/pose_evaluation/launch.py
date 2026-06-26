@@ -174,6 +174,11 @@ def validate_streamvggt_args(args):
             "Error: --leverage_ridge_lambda must be >= 0, "
             f"got {args.leverage_ridge_lambda}."
         )
+    if args.leverage_diag_interval < 0:
+        raise SystemExit(
+            "Error: --leverage_diag_interval must be >= 0, "
+            f"got {args.leverage_diag_interval}."
+        )
     if args.leverage_ridge_jitter <= 0:
         raise SystemExit(
             "Error: --leverage_ridge_jitter must be > 0, "
@@ -426,6 +431,19 @@ def get_args_parser():
         help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge",
     )
     parser.add_argument(
+        "--leverage_diag",
+        "--leverage-diag",
+        action="store_true",
+        help="Print ridge leverage diagnostic statistics at selected eviction steps",
+    )
+    parser.add_argument(
+        "--leverage_diag_interval",
+        "--leverage-diag-interval",
+        type=int,
+        default=0,
+        help="Diagnostic interval; 0 prints only the first eviction step, positive values print every N steps",
+    )
+    parser.add_argument(
         "--leverage_random_seed",
         "--leverage-random-seed",
         type=int,
@@ -455,6 +473,13 @@ def get_args_parser():
         default="raw",
         choices=("raw", "random"),
         help="Feature source for similarity_topk cosine: raw key features or random projected leverage features reused from score computation",
+    )
+    parser.add_argument(
+        "--leverage_similarity_leverage_gamma",
+        "--leverage-similarity-leverage-gamma",
+        type=float,
+        default=1.0,
+        help="Exponent gamma in similarity_topk eviction score: max_cosine / leverage**gamma",
     )
     parser.add_argument(
         "--leverage_eviction_risk_mode",
@@ -1011,10 +1036,13 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=args.leverage_ridge_jitter,
                             leverage_ridge_dim=args.leverage_ridge_dim,
+                            leverage_diag=args.leverage_diag,
+                            leverage_diag_interval=args.leverage_diag_interval,
                             leverage_random_seed=args.leverage_random_seed,
                             leverage_eviction_selector=args.leverage_eviction_selector,
                             leverage_similarity_granularity=args.leverage_similarity_granularity,
                             leverage_similarity_feature_projection=args.leverage_similarity_feature_projection,
+                            leverage_similarity_leverage_gamma=args.leverage_similarity_leverage_gamma,
                             leverage_eviction_risk_mode=args.leverage_eviction_risk_mode,
                             leverage_high_outlier_z=args.leverage_high_outlier_z,
                             leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,

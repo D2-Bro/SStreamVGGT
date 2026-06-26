@@ -21,6 +21,7 @@ from streamvggt.utils.cache_analysis import (
     TokenOverlayDumpConfig,
 )
 from streamvggt.utils.history_anchor import HistoryAnchorConfig, HistoryAnchorManager
+from streamvggt.layers.confidence_state import make_token_confidence_gate, pack_kv_cache, sample_token_confidence, unpack_kv_cache
 from streamvggt.layers.recent_merge import RecentMergeConfig, RecentSimilarityMerge
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig, VoxelCovisibilityGraph
@@ -279,10 +280,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        leverage_diag: bool = False,
+        leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
         leverage_similarity_granularity: str = "layer",
         leverage_similarity_feature_projection: str = "raw",
+        leverage_similarity_leverage_gamma: float = 1.0,
         leverage_eviction_risk_mode: str = "low_leverage",
         leverage_high_outlier_z: float = 3.0,
         leverage_dpp_candidate_multiplier: int = 2,
@@ -295,6 +299,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_dpp_recency_window: int = 5,
         leverage_dpp_recency_gate_power: float = 1.0,
         leverage_dpp_recency_debug: bool = False,
+        leverage_conf_gate: bool = False,
+        leverage_conf_gate_floor: float = 0.2,
+        leverage_conf_gate_depth_alpha: float = 1.0,
+        leverage_conf_gate_point_beta: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -513,11 +521,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                 leverage_ridge_jitter=leverage_ridge_jitter,
                 leverage_ridge_dim=leverage_ridge_dim,
+                leverage_diag=leverage_diag,
+                leverage_diag_interval=leverage_diag_interval,
                 leverage_random_seed=leverage_random_seed,
                 leverage_eviction_selector=leverage_eviction_selector,
                 leverage_similarity_granularity=leverage_similarity_granularity,
                 leverage_similarity_feature_projection=leverage_similarity_feature_projection,
-leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                leverage_similarity_leverage_gamma=leverage_similarity_leverage_gamma,
+                leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                 leverage_high_outlier_z=leverage_high_outlier_z,
                 leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
                 leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
@@ -529,6 +540,10 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                 leverage_dpp_recency_window=leverage_dpp_recency_window,
                 leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
                 leverage_dpp_recency_debug=leverage_dpp_recency_debug,
+                leverage_conf_gate=leverage_conf_gate,
+                leverage_conf_gate_floor=leverage_conf_gate_floor,
+                leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
+                leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                 layer_budget_strategy=layer_budget_strategy,
                 layer_budget_value_gamma=layer_budget_value_gamma,
                 layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -737,21 +752,58 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                     camera_cache_tokens_per_frame,
                 )
 
+            tokens_per_frame = int(aggregated_tokens[-1].shape[2])
+            if leverage_conf_gate:
+                token_depth_conf = sample_token_confidence(
+                    depth_conf,
+                    images.shape[-2:],
+                    tokens_per_frame,
+                    self.aggregator.patch_start_idx,
+                    self.aggregator.patch_size,
+                )
+                token_point_conf = sample_token_confidence(
+                    pts3d_conf if self.point_head is not None else None,
+                    images.shape[-2:],
+                    tokens_per_frame,
+                    self.aggregator.patch_start_idx,
+                    self.aggregator.patch_size,
+                    batch_size=token_depth_conf.shape[0],
+                    device=token_depth_conf.device,
+                )
+                token_conf_gate = make_token_confidence_gate(
+                    token_depth_conf,
+                    token_point_conf,
+                    floor=leverage_conf_gate_floor,
+                    depth_alpha=leverage_conf_gate_depth_alpha,
+                    point_beta=leverage_conf_gate_point_beta,
+                    preserve_prefix_tokens=self.aggregator.patch_start_idx,
+                )
+                for layer_id, layer_kv in enumerate(past_key_values):
+                    if layer_kv is None:
+                        continue
+                    k_cache, v_cache, metadata, confidence_state = unpack_kv_cache(layer_kv)
+                    if confidence_state is None:
+                        continue
+                    confidence_state.update_frame_gate(i, token_conf_gate)
+                    past_key_values[layer_id] = pack_kv_cache(k_cache, v_cache, metadata, confidence_state)
+
             if recent_merger is not None:
-                tokens_per_frame = int(aggregated_tokens[-1].shape[2])
                 geom = recent_merger.record_frame_geometry(
                     frame_id=i,
                     depth=depth,
                     depth_conf=depth_conf,
+                    point_conf=pts3d_conf if self.point_head is not None else None,
                     pose_enc=camera_pose,
                     image_hw=images.shape[-2:],
                     tokens_per_frame=tokens_per_frame,
                 )
                 if geom is not None:
                     for layer_id, layer_kv in enumerate(past_key_values):
-                        if layer_kv is None or len(layer_kv) != 3:
+                        if layer_kv is None:
                             continue
-                        k_cache, v_cache, metadata = layer_kv
+                        k_cache, v_cache, metadata, confidence_state = unpack_kv_cache(layer_kv)
+                        if metadata is None:
+                            continue
                         recent_merger.update_metadata_for_frame(metadata, i)
                         if run_recent_merge:
                             k_cache, v_cache, metadata, _ = recent_merger.merge_layer(
@@ -761,7 +813,7 @@ leverage_eviction_risk_mode=leverage_eviction_risk_mode,
                                 layer_id=layer_id,
                                 frame_id=i,
                             )
-                        past_key_values[layer_id] = (k_cache, v_cache, metadata)
+                        past_key_values[layer_id] = pack_kv_cache(k_cache, v_cache, metadata, confidence_state)
 
             if voxel_covis_graph is not None:
                 voxel_covis_graph.record_frame_geometry(
@@ -837,9 +889,11 @@ def _format_covis_debug(selection, past_key_values) -> str:
 
 def _covis_cache_stats(past_key_values, selected_frame_ids) -> tuple[int, str, str]:
     for layer_kv in past_key_values:
-        if layer_kv is None or len(layer_kv) != 3:
+        if layer_kv is None:
             continue
-        k_cache, _, metadata = layer_kv
+        k_cache, _, metadata, _ = unpack_kv_cache(layer_kv)
+        if metadata is None:
+            continue
         selected = torch.as_tensor(list(selected_frame_ids), dtype=torch.long)
         counts = []
         per_frame = {}
