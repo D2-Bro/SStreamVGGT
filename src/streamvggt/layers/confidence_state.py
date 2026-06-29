@@ -164,6 +164,7 @@ def make_token_confidence_gate(
     floor: float,
     depth_alpha: float,
     point_beta: float,
+    normalizer_k: float = 1.0,
     normalize_confidence: bool = True,
     preserve_prefix_tokens: int = 0,
 ) -> torch.Tensor:
@@ -180,9 +181,12 @@ def make_token_confidence_gate(
 
     prefix = max(int(preserve_prefix_tokens), 0)
     if normalize_confidence:
-        depth_conf = depth_conf / (depth_conf + 1.0)
+        normalizer_k = float(normalizer_k)
+        if normalizer_k <= 0.0:
+            raise ValueError(f"normalizer_k must be > 0, got {normalizer_k}")
+        depth_conf = depth_conf / (depth_conf + normalizer_k)
         if token_point_confidence is not None:
-            point_conf = point_conf / (point_conf + 1.0)
+            point_conf = point_conf / (point_conf + normalizer_k)
 
     if float(depth_alpha) != 1.0:
         depth_conf = depth_conf.pow(float(depth_alpha))

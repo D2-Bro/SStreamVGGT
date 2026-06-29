@@ -303,6 +303,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         leverage_conf_gate_floor: float = 0.2,
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
+        leverage_conf_gate_k: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -776,6 +777,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     floor=leverage_conf_gate_floor,
                     depth_alpha=leverage_conf_gate_depth_alpha,
                     point_beta=leverage_conf_gate_point_beta,
+                    normalizer_k=leverage_conf_gate_k,
                     preserve_prefix_tokens=self.aggregator.patch_start_idx,
                 )
                 for layer_id, layer_kv in enumerate(past_key_values):

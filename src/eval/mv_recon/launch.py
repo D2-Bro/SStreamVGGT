@@ -341,8 +341,9 @@ def get_args_parser():
     parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print eviction-score recency bonus summary statistics")
     parser.add_argument("--leverage_conf_gate", "--leverage-conf-gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
     parser.add_argument("--leverage_conf_gate_floor", "--leverage-conf-gate-floor", type=float, default=0.2, help="Minimum multiplicative confidence gate value")
-    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to normalized depth_conf / (depth_conf + 1) in the confidence gate")
-    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + 1) in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to normalized depth_conf / (depth_conf + k) in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + k) in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive k for confidence normalization c / (c + k)")
     parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
@@ -810,6 +811,11 @@ def main(args):
             "Error: --leverage_conf_gate_point_beta must be >= 0, "
             f"got {args.leverage_conf_gate_point_beta}."
         )
+    if args.leverage_conf_gate_k <= 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_k must be > 0, "
+            f"got {args.leverage_conf_gate_k}."
+        )
     if args.layer_budget_alpha < 0:
         raise SystemExit(
             "Error: --layer_budget_alpha must be >= 0, "
@@ -902,6 +908,7 @@ def main(args):
             f"conf_gate_floor={args.leverage_conf_gate_floor}, "
             f"conf_gate_depth_alpha={args.leverage_conf_gate_depth_alpha}, "
             f"conf_gate_point_beta={args.leverage_conf_gate_point_beta}, "
+            f"conf_gate_k={args.leverage_conf_gate_k}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
@@ -1307,6 +1314,7 @@ def main(args):
                                     leverage_conf_gate_floor=args.leverage_conf_gate_floor,
                                     leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
                                     leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
+                                    leverage_conf_gate_k=args.leverage_conf_gate_k,
                                     layer_budget_strategy=args.layer_budget_strategy,
                                     layer_budget_value_gamma=args.layer_budget_value_gamma,
                                     layer_budget_value_norm_type=args.layer_budget_value_norm_type,

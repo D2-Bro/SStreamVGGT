@@ -207,6 +207,27 @@ def check_confidence_state_sidecar() -> None:
     expected_gate[:, 0] = expected_gate[:, 1:].mean(dim=1)
     if not torch.allclose(gate_tokens, expected_gate):
         raise AssertionError(f"normalized confidence gate mismatch: {gate_tokens} vs {expected_gate}")
+    gate_tokens_k2 = make_token_confidence_gate(
+        depth_tokens,
+        point_tokens,
+        floor=0.2,
+        depth_alpha=1.0,
+        point_beta=1.0,
+        normalizer_k=2.0,
+        preserve_prefix_tokens=1,
+    )
+    expected_depth_k2 = depth_tokens / (depth_tokens + 2.0)
+    expected_point_k2 = point_tokens / (point_tokens + 2.0)
+    expected_gate_k2 = 0.2 + 0.8 * expected_depth_k2 * expected_point_k2
+    expected_gate_k2[:, 0] = expected_gate_k2[:, 1:].mean(dim=1)
+    if not torch.allclose(gate_tokens_k2, expected_gate_k2):
+        raise AssertionError(f"k=2 confidence gate mismatch: {gate_tokens_k2} vs {expected_gate_k2}")
+    try:
+        make_token_confidence_gate(depth_tokens, point_tokens, floor=0.2, depth_alpha=1.0, point_beta=1.0, normalizer_k=0.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("normalizer_k <= 0 should be rejected")
     if not torch.isclose(gate_tokens[0, 0], gate_tokens[0, 1:].mean()):
         raise AssertionError("prefix token gate should use patch gate mean")
     combined.update_frame_gate(1, gate_tokens)
