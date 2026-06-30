@@ -167,7 +167,11 @@ def make_token_confidence_gate(
     normalizer_k: float = 1.0,
     normalize_confidence: bool = True,
     preserve_prefix_tokens: int = 0,
+    prefix_token_mode: str = "mean",
 ) -> torch.Tensor:
+    if prefix_token_mode not in ("mean", "one"):
+        raise ValueError(f"prefix_token_mode must be 'mean' or 'one', got {prefix_token_mode!r}")
+
     depth_conf = torch.nan_to_num(token_depth_confidence.float(), nan=1.0, posinf=1.0e6, neginf=0.0).clamp_min(0.0)
     if token_point_confidence is None:
         point_conf = torch.ones_like(depth_conf)
@@ -197,7 +201,7 @@ def make_token_confidence_gate(
 
     prefix = min(prefix, gate.shape[1])
     if prefix > 0:
-        if gate.shape[1] > prefix:
+        if prefix_token_mode == "mean" and gate.shape[1] > prefix:
             patch_gate = gate[:, prefix:]
             finite = torch.isfinite(patch_gate)
             patch_sum = torch.where(finite, patch_gate, torch.zeros_like(patch_gate)).sum(dim=1)

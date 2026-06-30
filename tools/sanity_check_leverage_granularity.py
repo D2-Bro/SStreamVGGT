@@ -230,6 +230,17 @@ def check_confidence_state_sidecar() -> None:
         raise AssertionError("normalizer_k <= 0 should be rejected")
     if not torch.isclose(gate_tokens[0, 0], gate_tokens[0, 1:].mean()):
         raise AssertionError("prefix token gate should use patch gate mean")
+    gate_tokens_prefix_one = make_token_confidence_gate(
+        depth_tokens,
+        point_tokens,
+        floor=0.2,
+        depth_alpha=1.0,
+        point_beta=1.0,
+        preserve_prefix_tokens=1,
+        prefix_token_mode="one",
+    )
+    if not torch.isclose(gate_tokens_prefix_one[0, 0], torch.tensor(1.0)):
+        raise AssertionError("prefix_token_mode='one' should set prefix gate to 1.0")
     combined.update_frame_gate(1, gate_tokens)
     if not torch.isclose(combined.confidence_gate[0, 6], gate_tokens[0, 2]):
         raise AssertionError("confidence gate update did not use frame/token provenance")

@@ -345,6 +345,14 @@ def get_args_parser():
     parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + k) in the confidence gate")
     parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive k for confidence normalization c / (c + k)")
     parser.add_argument(
+        "--leverage_conf_gate_special_mode",
+        "--leverage-conf-gate-special-mode",
+        type=str,
+        default="mean",
+        choices=("mean", "one"),
+        help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0",
+    )
+    parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
         type=str,
@@ -909,6 +917,7 @@ def main(args):
             f"conf_gate_depth_alpha={args.leverage_conf_gate_depth_alpha}, "
             f"conf_gate_point_beta={args.leverage_conf_gate_point_beta}, "
             f"conf_gate_k={args.leverage_conf_gate_k}, "
+            f"conf_gate_special_mode={args.leverage_conf_gate_special_mode}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
@@ -1006,16 +1015,16 @@ def main(args):
     else:
         raise NotImplementedError
     datasets_all = {
-        # "7scenes": SevenScenes(
-        #     split="test",
-        #     ROOT="/home/dongjae/data/7scenes_sfm",
-        #     # ROOT="/data2/dongjae/datasets/7scenes_sfm",
-        #     resolution=resolution,
-        #     num_seq=1,
-        #     full_video=True,
-        #     kf_every=2,
-        #     max_frames=args.max_frames,
-        # ),
+        "7scenes": SevenScenes(
+            split="test",
+            ROOT="/home/dongjae/data/7scenes_sfm",
+            # ROOT="/data2/dongjae/datasets/7scenes_sfm",
+            resolution=resolution,
+            num_seq=1,
+            full_video=True,
+            kf_every=2,
+            max_frames=args.max_frames,
+        ),
         # "ETH3D": ETH3D
             # 20),
         "NRGBD": NRGBD(
@@ -1315,6 +1324,7 @@ def main(args):
                                     leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
                                     leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
                                     leverage_conf_gate_k=args.leverage_conf_gate_k,
+                                    leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
                                     layer_budget_strategy=args.layer_budget_strategy,
                                     layer_budget_value_gamma=args.layer_budget_value_gamma,
                                     layer_budget_value_norm_type=args.layer_budget_value_norm_type,

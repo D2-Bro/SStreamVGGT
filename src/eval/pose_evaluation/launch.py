@@ -149,6 +149,26 @@ def validate_streamvggt_args(args):
             "Error: --leverage_dpp_recency_gate_power must be >= 0, "
             f"got {args.leverage_dpp_recency_gate_power}."
         )
+    if not (0.0 <= args.leverage_conf_gate_floor <= 1.0):
+        raise SystemExit(
+            "Error: --leverage_conf_gate_floor must be in [0, 1], "
+            f"got {args.leverage_conf_gate_floor}."
+        )
+    if args.leverage_conf_gate_depth_alpha < 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_depth_alpha must be >= 0, "
+            f"got {args.leverage_conf_gate_depth_alpha}."
+        )
+    if args.leverage_conf_gate_point_beta < 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_point_beta must be >= 0, "
+            f"got {args.leverage_conf_gate_point_beta}."
+        )
+    if args.leverage_conf_gate_k <= 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_k must be > 0, "
+            f"got {args.leverage_conf_gate_k}."
+        )
     if args.layer_budget_alpha < 0:
         raise SystemExit(
             "Error: --layer_budget_alpha must be >= 0, "
@@ -224,6 +244,7 @@ def validate_streamvggt_args(args):
             f"ridge_chunk={args.leverage_ridge_score_chunk_size}, ridge_jitter={args.leverage_ridge_jitter}, "
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
+            f"normalize_rows={args.leverage_normalize_rows}, "
             f"selector={args.leverage_eviction_selector}, "
             f"risk_mode={args.leverage_eviction_risk_mode}, "
             f"high_outlier_z={args.leverage_high_outlier_z}, "
@@ -232,6 +253,12 @@ def validate_streamvggt_args(args):
             f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
             f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
             f"dpp_feature_projection={args.leverage_dpp_feature_projection}, "
+            f"conf_gate={args.leverage_conf_gate}, "
+            f"conf_gate_floor={args.leverage_conf_gate_floor}, "
+            f"conf_gate_depth_alpha={args.leverage_conf_gate_depth_alpha}, "
+            f"conf_gate_point_beta={args.leverage_conf_gate_point_beta}, "
+            f"conf_gate_k={args.leverage_conf_gate_k}, "
+            f"conf_gate_special_mode={args.leverage_conf_gate_special_mode}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
@@ -387,6 +414,13 @@ def get_args_parser():
         help="Number of mean-pooled channel groups per head for leverage_projection='head_mean'",
     )
     parser.add_argument(
+        "--leverage_normalize_rows",
+        "--leverage-normalize-rows",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
+    )
+    parser.add_argument(
         "--leverage_approx_method",
         "--leverage-approx-method",
         type=str,
@@ -538,6 +572,19 @@ def get_args_parser():
     parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=5, help="Frame window for linear eviction-score freshness")
     parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for eviction-score recency")
     parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print eviction-score recency bonus summary statistics")
+    parser.add_argument("--leverage_conf_gate", "--leverage-conf-gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
+    parser.add_argument("--leverage_conf_gate_floor", "--leverage-conf-gate-floor", type=float, default=0.2, help="Minimum multiplicative confidence gate value")
+    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to normalized depth_conf / (depth_conf + k) in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + k) in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive k for confidence normalization c / (c + k)")
+    parser.add_argument(
+        "--leverage_conf_gate_special_mode",
+        "--leverage-conf-gate-special-mode",
+        type=str,
+        default="mean",
+        choices=("mean", "one"),
+        help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0",
+    )
     parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
@@ -1030,8 +1077,9 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_feature=args.leverage_feature,
                             leverage_projection=args.leverage_projection,
                             leverage_head_mean_dim=args.leverage_head_mean_dim,
+                            leverage_normalize_rows=args.leverage_normalize_rows,
                             leverage_approx_method=args.leverage_approx_method,
-                                    leverage_ridge_lambda=args.leverage_ridge_lambda,
+                            leverage_ridge_lambda=args.leverage_ridge_lambda,
                             leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
                             leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=args.leverage_ridge_jitter,
@@ -1055,6 +1103,12 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_dpp_recency_window=args.leverage_dpp_recency_window,
                             leverage_dpp_recency_gate_power=args.leverage_dpp_recency_gate_power,
                             leverage_dpp_recency_debug=args.leverage_dpp_recency_debug,
+                            leverage_conf_gate=args.leverage_conf_gate,
+                            leverage_conf_gate_floor=args.leverage_conf_gate_floor,
+                            leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
+                            leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
+                            leverage_conf_gate_k=args.leverage_conf_gate_k,
+                            leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
                             layer_budget_strategy=args.layer_budget_strategy,
                             layer_budget_value_gamma=args.layer_budget_value_gamma,
                             layer_budget_value_norm_type=args.layer_budget_value_norm_type,
