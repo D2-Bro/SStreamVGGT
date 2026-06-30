@@ -312,8 +312,8 @@ def check_confidence_state_sidecar() -> None:
         step_idx=1,
         leverage_conf_gate=True,
     )
-    if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.full((1, 4), 0.5)):
-        raise AssertionError(f"new frame temporary gate should use cached mean: {kv1[3].confidence_gate}")
+    if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.ones((1, 4))):
+        raise AssertionError(f"new frame temporary gate should initialize to one: {kv1[3].confidence_gate}")
     kv1[3].update_frame_gate(1, torch.tensor([[0.9, 0.8, 0.7, 0.6]]))
     if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.tensor([[0.9, 0.8, 0.7, 0.6]])):
         raise AssertionError("post-head update did not replace temporary current-frame gate")

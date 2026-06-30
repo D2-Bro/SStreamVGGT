@@ -680,14 +680,6 @@ class Attention(nn.Module):
                     num_tokens=current_k.shape[2],
                     frame_id=step_idx if step_idx is not None else 0,
                 )
-            initial_confidence_gate = None
-            if confidence_needed and past_key_values is not None:
-                _, _, _, past_confidence_for_init = unpack_kv_cache(past_key_values)
-                if past_confidence_for_init is not None:
-                    initial_confidence_gate = past_confidence_for_init.mean_gate().to(
-                        device=current_k.device,
-                        dtype=torch.float32,
-                    )
             if confidence_needed:
                 confidence_state = KVConfidenceState.for_current_frame(
                     batch_size=B,
@@ -695,7 +687,6 @@ class Attention(nn.Module):
                     num_tokens=current_k.shape[2],
                     frame_id=step_idx if step_idx is not None else 0,
                     device=current_k.device,
-                    initial_gate=initial_confidence_gate,
                 )
 
             write_k = current_k
