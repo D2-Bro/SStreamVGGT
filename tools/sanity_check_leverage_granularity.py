@@ -168,6 +168,31 @@ def check_key_value_feature() -> None:
     _assert_finite(scores, "key_value layer scores")
 
 
+def check_key_value_lowdim_concat_feature() -> None:
+    k, v = _make_cache()
+    ridge_dim = 4
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_feature="key_value_lowdim_concat",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=ridge_dim,
+    )
+    scores = manager._layer_svd_leverage_scores(k[:, :, 2:, :], v[:, :, 2:, :])
+    assert scores.shape == (2, 9)
+    assert manager._last_layer_feature_shape == (9, 2 * ridge_dim)
+    _assert_finite(scores, "key_value_lowdim_concat layer scores")
+    _assert_nonnegative(scores, "key_value_lowdim_concat layer scores")
+
+    try:
+        manager._layer_svd_leverage_scores(k[:, :, 2:, :], None)
+    except ValueError as exc:
+        if "requires value cache tensor" not in str(exc):
+            raise AssertionError(f"unexpected missing-value error: {exc}") from exc
+    else:
+        raise AssertionError("key_value_lowdim_concat should require candidate_v")
+
+
 def check_low_precision_inputs() -> None:
     for dtype in (torch.float16, torch.bfloat16):
         k, v = _make_cache(dtype=dtype)
@@ -765,7 +790,7 @@ def _reference_layer_score_head_dpp(
         for head_idx in range(H):
             def feature_fn(indices):
                 features = candidate_k[batch_idx, head_idx].index_select(0, indices)
-                if manager.leverage_feature == "key_value":
+                if manager.leverage_feature in ("key_value", "key_value_lowdim_concat"):
                     features = torch.cat(
                         [features, candidate_v[batch_idx, head_idx].index_select(0, indices)],
                         dim=-1,
@@ -2214,6 +2239,7 @@ def main() -> None:
     check_dpp_shapes_and_full_pool()
     check_dpp_recent_frame_protection()
     check_key_value_feature()
+    check_key_value_lowdim_concat_feature()
     check_low_precision_inputs()
     check_confidence_state_sidecar()
     check_confidence_gate_head_mode()

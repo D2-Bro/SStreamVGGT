@@ -78,8 +78,8 @@ def get_args_parser():
         "--leverage_feature",
         type=str,
         default="key",
-        choices=("key", "key_value"),
-        help="Feature tensor for svd_leverage eviction: keys only or concatenated keys and values",
+        choices=("key", "key_value", "key_value_lowdim_concat"),
+        help="Feature tensor for svd_leverage eviction: keys only, concatenated keys and values, or concatenated low-dimensional key/value sketches",
     )
     parser.add_argument(
         "--leverage_projection",

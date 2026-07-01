@@ -57,6 +57,9 @@ COVARIANCE_LAYER_BUDGET_STRATEGIES = (
 )
 
 
+KV_LEVERAGE_FEATURES = ("key_value", "key_value_lowdim_concat")
+
+
 def _participation_ratio_from_values(values: Optional[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
     if values is None or values.numel() == 0:
         device = values.device if values is not None else "cpu"
@@ -464,8 +467,11 @@ class EvictionManager:
             raise ValueError(f"leverage_head_mean_dim must be >= 1, got {leverage_head_mean_dim}")
         if leverage_granularity not in ("head", "layer"):
             raise ValueError("leverage_granularity must be 'head' or 'layer', got " f"{leverage_granularity!r}")
-        if leverage_feature not in ("key", "key_value"):
-            raise ValueError("leverage_feature must be 'key' or 'key_value', got " f"{leverage_feature!r}")
+        if leverage_feature not in ("key", "key_value", "key_value_lowdim_concat"):
+            raise ValueError(
+                "leverage_feature must be 'key', 'key_value', or "
+                f"'key_value_lowdim_concat', got {leverage_feature!r}"
+            )
         if leverage_projection not in ("random", "head_mean"):
             raise ValueError(
                 "leverage_projection must be 'random' or 'head_mean', got "
@@ -475,6 +481,18 @@ class EvictionManager:
             raise ValueError("leverage_projection='head_mean' requires leverage_granularity='layer'")
         if leverage_projection == "head_mean" and leverage_feature != "key":
             raise ValueError("leverage_projection='head_mean' requires leverage_feature='key'")
+        if leverage_feature == "key_value_lowdim_concat":
+            if leverage_granularity != "layer":
+                raise ValueError("leverage_feature='key_value_lowdim_concat' requires leverage_granularity='layer'")
+            if leverage_projection != "random":
+                raise ValueError("leverage_feature='key_value_lowdim_concat' requires leverage_projection='random'")
+            if leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+                raise ValueError(
+                    "leverage_feature='key_value_lowdim_concat' requires "
+                    "leverage_approx_method='right_sketch' or 'right_sketch_ridge'"
+                )
+            if leverage_ridge_dim is None:
+                raise ValueError("leverage_feature='key_value_lowdim_concat' requires leverage_ridge_dim >= 1")
         if leverage_approx_method not in self.VALID_LEVERAGE_APPROX_METHODS:
             raise ValueError(
                 "leverage_approx_method must be one of "
@@ -926,7 +944,10 @@ class EvictionManager:
                 if self.leverage_projection == "head_mean":
                     feature_dim = H * self.leverage_head_mean_dim
                 else:
-                    feature_dim = H * D * (2 if self.leverage_feature == "key_value" else 1)
+                    if self.leverage_feature == "key_value_lowdim_concat" and self._last_layer_feature_shape is not None:
+                        feature_dim = self._last_layer_feature_shape[-1]
+                    else:
+                        feature_dim = H * D * (2 if self.leverage_feature == "key_value" else 1)
             msg = (
                 f"[EvictionManager] policy={self.policy} layer={layer_id} step={step_idx} "
                 f"cache={N} budget={cache_budget} keep_candidates={kept.shape[-1]} "
@@ -1695,10 +1716,10 @@ class EvictionManager:
         else:
             gather_index = pool.unsqueeze(-1).expand(B, H, pool_size, D)
             features = torch.gather(candidate_k, dim=2, index=gather_index).float()
-            if self.leverage_feature == "key_value":
+            if self.leverage_feature in KV_LEVERAGE_FEATURES:
                 if candidate_v is None:
                     raise ValueError(
-                        "leverage_feature='key_value' requires value cache tensor for layer_head_fast_dpp"
+                        f"leverage_feature={self.leverage_feature!r} requires value cache tensor for layer_head_fast_dpp"
                     )
                 value_features = torch.gather(candidate_v, dim=2, index=gather_index).float()
                 features = torch.cat([features, value_features], dim=-1)
@@ -2275,9 +2296,9 @@ class EvictionManager:
             features = head_features.permute(1, 0, 2).reshape(indices.numel(), H * self.leverage_head_mean_dim)
         else:
             features = mat_k.transpose(0, 1).reshape(indices.numel(), H * D)
-            if self.leverage_feature == "key_value":
+            if self.leverage_feature in KV_LEVERAGE_FEATURES:
                 if candidate_v is None:
-                    raise ValueError("leverage_feature=key_value requires value cache tensor")
+                    raise ValueError(f"leverage_feature={self.leverage_feature!r} requires value cache tensor")
                 mat_v = candidate_v[batch_idx].index_select(1, indices).to(dtype=torch.float32)
                 mat_v = torch.nan_to_num(mat_v, nan=0.0, posinf=0.0, neginf=0.0)
                 value_features = mat_v.transpose(0, 1).reshape(indices.numel(), H * D)
@@ -2630,6 +2651,10 @@ class EvictionManager:
             return x
         return F.normalize(x, p=2, dim=-1, eps=1e-12)
 
+    @staticmethod
+    def _normalizes_before_projection(method: str) -> bool:
+        return method in ("exact_qr", "full_d_ridge")
+
     def _needs_layer_covariance_pr(self) -> bool:
         return self.layer_budget_strategy in COVARIANCE_LAYER_BUDGET_STRATEGIES
 
@@ -2931,6 +2956,7 @@ class EvictionManager:
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
             projection_start = time.perf_counter() if do_profile else 0.0
             projected = mat @ omega
+            projected = self._maybe_normalize_rows(projected)
             self._store_projected_similarity_features(projected, granularity)
             if do_profile:
                 self._sync_for_timing(projected)
@@ -3003,6 +3029,7 @@ class EvictionManager:
                     profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
                 projection_start = time.perf_counter() if do_profile else 0.0
                 leverage_matrix = mat @ omega
+                leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
                 self._store_projected_similarity_features(leverage_matrix, granularity)
                 if do_profile:
                     self._sync_for_timing(leverage_matrix)
@@ -3017,7 +3044,7 @@ class EvictionManager:
                     self._sync_for_timing(q)
                     profile["qr"] = time.perf_counter() - qr_start
             except RuntimeError:
-                scores = torch.nan_to_num(mat.square().sum(dim=-1), nan=0.0, posinf=0.0, neginf=0.0)
+                scores = torch.nan_to_num(leverage_matrix.square().sum(dim=-1), nan=0.0, posinf=0.0, neginf=0.0)
                 profile["fallback"] = 1.0
                 self._profile_finish(profile, total_start, scores, do_profile=do_profile)
                 if return_basis:
@@ -3078,7 +3105,9 @@ class EvictionManager:
         prep_start = time.perf_counter() if do_profile else 0.0
         with torch.cuda.amp.autocast(enabled=False):
             mat = torch.nan_to_num(x.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
-            mat = self._maybe_normalize_rows(mat)
+            method = self._resolve_leverage_approx_method(active_sketch_dim)
+            if self._normalizes_before_projection(method):
+                mat = self._maybe_normalize_rows(mat)
         if do_profile:
             self._sync_for_timing(mat)
             profile["candidate_matrix_preparation"] = time.perf_counter() - prep_start
@@ -3119,7 +3148,9 @@ class EvictionManager:
         prep_start = time.perf_counter() if do_profile else 0.0
         with torch.cuda.amp.autocast(enabled=False):
             mat = torch.nan_to_num(candidate_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
-            mat = self._maybe_normalize_rows(mat)
+            method = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
+            if self._normalizes_before_projection(method):
+                mat = self._maybe_normalize_rows(mat)
         if do_profile:
             self._sync_for_timing(mat)
             profile["candidate_matrix_preparation"] = time.perf_counter() - prep_start
@@ -3156,18 +3187,22 @@ class EvictionManager:
             raise ValueError(f"head_dim must be > 0 for layer-wise SVD leverage, got {D}")
         if self.leverage_projection == "head_mean":
             return self._layer_svd_leverage_scores_head_mean(candidate_k, return_basis=return_basis)
+        uses_value_feature = self.leverage_feature in KV_LEVERAGE_FEATURES
         feature_dim = H * D * (2 if self.leverage_feature == "key_value" else 1)
         self._last_layer_feature_shape = (int(N), int(feature_dim))
-        if self.leverage_feature == "key_value":
+        if uses_value_feature:
             if candidate_v is None:
-                raise ValueError("leverage_feature='key_value' requires value cache tensor")
+                raise ValueError(f"leverage_feature={self.leverage_feature!r} requires value cache tensor")
             if candidate_v.shape != candidate_k.shape:
                 raise ValueError(
-                    "candidate_v must match candidate_k for key_value leverage, "
+                    "candidate_v must match candidate_k for key/value leverage, "
                     f"got {tuple(candidate_v.shape)} vs {tuple(candidate_k.shape)}"
                 )
 
-        if self._resolve_leverage_approx_method(self.leverage_sketch_dim) in ("right_sketch", "right_sketch_ridge"):
+        if (
+            self.leverage_feature == "key_value_lowdim_concat"
+            or self._resolve_leverage_approx_method(self.leverage_sketch_dim) in ("right_sketch", "right_sketch_ridge")
+        ):
             return self._layer_svd_leverage_scores_sketched(
                 candidate_k,
                 candidate_v,
@@ -3191,7 +3226,7 @@ class EvictionManager:
         for batch_idx in range(B):
             feature_start = time.perf_counter() if self.debug else 0.0
             x_key = candidate_k[batch_idx].transpose(0, 1).reshape(N, H * D)
-            if self.leverage_feature == "key_value":
+            if self.leverage_feature in KV_LEVERAGE_FEATURES:
                 assert candidate_v is not None
                 x_value = candidate_v[batch_idx].transpose(0, 1).reshape(N, H * D)
                 x_layer = torch.cat([x_key, x_value], dim=-1)
@@ -3263,13 +3298,14 @@ class EvictionManager:
             head_chunks = torch.tensor_split(mat_k, self.leverage_head_mean_dim, dim=-1)
             head_features = torch.stack([chunk.mean(dim=-1) for chunk in head_chunks], dim=-1)
             leverage_matrix = head_features.permute(0, 2, 1, 3).reshape(B, N, feature_dim).contiguous()
-            leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
+            method = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
+            if self._normalizes_before_projection(method):
+                leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
             if do_profile:
                 self._sync_for_timing(leverage_matrix)
                 profile["feature"] = time.perf_counter() - feature_start
                 profile["sketch"] = 0.0
 
-            method = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
             if method == "full_d_ridge":
                 return self._ridge_leverage_scores_from_matrix(
                     leverage_matrix,
@@ -3336,9 +3372,10 @@ class EvictionManager:
     ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
         """Layer-wise sketched leverage without materializing ``[B, N, H * D]``."""
         B, H, N, D = candidate_k.shape
-        method = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
-        if method == "right_sketch_ridge":
-            sketch_dim = self._resolve_ridge_sketch_dim(feature_dim, N)
+        lowdim_concat = self.leverage_feature == "key_value_lowdim_concat"
+        method = self.leverage_approx_method if lowdim_concat else self._resolve_leverage_approx_method(self.leverage_sketch_dim)
+        if method == "right_sketch_ridge" or lowdim_concat:
+            sketch_dim = self._resolve_ridge_sketch_dim(H * D if lowdim_concat else feature_dim, N)
         else:
             sketch_dim = min(int(self.leverage_sketch_dim), int(feature_dim), int(N))
         if sketch_dim <= 0:
@@ -3362,7 +3399,7 @@ class EvictionManager:
             mat_k = torch.nan_to_num(candidate_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
             mat_v = (
                 torch.nan_to_num(candidate_v.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
-                if self.leverage_feature == "key_value" and candidate_v is not None
+                if self.leverage_feature in KV_LEVERAGE_FEATURES and candidate_v is not None
                 else None
             )
             if do_profile:
@@ -3374,26 +3411,42 @@ class EvictionManager:
             # the full [B, N, H * D] matrix first.
             sketch_retrieval_start = time.perf_counter() if do_profile else 0.0
             omega = self._get_leverage_right_sketch(
-                feature_dim,
+                H * D if lowdim_concat else feature_dim,
                 sketch_dim,
                 device=mat_k.device,
                 seed=self.leverage_random_seed,
             )
+            omega_value = None
+            if lowdim_concat:
+                omega_value = self._get_leverage_right_sketch(
+                    H * D,
+                    sketch_dim,
+                    device=mat_k.device,
+                    seed=self.leverage_random_seed + 1,
+                )
             if do_profile:
-                self._sync_for_timing(omega)
+                sync_tensor = omega_value if omega_value is not None else omega
+                self._sync_for_timing(sync_tensor)
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
             projection_start = time.perf_counter() if do_profile else 0.0
             omega_key = omega[: H * D].view(H, D, sketch_dim)
-            head_leverage_matrix = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
-            if mat_v is not None:
-                omega_value = omega[H * D :].view(H, D, sketch_dim)
-                head_leverage_matrix = head_leverage_matrix + torch.einsum("bhnd,hds->bhns", mat_v, omega_value)
-            if self.leverage_normalize_rows:
-                row_norm_sq = mat_k.square().sum(dim=(1, 3))
+            head_key_matrix = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
+            if lowdim_concat:
+                if mat_v is None or omega_value is None:
+                    raise ValueError("leverage_feature='key_value_lowdim_concat' requires value cache tensor")
+                omega_value_view = omega_value.view(H, D, sketch_dim)
+                head_value_matrix = torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
+                head_leverage_matrix = torch.cat([head_key_matrix, head_value_matrix], dim=-1)
+                leverage_matrix = torch.cat([head_key_matrix.sum(dim=1), head_value_matrix.sum(dim=1)], dim=-1)
+                self._last_layer_feature_shape = (int(N), int(leverage_matrix.shape[-1]))
+            else:
+                head_leverage_matrix = head_key_matrix
                 if mat_v is not None:
-                    row_norm_sq = row_norm_sq + mat_v.square().sum(dim=(1, 3))
-                head_leverage_matrix = head_leverage_matrix / row_norm_sq.sqrt().clamp_min(1e-12).unsqueeze(1).unsqueeze(-1)
-            leverage_matrix = head_leverage_matrix.sum(dim=1)
+                    omega_value_view = omega[H * D :].view(H, D, sketch_dim)
+                    head_leverage_matrix = head_leverage_matrix + torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
+                leverage_matrix = head_leverage_matrix.sum(dim=1)
+            leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
+            head_leverage_matrix = self._maybe_normalize_rows(head_leverage_matrix)
             self._store_projected_similarity_features(leverage_matrix, "layer")
             self._store_projected_similarity_features(head_leverage_matrix, "head")
             if do_profile:
@@ -3403,7 +3456,7 @@ class EvictionManager:
                 profile["sketch"] = profile["sketch_matrix_retrieval"] + profile["projection_matmul"]
 
             if method == "right_sketch_ridge":
-                profile["D"] = float(feature_dim)
+                profile["D"] = float(leverage_matrix.shape[-1])
                 profile["sketch_dim"] = float(sketch_dim)
                 return self._ridge_leverage_scores_from_matrix(
                     leverage_matrix,

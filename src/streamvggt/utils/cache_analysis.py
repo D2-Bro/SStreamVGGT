@@ -818,7 +818,7 @@ def dump_eviction_nn_analysis(
                         if not config.should_dump(layer_id, None, step_idx):
                             continue
                         kept_local, evicted_local = _shared_local_indices(kept_candidate_indices, all_candidates, candidate_count, batch_id, device)
-                        if leverage_feature == "key_value" and v_before is not None:
+                        if leverage_feature in ("key_value", "key_value_lowdim_concat") and v_before is not None:
                             features = torch.cat(
                                 [
                                     k_before[batch_id].float().permute(1, 0, 2).reshape(N, H * D),
@@ -826,10 +826,10 @@ def dump_eviction_nn_analysis(
                                 ],
                                 dim=-1,
                             )
-                            analysis_feature = "key_value"
+                            analysis_feature = leverage_feature
                         else:
                             features = k_before[batch_id].float().permute(1, 0, 2).reshape(N, H * D)
-                            analysis_feature = "key_fallback" if leverage_feature == "key_value" else "key"
+                            analysis_feature = "key_fallback" if leverage_feature in ("key_value", "key_value_lowdim_concat") else "key"
                         _dump_one_eviction_nn_event(
                             config,
                             features=features,
@@ -860,10 +860,10 @@ def dump_eviction_nn_analysis(
                             evicted_local = _evicted_from_kept(kept_local, all_candidates, candidate_count)
                             features = k_before[batch_id, head_id].float()
                             analysis_feature = "key"
-                            if leverage_feature == "key_value" and v_before is not None:
+                            if leverage_feature in ("key_value", "key_value_lowdim_concat") and v_before is not None:
                                 features = torch.cat([features, v_before[batch_id, head_id].float()], dim=-1)
-                                analysis_feature = "key_value"
-                            elif leverage_feature == "key_value":
+                                analysis_feature = leverage_feature
+                            elif leverage_feature in ("key_value", "key_value_lowdim_concat"):
                                 analysis_feature = "key_fallback"
                             _dump_one_eviction_nn_event(
                                 config,
