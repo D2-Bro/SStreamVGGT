@@ -1,0 +1,94 @@
+{
+  "sequences": [
+    {
+      "name": "kitti/2011_09_26_drive_0002_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0002_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_26_drive_0005_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0005_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_26_drive_0013_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0013_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_26_drive_0020_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0020_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_26_drive_0023_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0023_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_26_drive_0036_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0036_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_26_drive_0079_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0079_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_26_drive_0095_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0095_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_26_drive_0113_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_26_drive_0113_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_28_drive_0037_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_28_drive_0037_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_29_drive_0026_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_29_drive_0026_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_09_30_drive_0016_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_09_30_drive_0016_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "kitti/2011_10_03_drive_0047_sync_02",
+      "image_dir": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_500/2011_10_03_drive_0047_sync_02",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "bonn/balloon2",
+      "image_dir": "/home/dongjae/data/bonn/rgbd_bonn_dataset/rgbd_bonn_balloon2/rgb_500",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "bonn/crowd2",
+      "image_dir": "/home/dongjae/data/bonn/rgbd_bonn_dataset/rgbd_bonn_crowd2/rgb_500",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "bonn/crowd3",
+      "image_dir": "/home/dongjae/data/bonn/rgbd_bonn_dataset/rgbd_bonn_crowd3/rgb_500",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "bonn/person_tracking2",
+      "image_dir": "/home/dongjae/data/bonn/rgbd_bonn_dataset/rgbd_bonn_person_tracking2/rgb_500",
+      "image_glob": "*.png"
+    },
+    {
+      "name": "bonn/synchronous",
+      "image_dir": "/home/dongjae/data/bonn/rgbd_bonn_dataset/rgbd_bonn_synchronous/rgb_500",
+      "image_glob": "*.png"
+    }
+  ]
+}

@@ -96,6 +96,40 @@ python run_inference.py \
     --input_dir path/to/your/images_dir \
     --frame_cache_dir path/to/your/results_perframe_dir \
     --no_cache_results
+
+# AVGGT-style global-to-frame conversion: keep global attention from global_idx >= 9
+python run_inference.py \
+    --input_dir path/to/your/images_dir \
+    --global-attn-idx-ranges 9:
+
+# Keep only a middle global-attention window
+python run_inference.py \
+    --input_dir path/to/your/images_dir \
+    --global-attn-idx-ranges 9:20
+
+# Keep multiple global-attention windows
+python run_inference.py \
+    --input_dir path/to/your/images_dir \
+    --global-attn-idx-ranges 6:10,14:20
+```
+
+`--global-attn-idx-ranges` uses zero-based indices over original global-attention blocks only, not raw transformer block indices. Ranges are half-open: `9:` means `global_idx >= 9`, `9:20` means `9 <= global_idx < 20`, `:9` means `global_idx < 9`, and `12` keeps only `global_idx == 12`. `--middle-global-only` is a shortcut for `--global-attn-idx-ranges 9:`. In this mode, the total KV cache budget is redistributed across enabled global indices only; disabled global indices do not read/write cache and receive zero budget.
+
+```bash
+# Multi-view reconstruction evaluation
+accelerate launch --num_processes 1 --main_process_port 29602 ./eval/mv_recon/launch.py \
+    --weights path/to/checkpoints.pth \
+    --output_dir path/to/output_dir \
+    --model_name StreamVGGT \
+    --max_frames 300
+
+# AVGGT-style evaluation
+accelerate launch --num_processes 1 --main_process_port 29602 ./eval/mv_recon/launch.py \
+    --weights path/to/checkpoints.pth \
+    --output_dir path/to/output_dir \
+    --model_name StreamVGGT \
+    --max_frames 300 \
+    --global-attn-idx-ranges 9:
 ```
 
 ## 🚀 Run Demo

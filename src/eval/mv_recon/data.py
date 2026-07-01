@@ -9,7 +9,7 @@ from eval.mv_recon.base import BaseStereoViewDataset
 from dust3r.utils.image import imread_cv2
 import eval.mv_recon.dataset_utils.cropping as cropping
 import imageio.v3 as iio
-from tifffile import tifffile
+# from tifffile import tifffile
 from einops import rearrange
 
 
@@ -545,6 +545,171 @@ class DTU(BaseStereoViewDataset):
         return views
 
 
+class Replica(BaseStereoViewDataset):
+    def __init__(
+        self,
+        num_seq=1,
+        num_frames=5,
+        min_thresh=10,
+        max_thresh=100,
+        test_id=None,
+        full_video=False,
+        tuple_list=None,
+        seq_id=None,
+        rebuttal=False,
+        shuffle_seed=-1,
+        kf_every=1,
+        max_frames=None,
+        *args,
+        ROOT,
+        **kwargs,
+    ):
+        self.ROOT = ROOT
+        super().__init__(*args, **kwargs)
+        self.num_seq = num_seq
+        self.num_frames = num_frames
+        self.max_thresh = max_thresh
+        self.min_thresh = min_thresh
+        self.test_id = test_id
+        self.full_video = full_video
+        self.kf_every = kf_every
+        self.seq_id = seq_id
+        self.rebuttal = rebuttal
+        self.shuffle_seed = shuffle_seed
+        self.max_frames = max_frames
+        self.load_all_tuples(tuple_list)
+        self.load_all_scenes(ROOT)
+        self.intrinsics_, self.depth_scale = self.load_camera_params(ROOT)
+
+    def __len__(self):
+        if self.tuple_list is not None:
+            return len(self.tuple_list)
+        return len(self.scene_list) * self.num_seq
+
+    def load_all_tuples(self, tuple_list):
+        self.tuple_list = tuple_list
+
+    def load_all_scenes(self, base_dir):
+        scenes = sorted(
+            d
+            for d in os.listdir(base_dir)
+            if osp.isdir(osp.join(base_dir, d))
+            and osp.exists(osp.join(base_dir, d, "traj.txt"))
+        )
+        if self.test_id is not None:
+            scenes = [scene for scene in scenes if scene == self.test_id]
+        if self.seq_id is not None:
+            scenes = [scene for scene in scenes if scene == self.seq_id]
+        self.scene_list = scenes
+        print(f"Found {len(self.scene_list)} Replica sequences in split {self.split}")
+
+    @staticmethod
+    def load_camera_params(root):
+        params_path = osp.join(root, "cam_params.json")
+        camera = {}
+        if osp.exists(params_path):
+            with open(params_path, "r", encoding="utf-8") as f:
+                camera = json.load(f).get("camera", {})
+        fx = float(camera.get("fx", 600.0))
+        fy = float(camera.get("fy", 600.0))
+        cx = float(camera.get("cx", 599.5))
+        cy = float(camera.get("cy", 339.5))
+        scale = float(camera.get("scale", 6553.5))
+        intrinsics = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)
+        return intrinsics, scale
+
+    @staticmethod
+    def load_poses(path):
+        pose_data = np.loadtxt(path).astype(np.float32)
+        if pose_data.ndim == 1:
+            pose_data = pose_data[None, :]
+        if pose_data.shape[1] == 16:
+            return pose_data.reshape(-1, 4, 4)
+        if pose_data.shape[1] == 12:
+            poses = np.tile(np.eye(4, dtype=np.float32), (pose_data.shape[0], 1, 1))
+            poses[:, :3, :] = pose_data.reshape(-1, 3, 4)
+            return poses
+        raise ValueError(f"Unsupported Replica trajectory shape {pose_data.shape} in {path}")
+
+    def _get_views(self, idx, resolution, rng):
+        if self.tuple_list is not None:
+            line = self.tuple_list[idx].split(" ")
+            scene_id = line[0]
+            img_idxs = line[1:]
+        else:
+            scene_id = self.scene_list[idx // self.num_seq]
+            seq_id = idx % self.num_seq
+            results_dir = osp.join(self.ROOT, scene_id, "results")
+            img_idxs = [
+                osp.splitext(name)[0].replace("frame", "")
+                for name in sorted(os.listdir(results_dir))
+                if name.startswith("frame") and name.lower().endswith(".jpg")
+            ]
+            if self.full_video:
+                img_idxs = img_idxs[:: max(1, self.kf_every)]
+            else:
+                if self.shuffle_seed >= 0:
+                    local_rng = random.Random(self.shuffle_seed + seq_id)
+                    local_rng.shuffle(img_idxs)
+                img_idxs = img_idxs[: self.num_frames]
+            if self.max_frames is not None:
+                img_idxs = img_idxs[: self.max_frames]
+
+        posepath = osp.join(self.ROOT, scene_id, "traj.txt")
+        camera_poses = self.load_poses(posepath)
+
+        imgs_idxs = deque(img_idxs)
+        if self.shuffle_seed >= 0 and self.full_video:
+            imgs_idxs = shuffle_deque(imgs_idxs, seed=self.shuffle_seed)
+        views = []
+
+        while len(imgs_idxs) > 0:
+            im_idx = imgs_idxs.popleft()
+            impath = osp.join(self.ROOT, scene_id, "results", f"frame{im_idx}.jpg")
+            depthpath = osp.join(self.ROOT, scene_id, "results", f"depth{im_idx}.png")
+
+            rgb_image = imread_cv2(impath)
+            depthmap = imread_cv2(depthpath, cv2.IMREAD_UNCHANGED)
+            depthmap = np.nan_to_num(depthmap.astype(np.float32), 0.0) / self.depth_scale
+            depthmap[depthmap > 10] = 0
+            depthmap[depthmap < 1e-3] = 0
+            rgb_image = cv2.resize(rgb_image, (depthmap.shape[1], depthmap.shape[0]))
+
+            camera_pose = camera_poses[int(im_idx)]
+            intrinsics_ = self.intrinsics_.copy()
+            if resolution != (224, 224) or self.rebuttal:
+                rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
+                    rgb_image, depthmap, intrinsics_, resolution, rng=rng, info=impath
+                )
+            else:
+                rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
+                    rgb_image, depthmap, intrinsics_, (512, 384), rng=rng, info=impath
+                )
+                W, H = rgb_image.size
+                cx = W // 2
+                cy = H // 2
+                l, t = cx - 112, cy - 112
+                r, b = cx + 112, cy + 112
+                crop_bbox = (l, t, r, b)
+                rgb_image, depthmap, intrinsics = cropping.crop_image_depthmap(
+                    rgb_image, depthmap, intrinsics, crop_bbox
+                )
+
+            views.append(
+                dict(
+                    img=rgb_image,
+                    depthmap=depthmap,
+                    camera_pose=camera_pose,
+                    camera_intrinsics=intrinsics,
+                    dataset="replica",
+                    label=osp.join(scene_id, im_idx),
+                    instance=impath,
+                )
+            )
+
+        return views
+
+
 class NRGBD(BaseStereoViewDataset):
     def __init__(
         self,
@@ -559,6 +724,7 @@ class NRGBD(BaseStereoViewDataset):
         rebuttal=False,
         shuffle_seed=-1,
         kf_every=1,
+        max_frames=None,
         *args,
         ROOT,
         **kwargs,
@@ -576,6 +742,7 @@ class NRGBD(BaseStereoViewDataset):
         self.seq_id = seq_id
         self.rebuttal = rebuttal
         self.shuffle_seed = shuffle_seed
+        self.max_frames = max_frames
 
         # load all scenes
         self.load_all_tuples(tuple_list)
@@ -643,6 +810,7 @@ class NRGBD(BaseStereoViewDataset):
             num_files = len(os.listdir(os.path.join(self.ROOT, scene_id, "images")))
             img_idxs = [f"{i}" for i in range(num_files)]
             img_idxs = img_idxs[:: min(self.kf_every, len(img_idxs) // 2)]
+            img_idxs = img_idxs[: self.max_frames]
 
         fx, fy, cx, cy = 554.2562584220408, 554.2562584220408, 320, 240
         intrinsics_ = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float32)

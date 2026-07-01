@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Callable, List, Any, Tuple, Dict, Union, Optional
+from typing import Callable, List, Any, Tuple, Dict, Union, Optional, Set
 import warnings
 
 import torch
@@ -78,13 +78,74 @@ class Block(nn.Module):
         cache_budget=None,
         cache_analysis_config=None,
         pre_eviction_snapshot_config=None,
+        eviction_nn_analysis_config=None,
+        leverage_score_histogram_config=None,
+        token_overlay_dump_config=None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
         eviction_policy: str = "mean",
+        eviction_policy_layers: Optional[Set[int]] = None,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
+        leverage_granularity: str = "head",
+        leverage_feature: str = "key",
+        leverage_projection: str = "random",
+        leverage_head_mean_dim: int = 1,
+        leverage_normalize_rows: bool = False,
+        leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
+        leverage_ridge_lambda_mode: str = "relative",
+        leverage_ridge_score_chunk_size: int = 4096,
+        leverage_ridge_jitter: float = 1e-6,
+        leverage_ridge_dim: Optional[int] = None,
+        leverage_diag: bool = False,
+        leverage_diag_interval: int = 0,
+        leverage_random_seed: int = 0,
+        leverage_eviction_selector: str = "topk",
+        leverage_similarity_granularity: str = "layer",
+        leverage_similarity_feature_projection: str = "raw",
+        leverage_similarity_leverage_gamma: float = 1.0,
+        leverage_eviction_risk_mode: str = "low_leverage",
+        leverage_high_outlier_z: float = 3.0,
+        leverage_dpp_candidate_multiplier: int = 2,
+        leverage_dpp_greedy_block_size: int = 32,
+        leverage_dpp_quality_beta: float = 1.0,
+        leverage_dpp_diversity_beta: float = 1.0,
+        leverage_dpp_feature_projection: str = "raw",
+        leverage_dpp_recency_bonus: bool = False,
+        leverage_dpp_recency_lambda: float = 0.2,
+        leverage_dpp_recency_window: int = 5,
+        leverage_dpp_recency_gate_power: float = 1.0,
+        leverage_dpp_recency_debug: bool = False,
+        leverage_conf_gate: bool = False,
+        leverage_conf_gate_floor: float = 0.2,
+        leverage_conf_gate_depth_alpha: float = 1.0,
+        leverage_conf_gate_point_beta: float = 1.0,
+        leverage_conf_gate_init: str = "mean",
+        layer_budget_strategy: str = "uniform",
+        layer_budget_value_gamma: float = 0.5,
+        layer_budget_value_norm_type: str = "rms",
+        layer_budget_norm_source: str = "value",
+        layer_budget_eps: float = 1e-12,
+        slots_per_direction: float = 4.0,
+        hybrid_beta: float = 0.5,
+        eviction_protect_recent_frames: int = 0,
+        eviction_protect_special_tokens: bool = False,
+        eviction_protect_special_token_interval: int = 1,
+        special_token_count: int = 0,
+        anchor_token_count: Optional[int] = None,
+        window_token_count: int = 0,
         recent_merge_config=None,
+        svd_eviction_merge_config=None,
+        voxel_covis_frame_ids=None,
+        voxel_covis_enabled: bool = False,
+        voxel_covis_fallback_recent: int = 0,
+        cache_write_current_frame: bool = True,
+        cache_evict_current_frame: bool = True,
+        global_cache_history_anchor_special_tokens_only: bool = False,
+        history_anchor_frame_ids=None,
+        history_anchor_patch_topk_per_frame: int = 0,
+        history_anchor_max_frames: int = 0,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             
         def attn_residual_func(
@@ -96,7 +157,7 @@ class Block(nn.Module):
             cache_budget=None,
         ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             if use_cache:
-                output, new_kv, scores = self.attn(
+                attn_result = self.attn(
                     self.norm1(x),
                     pos=pos,
                     past_key_values=past_key_values,
@@ -104,14 +165,79 @@ class Block(nn.Module):
                     cache_budget=cache_budget,
                     cache_analysis_config=cache_analysis_config,
                     pre_eviction_snapshot_config=pre_eviction_snapshot_config,
+                    eviction_nn_analysis_config=eviction_nn_analysis_config,
+                    leverage_score_histogram_config=leverage_score_histogram_config,
+                    token_overlay_dump_config=token_overlay_dump_config,
                     layer_id=layer_id,
                     step_idx=step_idx,
                     tokens_per_frame=tokens_per_frame,
                     eviction_policy=eviction_policy,
+                    eviction_policy_layers=eviction_policy_layers,
                     eviction_debug=eviction_debug,
                     leverage_sketch_dim=leverage_sketch_dim,
+                    leverage_granularity=leverage_granularity,
+                    leverage_feature=leverage_feature,
+                    leverage_projection=leverage_projection,
+                    leverage_head_mean_dim=leverage_head_mean_dim,
+                    leverage_normalize_rows=leverage_normalize_rows,
+                    leverage_approx_method=leverage_approx_method,                    leverage_ridge_lambda=leverage_ridge_lambda,
+                    leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
+                    leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
+                    leverage_ridge_jitter=leverage_ridge_jitter,
+                    leverage_ridge_dim=leverage_ridge_dim,
+                    leverage_diag=leverage_diag,
+                    leverage_diag_interval=leverage_diag_interval,
+                    leverage_random_seed=leverage_random_seed,
+                    leverage_eviction_selector=leverage_eviction_selector,
+                    leverage_similarity_granularity=leverage_similarity_granularity,
+                leverage_similarity_feature_projection=leverage_similarity_feature_projection,
+                leverage_similarity_leverage_gamma=leverage_similarity_leverage_gamma,
+                leverage_eviction_risk_mode=leverage_eviction_risk_mode,
+                    leverage_high_outlier_z=leverage_high_outlier_z,
+                    leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
+                    leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
+                    leverage_dpp_quality_beta=leverage_dpp_quality_beta,
+                    leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
+                    leverage_dpp_feature_projection=leverage_dpp_feature_projection,
+                    leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
+                    leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
+                    leverage_dpp_recency_window=leverage_dpp_recency_window,
+                    leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
+                    leverage_dpp_recency_debug=leverage_dpp_recency_debug,
+                    leverage_conf_gate=leverage_conf_gate,
+                    leverage_conf_gate_floor=leverage_conf_gate_floor,
+                    leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
+                    leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
+                    leverage_conf_gate_init=leverage_conf_gate_init,
+                    layer_budget_strategy=layer_budget_strategy,
+                    layer_budget_value_gamma=layer_budget_value_gamma,
+                    layer_budget_value_norm_type=layer_budget_value_norm_type,
+                    layer_budget_norm_source=layer_budget_norm_source,
+                    layer_budget_eps=layer_budget_eps,
+                    slots_per_direction=slots_per_direction,
+                    hybrid_beta=hybrid_beta,
+                    eviction_protect_recent_frames=eviction_protect_recent_frames,
+                    eviction_protect_special_tokens=eviction_protect_special_tokens,
+                    eviction_protect_special_token_interval=eviction_protect_special_token_interval,
+                    special_token_count=special_token_count,
+                    anchor_token_count=anchor_token_count,
+                    window_token_count=window_token_count,
                     recent_merge_config=recent_merge_config,
+                    svd_eviction_merge_config=svd_eviction_merge_config,
+                    voxel_covis_frame_ids=voxel_covis_frame_ids,
+                    voxel_covis_enabled=voxel_covis_enabled,
+                    voxel_covis_fallback_recent=voxel_covis_fallback_recent,
+                    cache_write_current_frame=cache_write_current_frame,
+                    cache_evict_current_frame=cache_evict_current_frame,
+                    global_cache_history_anchor_special_tokens_only=global_cache_history_anchor_special_tokens_only,
+                    history_anchor_frame_ids=history_anchor_frame_ids,
+                    history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
+                    history_anchor_max_frames=history_anchor_max_frames,
                 )
+                if len(attn_result) == 4:
+                    output, new_kv, scores, special_kv_sidecar = attn_result
+                    return self.ls1(output), new_kv, scores, special_kv_sidecar
+                output, new_kv, scores = attn_result
                 return self.ls1(output), new_kv, scores
             else:
                 if attn_mask is not None:
@@ -122,7 +248,13 @@ class Block(nn.Module):
             return self.ls2(self.mlp(self.norm2(x)))
         
         if use_cache:
-            attn_output, new_kv, scores = attn_residual_func(x, pos=pos, past_key_values=past_key_values, use_cache=True, cache_budget=cache_budget)
+            cache_result = attn_residual_func(x, pos=pos, past_key_values=past_key_values, use_cache=True, cache_budget=cache_budget)
+            if len(cache_result) == 4:
+                attn_output, new_kv, scores, special_kv_sidecar = cache_result
+                x = x + attn_output
+                x = x + ffn_residual_func(x)
+                return x, new_kv, scores, special_kv_sidecar
+            attn_output, new_kv, scores = cache_result
             x = x + attn_output
             x = x + ffn_residual_func(x)
             return x, new_kv, scores

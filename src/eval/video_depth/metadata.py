@@ -2,6 +2,26 @@ import os
 import glob
 from tqdm import tqdm
 
+
+def _replica_root():
+    return os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica")
+
+
+def _replica_sequences(root=None):
+    root = root or _replica_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        seq
+        for seq in os.listdir(root)
+        if os.path.isdir(os.path.join(root, seq))
+        and os.path.exists(os.path.join(root, seq, "traj.txt"))
+    )
+
+
+def _replica_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "frame*.jpg")))
+
 # Define the merged dataset metadata dictionary
 dataset_metadata = {
     "davis": {
@@ -17,7 +37,7 @@ dataset_metadata = {
         "process_func": None,  # Not used in mono depth estimation
     },
     "kitti": {
-        "img_path": "../data/eval/kitti/depth_selection/val_selection_cropped/image_gathered",  # Default path
+        "img_path": "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered",  # Default path
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
         "gt_traj_func": lambda img_path, anno_path, seq: None,
@@ -63,6 +83,21 @@ dataset_metadata = {
         "skip_condition": None,  # lambda save_dir, seq: os.path.exists(os.path.join(save_dir, seq)),
         "process_func": lambda args, img_path: process_scannet(args, img_path),
     },
+
+    "replica": {
+        "img_path": _replica_root(),
+        "anno_path": _replica_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "results"),
+        "filelist_func": _replica_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq, "traj.txt"),
+        "traj_format": "replica",
+        "seq_list": _replica_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": lambda args, img_path: process_replica(args, img_path),
+    },
     "tum": {
         "img_path": "../data/eval/tum",
         "mask_path": None,
@@ -78,7 +113,7 @@ dataset_metadata = {
         "process_func": None,
     },
     "sintel": {
-        "img_path": "/home/ma-user/work/datasets/sintel/training/final",
+        "img_path": "/home/dongjae/data/datasets/sintel/training/final",
         "anno_path": "../data/eval/sintel/training/camdata_left",
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
@@ -110,7 +145,7 @@ dataset_metadata = {
 kitti_numbers = [50, 100, 110, 150, 200, 250, 300, 350, 400, 450, 500]
 kitti_configs = {
     f"kitti_s1_{num}": {
-        "img_path": f"data/long_kitti_s1/depth_selection/val_selection_cropped/image_gathered_{num}",  # Default path
+        "img_path": f"/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered_{num}",  # Default path
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
         "gt_traj_func": lambda img_path, anno_path, seq: None,
@@ -129,7 +164,7 @@ dataset_metadata.update(kitti_configs)
 bonn_numbers = [50, 100, 110, 150, 200, 250, 300, 350, 400, 450, 500]
 bonn_configs = {
     f"bonn_{num}": {
-        "img_path": "/home/ma-user/work/dataset/3D_Reconstruction/bonn",
+        "img_path": "/home/dongjae/data/bonn/rgbd_bonn_dataset",
         "mask_path": None,
         "dir_path_func": lambda img_path, seq, num=num: os.path.join(
             img_path, f"rgbd_bonn_{seq}", f"rgb_{num}"
@@ -157,6 +192,11 @@ def process_kitti(args, img_path):
 
 
 def process_bonn(args, img_path):
+    bonn_number = (
+        args.eval_dataset.split("_")[-1]
+        if "_" in getattr(args, "eval_dataset", "")
+        else "110"
+    )
     if args.full_seq:
         for dir in tqdm(sorted(glob.glob(f"{img_path}/*/"))):
             filelist = sorted(glob.glob(f"{dir}/rgb/*.png"))
@@ -169,7 +209,9 @@ def process_bonn(args, img_path):
             else args.seq_list
         )
         for seq in tqdm(seq_list):
-            filelist = sorted(glob.glob(f"{img_path}/rgbd_bonn_{seq}/rgb_110/*.png"))
+            filelist = sorted(
+                glob.glob(f"{img_path}/rgbd_bonn_{seq}/rgb_{bonn_number}/*.png")
+            )
             save_dir = f"{args.output_dir}/{seq}"
             yield filelist, save_dir
 
@@ -185,6 +227,14 @@ def process_scannet(args, img_path):
     for seq in tqdm(seq_list):
         filelist = sorted(glob.glob(f"{seq}/color_90/*.jpg"))
         save_dir = f"{args.output_dir}/{os.path.basename(seq)}"
+        yield filelist, save_dir
+
+
+def process_replica(args, img_path):
+    seq_list = args.seq_list if args.seq_list is not None else _replica_sequences(img_path)
+    for seq in tqdm(seq_list):
+        filelist = _replica_image_files(os.path.join(img_path, seq, "results"))
+        save_dir = f"{args.output_dir}/{seq}"
         yield filelist, save_dir
 
 

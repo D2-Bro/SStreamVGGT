@@ -2,8 +2,136 @@ import os
 import glob
 from tqdm import tqdm
 
+
+def _seven_scenes_root():
+    return os.environ.get("SSTREAMVGGT_7SCENES_ROOT", "/home/dongjae/data/7scenes_sfm")
+
+
+def _seven_scenes_seq_from_split_line(line):
+    num_part = "".join(filter(str.isdigit, line))
+    return f"seq-{num_part.zfill(2)}"
+
+
+def _seven_scenes_test_sequences(root=None):
+    root = root or _seven_scenes_root()
+    if not os.path.isdir(root):
+        return []
+
+    seq_list = []
+    for scene in sorted(os.listdir(root)):
+        scene_dir = os.path.join(root, scene)
+        split_file = os.path.join(scene_dir, "TestSplit.txt")
+        if not os.path.isdir(scene_dir) or not os.path.exists(split_file):
+            continue
+        with open(split_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    seq_list.append(f"{scene}/{_seven_scenes_seq_from_split_line(line)}")
+    return seq_list
+
+
+def _seven_scenes_color_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "frame-*.color.png")))
+
+
+def _kitti_odometry_root():
+    return os.environ.get("SSTREAMVGGT_KITTI_ODOMETRY_ROOT", "/home/dongjae/data/kitti/dataset")
+
+
+def _kitti_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "*.png")))
+
+
+def _vbr_root():
+    return os.environ.get("SSTREAMVGGT_VBR_ROOT", "/home/dongjae/data/vbr")
+
+
+def _vbr_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "*.png")))
+
+
+def _replica_root():
+    return os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica")
+
+
+def _replica_sequences(root=None):
+    root = root or _replica_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        seq
+        for seq in os.listdir(root)
+        if os.path.isdir(os.path.join(root, seq))
+        and os.path.exists(os.path.join(root, seq, "traj.txt"))
+    )
+
+
+def _replica_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "frame*.jpg")))
+
+
+def _nrgbd_root():
+    return os.environ.get("SSTREAMVGGT_NRGBD_ROOT", "/home/dongjae/data/neural_rgbd_data")
+
+
+def _nrgbd_sequences(root=None):
+    root = root or _nrgbd_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        seq
+        for seq in os.listdir(root)
+        if os.path.isdir(os.path.join(root, seq, "images"))
+        and os.path.exists(os.path.join(root, seq, "poses.txt"))
+    )
+
+
+def _nrgbd_image_sort_key(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.startswith("img"):
+        suffix = stem[3:]
+        if suffix.isdigit():
+            return (0, int(suffix))
+    return (1, stem)
+
+
+def _nrgbd_image_files(dir_path):
+    return sorted(
+        glob.glob(os.path.join(dir_path, "img*.png")),
+        key=_nrgbd_image_sort_key,
+    )
+
+
+KITTI_ODOMETRY_GT_SEQS = [f"{i:02d}" for i in range(11)]
+KITTI_ODOMETRY_TEST_SEQS = [f"{i:02d}" for i in range(11, 22)]
+VBR_SEQS = [
+    "campus_train1",
+    "diag_train0",
+    "colosseo_train0",
+    "pincio_train0",
+    "ciampino_train1",
+    "spagna_train0",
+    "campus_train0",
+]
+
+
 # Define the merged dataset metadata dictionary
 dataset_metadata = {
+    "7scenes": {
+        "img_path": _seven_scenes_root(),
+        "anno_path": _seven_scenes_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
+        "filelist_func": _seven_scenes_color_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq),
+        "traj_format": "7scenes",
+        "seq_list": _seven_scenes_test_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
     "davis": {
         "img_path": "data/davis/DAVIS/JPEGImages/480p",
         "mask_path": "data/davis/DAVIS/masked_images/480p",
@@ -27,6 +155,80 @@ dataset_metadata = {
         "mask_path_seq_func": lambda mask_path, seq: None,
         "skip_condition": None,
         "process_func": lambda args, img_path: process_kitti(args, img_path),
+    },
+    "kitti_trajectory": {
+        "img_path": os.path.join(_kitti_odometry_root(), "sequences"),
+        "anno_path": os.path.join(_kitti_odometry_root(), "poses"),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "image_2"),
+        "filelist_func": _kitti_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, f"{seq}.txt"),
+        "traj_format": "kitti",
+        "seq_list": KITTI_ODOMETRY_GT_SEQS,
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "kitti_trajectory_test": {
+        "img_path": os.path.join(_kitti_odometry_root(), "sequences"),
+        "anno_path": None,
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "image_2"),
+        "filelist_func": _kitti_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: None,
+        "traj_format": None,
+        "seq_list": KITTI_ODOMETRY_TEST_SEQS,
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "vbr": {
+        "img_path": _vbr_root(),
+        "anno_path": os.path.join(_vbr_root(), "processed_gt"),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(
+            img_path, f"{seq}_processed_aligned", "rgb"
+        ),
+        "filelist_func": _vbr_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
+            anno_path, f"{seq}_gt.txt"
+        ),
+        "traj_format": "tum",
+        "seq_list": VBR_SEQS,
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "replica": {
+        "img_path": _replica_root(),
+        "anno_path": _replica_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "results"),
+        "filelist_func": _replica_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq, "traj.txt"),
+        "traj_format": "replica",
+        "seq_list": _replica_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "NRGBD": {
+        "img_path": _nrgbd_root(),
+        "anno_path": _nrgbd_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "images"),
+        "filelist_func": _nrgbd_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq, "poses.txt"),
+        "traj_format": "nrgbd",
+        "seq_list": _nrgbd_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
     },
     "bonn": {
         "img_path": "data/bonn/rgbd_bonn_dataset",

@@ -4,3 +4,4 @@ Idx: fire/seq-03, Acc: 0.010109375464846311, Comp: 0.0107626978282865, NC1: 0.57
 Idx: fire/seq-04, Acc: 0.015900078478746804, Comp: 0.009937181841869999, NC1: 0.5839958684081978, NC2: 0.5578635782844785 - Acc_med: 0.0057367821139697505, Compc_med: 0.0034594894543205847, NC1c_med: 0.6273448458950759, NC2c_med: 0.5878551470900257
 Timing before eval - Idx: chess/seq-03, Time: 154.984441, FPS: 1.936
 Timing before eval - Idx: chess/seq-03, Time: 74.006546, FPS: 4.054
+Timing before eval - Idx: chess/seq-03, Time: 93.219527, FPS: 3.218

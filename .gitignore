@@ -2,3 +2,8 @@
 cache_*/
 .vscode/
 pre_*/
+ckpt/
+eval_results/
+headwise_subspace_experiment/
+normalized_svd_cause_analysis/
+demo_tmp/
