@@ -19,7 +19,7 @@ if SRC_ROOT not in sys.path:
     sys.path.insert(0, SRC_ROOT)
 
 from streamvggt.layers.attention import Attention
-from streamvggt.layers.confidence_state import KVConfidenceState, make_token_confidence_gate, sample_token_confidence
+from streamvggt.layers.confidence_state import KVConfidenceState, make_token_confidence_gate, parse_confidence_gate_init, sample_token_confidence
 from streamvggt.layers.eviction import EvictionManager
 from streamvggt.layers.recent_merge import KVCacheMetadata
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
@@ -312,8 +312,33 @@ def check_confidence_state_sidecar() -> None:
         step_idx=1,
         leverage_conf_gate=True,
     )
-    if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.ones((1, 4))):
-        raise AssertionError(f"new frame temporary gate should initialize to one: {kv1[3].confidence_gate}")
+    if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.full((1, 4), 0.5)):
+        raise AssertionError(f"default new frame temporary gate should use cached mean: {kv1[3].confidence_gate}")
+    for init_value, expected_value in (("1", 1.0), ("1.0", 1.0), ("0.5", 0.5)):
+        _, kv_const, _ = attention2(
+            x1,
+            past_key_values=kv0,
+            use_cache=True,
+            cache_budget=8,
+            anchor_token_count=1,
+            eviction_policy="svd_leverage",
+            layer_id=0,
+            step_idx=1,
+            leverage_conf_gate=True,
+            leverage_conf_gate_init=init_value,
+        )
+        expected = torch.full((1, 4), expected_value)
+        if not torch.allclose(kv_const[3].confidence_gate[:, -4:], expected):
+            raise AssertionError(
+                f"new frame temporary gate init {init_value!r} mismatch: {kv_const[3].confidence_gate}"
+            )
+    for invalid_init in ("bad", "nan", "inf", "-0.1"):
+        try:
+            parse_confidence_gate_init(invalid_init)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid confidence gate init was accepted: {invalid_init}")
     kv1[3].update_frame_gate(1, torch.tensor([[0.9, 0.8, 0.7, 0.6]]))
     if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.tensor([[0.9, 0.8, 0.7, 0.6]])):
         raise AssertionError("post-head update did not replace temporary current-frame gate")

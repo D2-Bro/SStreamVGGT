@@ -14,6 +14,7 @@ from eval.pose_evaluation.utils import *
 
 from accelerate import PartialState
 from streamvggt.models.streamvggt import StreamVGGT
+from streamvggt.layers.confidence_state import parse_confidence_gate_init
 from streamvggt.layers.recent_merge import RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig
@@ -169,6 +170,10 @@ def validate_streamvggt_args(args):
             "Error: --leverage_conf_gate_k must be > 0, "
             f"got {args.leverage_conf_gate_k}."
         )
+    try:
+        parse_confidence_gate_init(args.leverage_conf_gate_init)
+    except ValueError as exc:
+        raise SystemExit(f"Error: --leverage_conf_gate_init {exc}.") from exc
     if args.layer_budget_alpha < 0:
         raise SystemExit(
             "Error: --layer_budget_alpha must be >= 0, "
@@ -258,6 +263,7 @@ def validate_streamvggt_args(args):
             f"conf_gate_depth_alpha={args.leverage_conf_gate_depth_alpha}, "
             f"conf_gate_point_beta={args.leverage_conf_gate_point_beta}, "
             f"conf_gate_k={args.leverage_conf_gate_k}, "
+            f"conf_gate_init={args.leverage_conf_gate_init}, "
             f"conf_gate_special_mode={args.leverage_conf_gate_special_mode}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
@@ -577,6 +583,7 @@ def get_args_parser():
     parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to normalized depth_conf / (depth_conf + k) in the confidence gate")
     parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + k) in the confidence gate")
     parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive k for confidence normalization c / (c + k)")
+    parser.add_argument("--leverage_conf_gate_init", "--leverage-conf-gate-init", type=str, default="mean", help="Initial current-frame confidence gate before head confidence update: mean or finite non-negative float")
     parser.add_argument(
         "--leverage_conf_gate_special_mode",
         "--leverage-conf-gate-special-mode",
@@ -1108,6 +1115,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
                             leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
                             leverage_conf_gate_k=args.leverage_conf_gate_k,
+                            leverage_conf_gate_init=args.leverage_conf_gate_init,
                             leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
                             layer_budget_strategy=args.layer_budget_strategy,
                             layer_budget_value_gamma=args.layer_budget_value_gamma,

@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+
+def parse_confidence_gate_init(value: str | float | int) -> str | float:
+    if isinstance(value, str) and value == "mean":
+        return "mean"
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("leverage_conf_gate_init must be 'mean' or a finite non-negative float") from exc
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise ValueError("leverage_conf_gate_init must be 'mean' or a finite non-negative float")
+    return parsed
 
 
 @dataclass

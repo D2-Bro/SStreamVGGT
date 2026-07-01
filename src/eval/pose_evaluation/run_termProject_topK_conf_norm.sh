@@ -7,7 +7,7 @@ ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
 max_frames='full_seq'
-eval_dataset='replica'
+eval_dataset='7scenes'
 eviction_policy='svd_leverage'
 # Switch to leverage_entropy to test the entropy effective-count allocator.
 layer_budget_strategy='leverage_pr' #[leverage_pr, uniform, leverage_entropy, value_weighted_leverage_pr]
@@ -18,7 +18,7 @@ layer_budget_value_gamma=0.7
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
 total_budget=200000
-leverage_eviction_selector=fast_dpp # [topk, fast_dpp, layer_head_fast_dpp, similarity_topk]
+leverage_eviction_selector=topk # [topk, fast_dpp, layer_head_fast_dpp, similarity_topk]
 leverage_similarity_granularity=layer # [layer, head]
 leverage_similarity_feature_projection=raw # [raw, random]
 leverage_similarity_leverage_gamma=0.5
@@ -58,7 +58,7 @@ leverage_conf_gate_point_beta=0.0
 leverage_conf_gate_k=1.0
 leverage_conf_gate_special_mode=mean
 
-output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_confDepth"
+output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_confDepth_norm"
 echo "$output_dir"
 
 accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evaluation/launch.py \
@@ -108,6 +108,7 @@ accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evalua
     --leverage_conf_gate_point_beta "$leverage_conf_gate_point_beta" \
     --leverage_conf_gate_k "$leverage_conf_gate_k" \
     --leverage_conf_gate_special_mode "$leverage_conf_gate_special_mode" \
+    --leverage_normalize_rows \
     "${first_frame_special_args[@]}"
 
 # Add --profile_eviction to the launch command above when measuring eviction latency.

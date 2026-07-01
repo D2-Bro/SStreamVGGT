@@ -21,7 +21,7 @@ from streamvggt.utils.cache_analysis import (
     dump_token_overlay_event,
 )
 from streamvggt.layers.eviction import EvictionManager
-from streamvggt.layers.confidence_state import KVConfidenceState, pack_kv_cache, unpack_kv_cache
+from streamvggt.layers.confidence_state import KVConfidenceState, pack_kv_cache, parse_confidence_gate_init, unpack_kv_cache
 from streamvggt.layers.recent_merge import KVCacheMetadata, RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig, SvdEvictionMerger
 
@@ -613,6 +613,7 @@ class Attention(nn.Module):
         leverage_conf_gate_floor: float = 0.2,
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
+        leverage_conf_gate_init: str = "mean",
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -680,13 +681,26 @@ class Attention(nn.Module):
                     num_tokens=current_k.shape[2],
                     frame_id=step_idx if step_idx is not None else 0,
                 )
+            initial_confidence_gate = None
             if confidence_needed:
+                parsed_conf_gate_init = parse_confidence_gate_init(leverage_conf_gate_init)
+                if parsed_conf_gate_init == "mean":
+                    if past_key_values is not None:
+                        _, _, _, past_confidence_for_init = unpack_kv_cache(past_key_values)
+                        if past_confidence_for_init is not None:
+                            initial_confidence_gate = past_confidence_for_init.mean_gate().to(
+                                device=current_k.device,
+                                dtype=torch.float32,
+                            )
+                else:
+                    initial_confidence_gate = parsed_conf_gate_init
                 confidence_state = KVConfidenceState.for_current_frame(
                     batch_size=B,
                     num_heads=self.num_heads,
                     num_tokens=current_k.shape[2],
                     frame_id=step_idx if step_idx is not None else 0,
                     device=current_k.device,
+                    initial_gate=initial_confidence_gate,
                 )
 
             write_k = current_k

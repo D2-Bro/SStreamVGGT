@@ -19,6 +19,7 @@ from tqdm import tqdm
 import uuid
 import json
 from collections import defaultdict
+from streamvggt.layers.confidence_state import parse_confidence_gate_init
 from streamvggt.layers.recent_merge import RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.voxel_covis import VoxelCovisConfig
@@ -344,6 +345,7 @@ def get_args_parser():
     parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to normalized depth_conf / (depth_conf + k) in the confidence gate")
     parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + k) in the confidence gate")
     parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive k for confidence normalization c / (c + k)")
+    parser.add_argument("--leverage_conf_gate_init", "--leverage-conf-gate-init", type=str, default="mean", help="Initial current-frame confidence gate before head confidence update: mean or finite non-negative float")
     parser.add_argument(
         "--leverage_conf_gate_special_mode",
         "--leverage-conf-gate-special-mode",
@@ -683,6 +685,13 @@ def get_args_parser():
         help="Voxel size for downsampling only the point clouds used by ICP; <=0 disables downsampling",
     )
     parser.add_argument(
+        "--eval_frame_stride",
+        "--eval-frame-stride",
+        type=int,
+        default=1,
+        help="Use every Nth frame only when building eval point clouds; inference still uses all frames",
+    )
+    parser.add_argument(
         "--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)"
     )
     return parser
@@ -794,6 +803,11 @@ def main(args):
             "Error: --icp_voxel_size must be >= 0, "
             f"got {args.icp_voxel_size}."
         )
+    if args.eval_frame_stride < 1:
+        raise SystemExit(
+            "Error: --eval_frame_stride must be >= 1, "
+            f"got {args.eval_frame_stride}."
+        )
     if args.leverage_dpp_recency_window < 1:
         raise SystemExit(
             "Error: --leverage_dpp_recency_window must be >= 1, "
@@ -824,6 +838,10 @@ def main(args):
             "Error: --leverage_conf_gate_k must be > 0, "
             f"got {args.leverage_conf_gate_k}."
         )
+    try:
+        parse_confidence_gate_init(args.leverage_conf_gate_init)
+    except ValueError as exc:
+        raise SystemExit(f"Error: --leverage_conf_gate_init {exc}.") from exc
     if args.layer_budget_alpha < 0:
         raise SystemExit(
             "Error: --layer_budget_alpha must be >= 0, "
@@ -917,6 +935,7 @@ def main(args):
             f"conf_gate_depth_alpha={args.leverage_conf_gate_depth_alpha}, "
             f"conf_gate_point_beta={args.leverage_conf_gate_point_beta}, "
             f"conf_gate_k={args.leverage_conf_gate_k}, "
+            f"conf_gate_init={args.leverage_conf_gate_init}, "
             f"conf_gate_special_mode={args.leverage_conf_gate_special_mode}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
@@ -1324,6 +1343,7 @@ def main(args):
                                     leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
                                     leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
                                     leverage_conf_gate_k=args.leverage_conf_gate_k,
+                                    leverage_conf_gate_init=args.leverage_conf_gate_init,
                                     leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
                                     layer_budget_strategy=args.layer_budget_strategy,
                                     layer_budget_value_gamma=args.layer_budget_value_gamma,
@@ -1413,8 +1433,13 @@ def main(args):
                         images_all = []
                         masks_all = []
                         conf_all = []
+                        eval_frame_count = 0
 
                         for j, view in enumerate(batch):
+                            if j % args.eval_frame_stride != 0:
+                                continue
+                            eval_frame_count += 1
+
                             if in_camera1 is None:
                                 in_camera1 = view["camera_pose"][0].cpu()
 
@@ -1452,12 +1477,19 @@ def main(args):
                             masks_all.append(mask[None, ...])
                             conf_all.append(conf[None, ...])
 
+                    scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
+                    if args.eval_frame_stride > 1:
+                        eval_stride_msg = (
+                            f"Eval frame stride: stride={args.eval_frame_stride}, "
+                            f"using {eval_frame_count}/{len(batch)} frames for {scene_id}"
+                        )
+                        print(eval_stride_msg)
+                        print(eval_stride_msg, file=open(log_file, "a"))
+
                     images_all = np.concatenate(images_all, axis=0)
                     pts_all = np.concatenate(pts_all, axis=0)
                     pts_gt_all = np.concatenate(pts_gt_all, axis=0)
                     masks_all = np.concatenate(masks_all, axis=0)
-
-                    scene_id = view["label"][0].rsplit("/", 1)[0]
 
                     save_params = {}
 
