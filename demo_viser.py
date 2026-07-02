@@ -259,6 +259,10 @@ def validate_args(args):
         )
     if args.layer_budget_eps <= 0:
         raise ValueError(f"--layer_budget_eps must be > 0, got {args.layer_budget_eps}")
+    if not (0.0 <= args.layer_budget_depth_mu <= 1.0):
+        raise ValueError(f"--layer_budget_depth_mu must be in [0, 1], got {args.layer_budget_depth_mu}")
+    if args.layer_budget_depth_sigma <= 0:
+        raise ValueError(f"--layer_budget_depth_sigma must be > 0, got {args.layer_budget_depth_sigma}")
     if args.slots_per_direction <= 0:
         raise ValueError(f"--slots_per_direction must be > 0, got {args.slots_per_direction}")
     if not (0.0 <= args.hybrid_beta <= 1.0):
@@ -440,6 +444,8 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             layer_budget_alpha=args.layer_budget_alpha,
             layer_budget_min_tokens=args.layer_budget_min_tokens,
             layer_budget_eps=args.layer_budget_eps,
+            layer_budget_depth_mu=args.layer_budget_depth_mu,
+            layer_budget_depth_sigma=args.layer_budget_depth_sigma,
             slots_per_direction=args.slots_per_direction,
             hybrid_beta=args.hybrid_beta,
             eviction_nn_analysis_config=eviction_nn_analysis_config,
@@ -623,11 +629,13 @@ def main():
         "--layer-budget-strategy",
         type=str,
         default="leverage_pr",
-        choices=("uniform", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
+        choices=("uniform", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "depth_weighted_leverage_pr", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
     )
     parser.add_argument("--layer_budget_alpha", "--layer-budget-alpha", type=float, default=1.0)
     parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
+    parser.add_argument("--layer_budget_depth_mu", "--layer-budget-depth-mu", type=float, default=0.5, help="Center of Gaussian depth prior for depth_weighted_leverage_pr")
+    parser.add_argument("--layer_budget_depth_sigma", "--layer-budget-depth-sigma", type=float, default=0.2, help="Width of Gaussian depth prior for depth_weighted_leverage_pr")
     parser.add_argument("--slots_per_direction", "--slots-per-direction", type=float, default=4.0)
     parser.add_argument("--hybrid_beta", "--hybrid-beta", type=float, default=0.5)
     parser.add_argument("--eviction_protect_recent_frames", "--eviction-protect-recent-frames", type=int, default=0)

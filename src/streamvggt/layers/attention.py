@@ -13,6 +13,7 @@ from streamvggt.utils.cache_analysis import (
     CacheAnalysisConfig,
     EvictionNNAnalysisConfig,
     LeverageScoreHistogramConfig,
+    ProjectedNormHistogramConfig,
     PreEvictionSnapshotConfig,
     TokenOverlayDumpConfig,
     dump_eviction_nn_analysis,
@@ -75,6 +76,7 @@ class Attention(nn.Module):
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        projected_norm_histogram_config: Optional[ProjectedNormHistogramConfig] = None,
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
@@ -431,6 +433,7 @@ class Attention(nn.Module):
                 and eviction_policy == "svd_leverage")
                 or (eviction_nn_analysis_config is not None and eviction_nn_analysis_config.wants_svd_coord())
             ),
+            capture_projected_norms=projected_norm_histogram_config is not None,
         )
         if profile_eviction and k.is_cuda and torch.cuda.is_available():
             torch.cuda.synchronize(k.device)
@@ -447,6 +450,19 @@ class Attention(nn.Module):
         ):
             leverage_score_histogram_config.record(
                 eviction_result.policy_scores,
+                layer_id=layer_id,
+                step_idx=step_idx,
+            )
+
+        if (
+            projected_norm_histogram_config is not None
+            and layer_id is not None
+            and step_idx is not None
+            and eviction_policy == "svd_leverage"
+            and eviction._last_projected_pre_norms is not None
+        ):
+            projected_norm_histogram_config.record(
+                eviction._last_projected_pre_norms,
                 layer_id=layer_id,
                 step_idx=step_idx,
             )
@@ -572,6 +588,7 @@ class Attention(nn.Module):
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        projected_norm_histogram_config: Optional[ProjectedNormHistogramConfig] = None,
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
@@ -818,6 +835,7 @@ class Attention(nn.Module):
                     "cache_analysis_config": cache_analysis_config,
                     "eviction_nn_analysis_config": eviction_nn_analysis_config,
                     "leverage_score_histogram_config": leverage_score_histogram_config,
+                    "projected_norm_histogram_config": projected_norm_histogram_config,
                     "token_overlay_dump_config": token_overlay_dump_config,
                     "layer_id": layer_id,
                     "step_idx": step_idx,

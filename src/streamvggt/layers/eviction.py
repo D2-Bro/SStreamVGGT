@@ -19,6 +19,7 @@ VALID_LAYER_BUDGET_STRATEGIES = (
     "hybrid_cap",
     "hybrid_geom",
     "leverage_entropy",
+    "depth_weighted_leverage_pr",
     "value_weighted_leverage_pr",
     "value_weighted_covariance_pr",
     "value_weighted_hybrid_cap",
@@ -32,6 +33,7 @@ LAYER_BUDGET_SCORE_STRATEGIES = (
     "hybrid_cap",
     "hybrid_geom",
     "leverage_entropy",
+    "depth_weighted_leverage_pr",
     "value_weighted_leverage_pr",
     "value_weighted_covariance_pr",
     "value_weighted_hybrid_cap",
@@ -44,6 +46,11 @@ VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES = (
     "value_weighted_covariance_pr",
     "value_weighted_hybrid_cap",
     "value_weighted_hybrid_geom",
+)
+
+
+DEPTH_WEIGHTED_LAYER_BUDGET_STRATEGIES = (
+    "depth_weighted_leverage_pr",
 )
 
 
@@ -97,7 +104,7 @@ def _combine_layer_budget_pr_base(
     hybrid_beta: float,
     eps: float,
 ) -> torch.Tensor:
-    if strategy in ("leverage_pr", "value_weighted_leverage_pr"):
+    if strategy in ("leverage_pr", "depth_weighted_leverage_pr", "value_weighted_leverage_pr"):
         return leverage_pr
     if covariance_pr is None:
         raise ValueError(f"{strategy} requires covariance participation ratio from layer features")
@@ -720,6 +727,7 @@ class EvictionManager:
         candidate_conf_gate: Optional[torch.Tensor] = None,
         candidate_evictable_mask: Optional[torch.Tensor] = None,
         need_leverage_basis: bool = False,
+        capture_projected_norms: bool = False,
         history_anchor_frame_ids=None,
         history_anchor_patch_topk_per_frame: int = 0,
         history_anchor_max_frames: int = 0,
@@ -763,6 +771,8 @@ class EvictionManager:
         self._last_dpp_recency_debug = {}
         self._last_similarity_layer_features = None
         self._last_similarity_head_features = None
+        self._last_projected_pre_norms = None
+        self._capture_projected_norms = bool(capture_projected_norms)
         need_mean_scores = self.policy in ("mean", "baseline_mean") or need_summary or self.debug
         mean_scores = self._mean_scores(candidate_k) if need_mean_scores else None
 
@@ -1934,6 +1944,10 @@ class EvictionManager:
             f"{granularity}-wise leverage features from right_sketch or right_sketch_ridge"
         )
 
+    def _capture_projected_pre_normalization_norms(self, projected: torch.Tensor) -> None:
+        if getattr(self, "_capture_projected_norms", False):
+            self._last_projected_pre_norms = torch.linalg.vector_norm(projected.detach(), ord=2, dim=-1)
+
     def _store_projected_similarity_features(self, projected: torch.Tensor, granularity: str) -> None:
         if self.leverage_similarity_feature_projection != "random":
             return
@@ -2956,6 +2970,7 @@ class EvictionManager:
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
             projection_start = time.perf_counter() if do_profile else 0.0
             projected = mat @ omega
+            self._capture_projected_pre_normalization_norms(projected)
             projected = self._maybe_normalize_rows(projected)
             self._store_projected_similarity_features(projected, granularity)
             if do_profile:
@@ -3029,6 +3044,7 @@ class EvictionManager:
                     profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
                 projection_start = time.perf_counter() if do_profile else 0.0
                 leverage_matrix = mat @ omega
+                self._capture_projected_pre_normalization_norms(leverage_matrix)
                 leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
                 self._store_projected_similarity_features(leverage_matrix, granularity)
                 if do_profile:
@@ -3445,6 +3461,7 @@ class EvictionManager:
                     omega_value_view = omega[H * D :].view(H, D, sketch_dim)
                     head_leverage_matrix = head_leverage_matrix + torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
                 leverage_matrix = head_leverage_matrix.sum(dim=1)
+            self._capture_projected_pre_normalization_norms(leverage_matrix)
             leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
             head_leverage_matrix = self._maybe_normalize_rows(head_leverage_matrix)
             self._store_projected_similarity_features(leverage_matrix, "layer")

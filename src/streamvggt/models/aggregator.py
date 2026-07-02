@@ -17,6 +17,7 @@ from streamvggt.layers.confidence_state import pack_kv_cache, unpack_kv_cache
 from streamvggt.layers.recent_merge import KVCacheMetadata, RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
 from streamvggt.layers.eviction import (
+    DEPTH_WEIGHTED_LAYER_BUDGET_STRATEGIES,
     LAYER_BUDGET_SCORE_STRATEGIES,
     VALID_LAYER_BUDGET_STRATEGIES,
     VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES,
@@ -29,6 +30,7 @@ from streamvggt.utils.cache_analysis import (
     CacheAnalysisConfig,
     EvictionNNAnalysisConfig,
     LeverageScoreHistogramConfig,
+    ProjectedNormHistogramConfig,
     PreEvictionSnapshotConfig,
     TokenOverlayDumpConfig,
 )
@@ -239,6 +241,7 @@ class Aggregator(nn.Module):
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        projected_norm_histogram_config: Optional[ProjectedNormHistogramConfig] = None,
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
@@ -285,6 +288,8 @@ class Aggregator(nn.Module):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
+        layer_budget_depth_mu: float = 0.5,
+        layer_budget_depth_sigma: float = 0.2,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         layer_budget_log_path: Optional[str] = None,
@@ -332,6 +337,10 @@ class Aggregator(nn.Module):
                 "leverage-based layer_budget_strategy requires "
                 "eviction_policy='svd_leverage' and leverage_granularity='layer'"
             )
+        if not (0.0 <= float(layer_budget_depth_mu) <= 1.0):
+            raise ValueError(f"layer_budget_depth_mu must be in [0, 1], got {layer_budget_depth_mu}")
+        if float(layer_budget_depth_sigma) <= 0.0:
+            raise ValueError(f"layer_budget_depth_sigma must be > 0, got {layer_budget_depth_sigma}")
         parsed_global_attn_idx_ranges = self._normalize_global_attn_idx_ranges(global_attn_idx_ranges)
         range_mode_enabled = parsed_global_attn_idx_ranges is not None
 
@@ -411,6 +420,8 @@ class Aggregator(nn.Module):
             layer_budget_alpha=layer_budget_alpha,
             layer_budget_min_tokens=layer_budget_min_tokens,
             layer_budget_eps=layer_budget_eps,
+            layer_budget_depth_mu=layer_budget_depth_mu,
+            layer_budget_depth_sigma=layer_budget_depth_sigma,
             slots_per_direction=slots_per_direction,
             hybrid_beta=hybrid_beta,
             layer_budget_log_path=layer_budget_log_path,
@@ -481,6 +492,7 @@ class Aggregator(nn.Module):
                             pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                             eviction_nn_analysis_config=eviction_nn_analysis_config,
                             leverage_score_histogram_config=leverage_score_histogram_config,
+                            projected_norm_histogram_config=projected_norm_histogram_config,
                             token_overlay_dump_config=token_overlay_dump_config,
                             eviction_policy=eviction_policy,
                             eviction_policy_layers=eviction_policy_layers,
@@ -558,6 +570,7 @@ class Aggregator(nn.Module):
                             pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                             eviction_nn_analysis_config=eviction_nn_analysis_config,
                             leverage_score_histogram_config=leverage_score_histogram_config,
+                            projected_norm_histogram_config=projected_norm_histogram_config,
                             token_overlay_dump_config=token_overlay_dump_config,
                             eviction_policy=eviction_policy,
                             eviction_policy_layers=eviction_policy_layers,
@@ -795,6 +808,7 @@ class Aggregator(nn.Module):
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        projected_norm_histogram_config: Optional[ProjectedNormHistogramConfig] = None,
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
@@ -841,6 +855,8 @@ class Aggregator(nn.Module):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
+        layer_budget_depth_mu: float = 0.5,
+        layer_budget_depth_sigma: float = 0.2,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         eviction_protect_recent_frames: int = 0,
@@ -892,6 +908,7 @@ class Aggregator(nn.Module):
                         pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                         eviction_nn_analysis_config=eviction_nn_analysis_config,
                         leverage_score_histogram_config=leverage_score_histogram_config,
+                        projected_norm_histogram_config=projected_norm_histogram_config,
                         token_overlay_dump_config=token_overlay_dump_config,
                         eviction_policy=eviction_policy,
                         eviction_policy_layers=eviction_policy_layers,
@@ -1056,6 +1073,7 @@ class Aggregator(nn.Module):
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        projected_norm_histogram_config: Optional[ProjectedNormHistogramConfig] = None,
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
@@ -1102,6 +1120,8 @@ class Aggregator(nn.Module):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
+        layer_budget_depth_mu: float = 0.5,
+        layer_budget_depth_sigma: float = 0.2,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         eviction_protect_recent_frames: int = 0,
@@ -1160,6 +1180,7 @@ class Aggregator(nn.Module):
                     pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                     eviction_nn_analysis_config=eviction_nn_analysis_config,
                     leverage_score_histogram_config=leverage_score_histogram_config,
+                    projected_norm_histogram_config=projected_norm_histogram_config,
                     token_overlay_dump_config=token_overlay_dump_config,
                     layer_id=global_idx,
                     step_idx=past_frame_idx,
@@ -1591,6 +1612,31 @@ class Aggregator(nn.Module):
             active_mask=active,
         )
 
+    @staticmethod
+    def _combine_depth_weighted_layer_scores(
+        base_scores,
+        mu: float,
+        sigma: float,
+        capacities: Optional[Dict[int, int]] = None,
+    ):
+        base = torch.nan_to_num(torch.as_tensor(base_scores).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        base = torch.clamp(base, min=0.0)
+        depth = int(base.numel())
+        if depth <= 0:
+            return base
+        denom = float(max(depth - 1, 1))
+        positions = torch.arange(depth, device=base.device, dtype=base.dtype) / denom
+        sigma_value = max(float(sigma), 1e-12)
+        prior = torch.exp(-((positions - float(mu)) ** 2) / (2.0 * sigma_value * sigma_value))
+        if capacities is not None:
+            active = torch.zeros_like(base, dtype=torch.bool)
+            for layer, capacity in capacities.items():
+                layer = int(layer)
+                if 0 <= layer < active.numel() and int(capacity) > 0:
+                    active[layer] = True
+            prior = torch.where(active, prior, torch.ones_like(prior))
+        return base * prior
+
     def _layer_budget_capacities(self, past_key_values, current_token_count, enabled_global_idx_ranges=None):
         capacities = {}
         current_token_count = max(int(current_token_count or 0), 0)
@@ -1652,6 +1698,8 @@ class Aggregator(nn.Module):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
+        layer_budget_depth_mu: float = 0.5,
+        layer_budget_depth_sigma: float = 0.2,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         layer_budget_log_path: Optional[str] = None,
@@ -1703,6 +1751,15 @@ class Aggregator(nn.Module):
                 active_layer_scores = self.layer_budget_proportions
                 allocation_alpha = 1.0
                 allocation_min_tokens = 0
+            elif layer_budget_strategy in DEPTH_WEIGHTED_LAYER_BUDGET_STRATEGIES:
+                active_layer_scores = self._combine_depth_weighted_layer_scores(
+                    self.last_layer_budget_scores,
+                    layer_budget_depth_mu,
+                    layer_budget_depth_sigma,
+                    capacities=capacities,
+                )
+                allocation_alpha = layer_budget_alpha
+                allocation_min_tokens = layer_budget_min_tokens
             elif layer_budget_strategy in VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES:
                 active_layer_scores = self._combine_value_weighted_layer_scores(
                     self.last_layer_budget_base_scores,

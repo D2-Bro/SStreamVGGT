@@ -189,6 +189,16 @@ def validate_streamvggt_args(args):
             "Error: --layer_budget_eps must be > 0, "
             f"got {args.layer_budget_eps}."
         )
+    if not (0.0 <= args.layer_budget_depth_mu <= 1.0):
+        raise SystemExit(
+            "Error: --layer_budget_depth_mu must be in [0, 1], "
+            f"got {args.layer_budget_depth_mu}."
+        )
+    if args.layer_budget_depth_sigma <= 0:
+        raise SystemExit(
+            "Error: --layer_budget_depth_sigma must be > 0, "
+            f"got {args.layer_budget_depth_sigma}."
+        )
     if args.layer_budget_value_gamma < 0:
         raise SystemExit(
             "Error: --layer_budget_value_gamma must be >= 0, "
@@ -268,6 +278,8 @@ def validate_streamvggt_args(args):
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
+            f"layer_budget_depth_mu={args.layer_budget_depth_mu}, "
+            f"layer_budget_depth_sigma={args.layer_budget_depth_sigma}, "
             f"layer_budget_value_gamma={args.layer_budget_value_gamma}, "
             f"layer_budget_value_norm_type={args.layer_budget_value_norm_type}, "
             f"layer_budget_norm_source={args.layer_budget_norm_source}, "
@@ -597,7 +609,7 @@ def get_args_parser():
         "--layer-budget-strategy",
         type=str,
         default="uniform",
-        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
+        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "depth_weighted_leverage_pr", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
         help="Layer-wise KV budget allocation strategy",
     )
     parser.add_argument(
@@ -610,6 +622,8 @@ def get_args_parser():
     parser.add_argument("--layer_budget_alpha", "--layer-budget-alpha", type=float, default=0.5)
     parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
+    parser.add_argument("--layer_budget_depth_mu", "--layer-budget-depth-mu", type=float, default=0.5, help="Center of Gaussian depth prior for depth_weighted_leverage_pr")
+    parser.add_argument("--layer_budget_depth_sigma", "--layer-budget-depth-sigma", type=float, default=0.2, help="Width of Gaussian depth prior for depth_weighted_leverage_pr")
     parser.add_argument("--layer_budget_value_gamma", "--layer-budget-value-gamma", type=float, default=0.5)
     parser.add_argument("--slots_per_direction", "--slots-per-direction", type=float, default=4.0)
     parser.add_argument("--hybrid_beta", "--hybrid-beta", type=float, default=0.5)
@@ -1124,6 +1138,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             layer_budget_alpha=args.layer_budget_alpha,
                             layer_budget_min_tokens=args.layer_budget_min_tokens,
                             layer_budget_eps=args.layer_budget_eps,
+                            layer_budget_depth_mu=args.layer_budget_depth_mu,
+                            layer_budget_depth_sigma=args.layer_budget_depth_sigma,
                         slots_per_direction=args.slots_per_direction,
                         hybrid_beta=args.hybrid_beta,
                             eviction_protect_recent_frames=args.eviction_protect_recent_frames,

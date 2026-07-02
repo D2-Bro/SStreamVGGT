@@ -26,9 +26,11 @@ from streamvggt.layers.voxel_covis import VoxelCovisConfig
 from streamvggt.utils.cache_analysis import (
     add_eviction_nn_analysis_args,
     add_leverage_score_histogram_args,
+    add_projected_norm_histogram_args,
     add_token_overlay_dump_args,
     eviction_nn_config_from_args,
     leverage_score_histogram_config_from_args,
+    projected_norm_histogram_config_from_args,
     token_overlay_dump_config_from_args,
 )
 
@@ -359,7 +361,7 @@ def get_args_parser():
         "--layer-budget-strategy",
         type=str,
         default="uniform",
-        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
+        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "depth_weighted_leverage_pr", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
         help="Layer-wise KV budget allocation strategy",
     )
     parser.add_argument(
@@ -372,6 +374,8 @@ def get_args_parser():
     parser.add_argument("--layer_budget_alpha", "--layer-budget-alpha", type=float, default=0.5)
     parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
+    parser.add_argument("--layer_budget_depth_mu", "--layer-budget-depth-mu", type=float, default=0.5, help="Center of Gaussian depth prior for depth_weighted_leverage_pr")
+    parser.add_argument("--layer_budget_depth_sigma", "--layer-budget-depth-sigma", type=float, default=0.2, help="Width of Gaussian depth prior for depth_weighted_leverage_pr")
     parser.add_argument("--layer_budget_value_gamma", "--layer-budget-value-gamma", type=float, default=0.5)
     parser.add_argument("--slots_per_direction", "--slots-per-direction", type=float, default=4.0)
     parser.add_argument("--hybrid_beta", "--hybrid-beta", type=float, default=0.5)
@@ -481,6 +485,7 @@ def get_args_parser():
     )
     add_eviction_nn_analysis_args(parser)
     add_leverage_score_histogram_args(parser)
+    add_projected_norm_histogram_args(parser)
     add_token_overlay_dump_args(parser)
     parser.add_argument(
         "--enable_svd_eviction_merge",
@@ -694,6 +699,13 @@ def get_args_parser():
     parser.add_argument(
         "--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)"
     )
+    parser.add_argument(
+        "--budget_frame_multiplier",
+        "--budget-frame-multiplier",
+        type=float,
+        default=None,
+        help="Set StreamVGGT total budget to ceil(multiplier * tokens_per_frame) * num_global_layers; overrides --budget",
+    )
     return parser
 
 
@@ -766,6 +778,16 @@ def main(args):
         raise SystemExit(
             "Error: --leverage_score_histogram_max must be greater than --leverage_score_histogram_min, "
             f"got min={args.leverage_score_histogram_min}, max={args.leverage_score_histogram_max}."
+        )
+    if args.projected_norm_histogram_bins < 1:
+        raise SystemExit(
+            "Error: --projected_norm_histogram_bins must be >= 1, "
+            f"got {args.projected_norm_histogram_bins}."
+        )
+    if args.projected_norm_histogram_max <= args.projected_norm_histogram_min:
+        raise SystemExit(
+            "Error: --projected_norm_histogram_max must be greater than --projected_norm_histogram_min, "
+            f"got min={args.projected_norm_histogram_min}, max={args.projected_norm_histogram_max}."
         )
 
     if args.leverage_dpp_candidate_multiplier < 1:
@@ -857,6 +879,16 @@ def main(args):
             "Error: --layer_budget_eps must be > 0, "
             f"got {args.layer_budget_eps}."
         )
+    if not (0.0 <= args.layer_budget_depth_mu <= 1.0):
+        raise SystemExit(
+            "Error: --layer_budget_depth_mu must be in [0, 1], "
+            f"got {args.layer_budget_depth_mu}."
+        )
+    if args.layer_budget_depth_sigma <= 0:
+        raise SystemExit(
+            "Error: --layer_budget_depth_sigma must be > 0, "
+            f"got {args.layer_budget_depth_sigma}."
+        )
     if args.layer_budget_value_gamma < 0:
         raise SystemExit(
             "Error: --layer_budget_value_gamma must be >= 0, "
@@ -908,6 +940,11 @@ def main(args):
         eviction_nn_config_from_args(args, output_dir=args.eviction_nn_analysis_dir)
     except ValueError as exc:
         raise SystemExit(f"Error: {exc}") from exc
+    if args.budget_frame_multiplier is not None and args.budget_frame_multiplier < 0.0:
+        raise SystemExit(
+            "Error: --budget_frame_multiplier must be >= 0 when provided, "
+            f"got {args.budget_frame_multiplier}."
+        )
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
         print(
@@ -940,6 +977,8 @@ def main(args):
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
+            f"layer_budget_depth_mu={args.layer_budget_depth_mu}, "
+            f"layer_budget_depth_sigma={args.layer_budget_depth_sigma}, "
             f"layer_budget_value_gamma={args.layer_budget_value_gamma}, "
             f"layer_budget_value_norm_type={args.layer_budget_value_norm_type}, "
             f"layer_budget_norm_source={args.layer_budget_norm_source}, "
@@ -1271,6 +1310,7 @@ def main(args):
                                         print(msg)
                                 eviction_nn_analysis_config = None
                                 leverage_score_histogram_config = None
+                                projected_norm_histogram_config = None
                                 token_overlay_dump_config = None
                                 if args.eviction_nn_analysis_dir:
                                     scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
@@ -1292,6 +1332,16 @@ def main(args):
                                         f"{int(data_idx):04d}_{safe_scene}",
                                     )
                                     leverage_score_histogram_config = leverage_score_histogram_config_from_args(args, output_dir=hist_dir)
+                                if args.projected_norm_histogram_dir:
+                                    scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
+                                    safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                                    norm_hist_dir = osp.join(
+                                        args.projected_norm_histogram_dir,
+                                        name_data,
+                                        f"rank_{accelerator.process_index}",
+                                        f"{int(data_idx):04d}_{safe_scene}",
+                                    )
+                                    projected_norm_histogram_config = projected_norm_histogram_config_from_args(args, output_dir=norm_hist_dir)
                                 if args.token_overlay_dump_dir:
                                     scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
                                     safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
@@ -1306,6 +1356,7 @@ def main(args):
                                 results = model.inference(
                                     batch,
                                     eviction_policy=args.eviction_policy,
+                                    budget_frame_multiplier=args.budget_frame_multiplier,
                                     eviction_policy_layers=eviction_policy_layers,
                                     leverage_sketch_dim=args.leverage_sketch_dim,
                                     leverage_granularity=args.leverage_granularity,
@@ -1352,6 +1403,8 @@ def main(args):
                                     layer_budget_alpha=args.layer_budget_alpha,
                                     layer_budget_min_tokens=args.layer_budget_min_tokens,
                                     layer_budget_eps=args.layer_budget_eps,
+                                    layer_budget_depth_mu=args.layer_budget_depth_mu,
+                                    layer_budget_depth_sigma=args.layer_budget_depth_sigma,
                                     slots_per_direction=args.slots_per_direction,
                                     hybrid_beta=args.hybrid_beta,
                                     eviction_protect_recent_frames=args.eviction_protect_recent_frames,
@@ -1368,6 +1421,7 @@ def main(args):
                                     eviction_debug=args.eviction_debug or args.profile_eviction,
                                     eviction_nn_analysis_config=eviction_nn_analysis_config,
                                     leverage_score_histogram_config=leverage_score_histogram_config,
+                                    projected_norm_histogram_config=projected_norm_histogram_config,
                                     token_overlay_dump_config=token_overlay_dump_config,
                                     recent_merge_config=recent_merge_config,
                                     svd_eviction_merge_config=svd_eviction_merge_config,
@@ -1385,6 +1439,8 @@ def main(args):
                                 )
                                 if leverage_score_histogram_config is not None:
                                     leverage_score_histogram_config.flush()
+                                if projected_norm_histogram_config is not None:
+                                    projected_norm_histogram_config.flush()
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize(device)
                                 infer_time = time.perf_counter() - infer_start

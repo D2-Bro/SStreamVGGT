@@ -52,13 +52,13 @@ leverage_dpp_recency_window=10
 leverage_dpp_recency_gate_power=0.0
 icp_voxel_size=0
 
-leverage_conf_gate_floor=0.0
+leverage_conf_gate_floor=0.2
 leverage_conf_gate_depth_alpha=1.0
-leverage_conf_gate_point_beta=0.0
+leverage_conf_gate_point_beta=1.0
 leverage_conf_gate_k=1.0
 leverage_conf_gate_special_mode=mean
 
-output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_confDepth_norm"
+output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_conf"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -111,6 +111,5 @@ taskset -c 0-63 accelerate launch --num_processes 3 --main_process_port 29402 ./
     --leverage_conf_gate_point_beta "$leverage_conf_gate_point_beta" \
     --leverage_conf_gate_k "$leverage_conf_gate_k" \
     --leverage_conf_gate_special_mode "$leverage_conf_gate_special_mode" \
-    --leverage_normalize_rows \
     "${first_frame_special_args[@]}" \
 # Add --profile_eviction to the launch command above when measuring eviction latency.

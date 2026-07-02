@@ -1,4 +1,5 @@
 import json
+import math
 import os
 
 import torch
@@ -17,6 +18,7 @@ from streamvggt.utils.cache_analysis import (
     CacheAnalysisConfig,
     EvictionNNAnalysisConfig,
     LeverageScoreHistogramConfig,
+    ProjectedNormHistogramConfig,
     PreEvictionSnapshotConfig,
     TokenOverlayDumpConfig,
 )
@@ -261,10 +263,12 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         anchor_keep_ratio: float = 0.05,
         history_anchor_patch_topk_per_frame: int = 0,
         total_budget=None,
+        budget_frame_multiplier: Optional[float] = None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        projected_norm_histogram_config: Optional[ProjectedNormHistogramConfig] = None,
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
@@ -313,6 +317,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         layer_budget_alpha: float = 0.5,
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 1e-12,
+        layer_budget_depth_mu: float = 0.5,
+        layer_budget_depth_sigma: float = 0.2,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         layer_budget_log_path: Optional[str] = None,
@@ -338,12 +344,17 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         camera_cache_frame_ids = []
         camera_cache_tokens_per_frame = None
         camera_cache_anchor_frame_ids = [0]
-        total_budget = self.total_budget
+        total_budget = self.total_budget if total_budget is None else total_budget
         kf_interval = max(int(kf_interval), 1)
         evict_interval = max(int(evict_interval), 1)
         eviction_protect_special_token_interval = int(eviction_protect_special_token_interval)
         history_anchor_patch_topk_per_frame = max(int(history_anchor_patch_topk_per_frame), 0)
         history_anchor_patch_topk_enabled = history_anchor_patch_topk_per_frame > 0 and int(max_anchors) > 0
+        if budget_frame_multiplier is not None and float(budget_frame_multiplier) < 0.0:
+            raise ValueError(
+                "budget_frame_multiplier must be >= 0 when provided, "
+                f"got {budget_frame_multiplier}"
+            )
         if eviction_protect_special_token_interval < 1:
             raise ValueError(
                 "eviction_protect_special_token_interval must be >= 1, "
@@ -389,6 +400,18 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         patch_h = img_h // patch_size
         patch_w = img_w // patch_size
         tokens_per_frame = 1 + 4 + patch_h * patch_w
+        if budget_frame_multiplier is not None:
+            per_layer_budget = int(math.ceil(float(budget_frame_multiplier) * int(tokens_per_frame)))
+            num_global_layers = int(self.aggregator.depth)
+            total_budget = per_layer_budget * num_global_layers
+            print(
+                "[StreamVGGT] Frame-multiple total budget: "
+                f"budget_frame_multiplier={budget_frame_multiplier}, "
+                f"tokens_per_frame={tokens_per_frame}, "
+                f"per_layer_budget={per_layer_budget}, "
+                f"num_global_layers={num_global_layers}, "
+                f"effective_total_budget={total_budget}"
+            )
         window_token_count = max(int(window_protect_frames), 0) * tokens_per_frame
         global_anchor_token_count = (
             min(int(self.aggregator.patch_start_idx), int(tokens_per_frame))
@@ -509,6 +532,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                 eviction_nn_analysis_config=eviction_nn_analysis_config,
                 leverage_score_histogram_config=leverage_score_histogram_config,
+                projected_norm_histogram_config=projected_norm_histogram_config,
                 token_overlay_dump_config=token_overlay_dump_config,
                 eviction_policy=eviction_policy,
                 eviction_policy_layers=eviction_policy_layers,
@@ -555,6 +579,8 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 layer_budget_alpha=layer_budget_alpha,
                 layer_budget_min_tokens=layer_budget_min_tokens,
                 layer_budget_eps=layer_budget_eps,
+                layer_budget_depth_mu=layer_budget_depth_mu,
+                layer_budget_depth_sigma=layer_budget_depth_sigma,
                 slots_per_direction=slots_per_direction,
                 hybrid_beta=hybrid_beta,
                 layer_budget_log_path=layer_budget_log_path,

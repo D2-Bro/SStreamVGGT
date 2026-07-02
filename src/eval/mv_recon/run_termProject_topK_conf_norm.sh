@@ -9,7 +9,7 @@ model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 max_frames='500'
 eviction_policy='svd_leverage'
 # Switch to leverage_entropy to test the entropy effective-count allocator.
-layer_budget_strategy='leverage_pr' #[leverage_pr, uniform, leverage_entropy, value_weighted_leverage_pr]
+layer_budget_strategy='value_weighted_leverage_pr' #[leverage_pr, uniform, leverage_entropy, value_weighted_leverage_pr]
 layer_budget_alpha=0.7
 layer_budget_min_tokens=0
 layer_budget_eps=1e-12
@@ -35,7 +35,7 @@ leverage_ridge_lambda=1e-5
 leverage_ridge_lambda_mode=relative
 leverage_ridge_score_chunk_size=4096
 leverage_ridge_jitter=1e-6
-leverage_ridge_dim=64
+leverage_ridge_dim=128
 leverage_random_seed=42
 
 history_anchor_strategy=none
@@ -62,7 +62,7 @@ leverage_conf_gate_init=mean
 
 eval_frame_stride=1
 
-output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_confDepth_init${leverage_conf_gate_init}_norm"
+output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_confDepth_init${leverage_conf_gate_init}_norm_${layer_budget_strategy}"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16

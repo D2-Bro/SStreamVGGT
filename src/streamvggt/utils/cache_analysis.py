@@ -303,6 +303,219 @@ def leverage_score_histogram_config_from_args(
 
 
 @dataclass
+class ProjectedNormHistogramConfig:
+    """Opt-in cumulative histograms for projected row norms before normalization."""
+
+    output_dir: str
+    bins: int = 100
+    min_value: float = 0.0
+    max_value: float = 3.0
+    layers: Optional[set[int]] = None
+    steps: Optional[set[int]] = None
+
+    def __post_init__(self) -> None:
+        if int(self.bins) < 1:
+            raise ValueError(f"bins must be >= 1, got {self.bins}")
+        if not math.isfinite(float(self.min_value)) or not math.isfinite(float(self.max_value)):
+            raise ValueError("histogram min/max must be finite")
+        if float(self.max_value) <= float(self.min_value):
+            raise ValueError(
+                f"histogram max must be greater than min, got min={self.min_value}, max={self.max_value}"
+            )
+        self.output_dir = os.path.abspath(self.output_dir)
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.bins = int(self.bins)
+        self.min_value = float(self.min_value)
+        self.max_value = float(self.max_value)
+        self.edges = torch.linspace(self.min_value, self.max_value, self.bins + 1, dtype=torch.float64)
+        self._counts: dict[int, torch.Tensor] = {}
+        self._summary: dict[int, dict[str, float | int | None]] = {}
+        self._flushed = False
+        atexit.register(self.flush)
+
+    @classmethod
+    def from_cli(
+        cls,
+        output_dir: Optional[str],
+        bins: int = 100,
+        min_value: float = 0.0,
+        max_value: float = 3.0,
+        layers: Optional[str] = None,
+        steps: Optional[str] = None,
+    ) -> Optional["ProjectedNormHistogramConfig"]:
+        if not output_dir:
+            return None
+        return cls(
+            output_dir=output_dir,
+            bins=bins,
+            min_value=min_value,
+            max_value=max_value,
+            layers=parse_index_filter(layers),
+            steps=parse_index_filter(steps),
+        )
+
+    def should_record(self, layer_id: int, step_idx: int) -> bool:
+        if self.layers is not None and int(layer_id) not in self.layers:
+            return False
+        if self.steps is not None and int(step_idx) not in self.steps:
+            return False
+        return True
+
+    def record(self, projected_norms: torch.Tensor, *, layer_id: int, step_idx: int) -> None:
+        if projected_norms is None or not self.should_record(layer_id, step_idx):
+            return
+        with torch.no_grad():
+            values = projected_norms.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+            values = values[torch.isfinite(values)]
+            if values.numel() == 0:
+                return
+
+            layer_id = int(layer_id)
+            if layer_id not in self._counts:
+                self._counts[layer_id] = torch.zeros(self.bins, dtype=torch.int64)
+                self._summary[layer_id] = {
+                    "total_tokens": 0,
+                    "records": 0,
+                    "sum": 0.0,
+                    "sum_sq": 0.0,
+                    "min": None,
+                    "max": None,
+                    "underflow": 0,
+                    "overflow": 0,
+                }
+
+            in_range = (values >= self.min_value) & (values <= self.max_value)
+            underflow = values < self.min_value
+            overflow = values > self.max_value
+            if bool(in_range.any().item()):
+                bin_ids = torch.bucketize(values[in_range], self.edges[1:-1], right=False)
+                self._counts[layer_id] += torch.bincount(bin_ids, minlength=self.bins).to(torch.int64)
+
+            summary = self._summary[layer_id]
+            count = int(values.numel())
+            summary["total_tokens"] = int(summary["total_tokens"]) + count
+            summary["records"] = int(summary["records"]) + 1
+            summary["sum"] = float(summary["sum"]) + float(values.sum().item())
+            summary["sum_sq"] = float(summary["sum_sq"]) + float((values * values).sum().item())
+            vmin = float(values.min().item())
+            vmax = float(values.max().item())
+            summary["min"] = vmin if summary["min"] is None else min(float(summary["min"]), vmin)
+            summary["max"] = vmax if summary["max"] is None else max(float(summary["max"]), vmax)
+            summary["underflow"] = int(summary["underflow"]) + int(underflow.sum().item())
+            summary["overflow"] = int(summary["overflow"]) + int(overflow.sum().item())
+            self._flushed = False
+
+    def flush(self) -> None:
+        if self._flushed:
+            return
+        os.makedirs(self.output_dir, exist_ok=True)
+        hist_path = os.path.join(self.output_dir, "projected_norm_histograms.csv")
+        summary_path = os.path.join(self.output_dir, "projected_norm_histogram_summary.csv")
+        layer_ids = sorted(self._counts)
+
+        with open(hist_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["layer_id", "bin_left", "bin_right", "count"])
+            for layer_id in layer_ids:
+                counts = self._counts[layer_id].tolist()
+                for bin_idx, count in enumerate(counts):
+                    writer.writerow([
+                        layer_id,
+                        float(self.edges[bin_idx].item()),
+                        float(self.edges[bin_idx + 1].item()),
+                        int(count),
+                    ])
+
+        with open(summary_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["layer_id", "min", "max", "mean", "std", "total_tokens", "underflow", "overflow", "records"])
+            for layer_id in layer_ids:
+                summary = self._summary[layer_id]
+                total = int(summary["total_tokens"])
+                mean = None
+                std = None
+                if total > 0:
+                    mean = float(summary["sum"]) / float(total)
+                    variance = max(float(summary["sum_sq"]) / float(total) - mean * mean, 0.0)
+                    std = math.sqrt(variance)
+                writer.writerow([
+                    layer_id,
+                    summary["min"],
+                    summary["max"],
+                    mean,
+                    std,
+                    total,
+                    int(summary["underflow"]),
+                    int(summary["overflow"]),
+                    int(summary["records"]),
+                ])
+
+        self._write_plots(layer_ids)
+        self._flushed = True
+
+    def _write_plots(self, layer_ids: list[int]) -> None:
+        if not layer_ids:
+            return
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception:
+            return
+
+        edges = self.edges.numpy()
+        left = edges[:-1]
+        width = edges[1:] - edges[:-1]
+        for layer_id in layer_ids:
+            counts = self._counts[layer_id].numpy()
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(left, counts, width=width, align="edge")
+            ax.set_xlabel("Projected row L2 norm bin")
+            ax.set_ylabel("Token count")
+            ax.set_title(f"Layer {layer_id:02d} projected pre-normalization norm")
+            fig.tight_layout()
+            fig.savefig(os.path.join(self.output_dir, f"layer_{layer_id:02d}_projected_norm_hist.png"), dpi=150)
+            plt.close(fig)
+
+        heat = torch.stack([self._counts[layer_id] for layer_id in layer_ids], dim=0).numpy()
+        fig, ax = plt.subplots(figsize=(10, max(3, 0.25 * len(layer_ids))))
+        image = ax.imshow(heat, aspect="auto", interpolation="nearest", origin="lower")
+        ax.set_xlabel("Projected row L2 norm bin")
+        ax.set_ylabel("Layer")
+        ax.set_yticks(range(len(layer_ids)))
+        ax.set_yticklabels([str(layer_id) for layer_id in layer_ids])
+        ax.set_title("Projected pre-normalization row norm histogram by layer")
+        fig.colorbar(image, ax=ax, label="Token count")
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.output_dir, "all_layers_projected_norm_heatmap.png"), dpi=150)
+        plt.close(fig)
+
+
+def add_projected_norm_histogram_args(parser) -> None:
+    parser.add_argument("--projected_norm_histogram_dir", "--projected-norm-histogram-dir", type=str, default=None)
+    parser.add_argument("--projected_norm_histogram_bins", "--projected-norm-histogram-bins", type=int, default=100)
+    parser.add_argument("--projected_norm_histogram_min", "--projected-norm-histogram-min", type=float, default=0.0)
+    parser.add_argument("--projected_norm_histogram_max", "--projected-norm-histogram-max", type=float, default=3.0)
+    parser.add_argument("--projected_norm_histogram_layers", "--projected-norm-histogram-layers", type=str, default="all")
+    parser.add_argument("--projected_norm_histogram_steps", "--projected-norm-histogram-steps", type=str, default="all")
+
+
+def projected_norm_histogram_config_from_args(
+    args: Any,
+    output_dir: Optional[str] = None,
+) -> Optional[ProjectedNormHistogramConfig]:
+    return ProjectedNormHistogramConfig.from_cli(
+        output_dir if output_dir is not None else getattr(args, "projected_norm_histogram_dir", None),
+        bins=getattr(args, "projected_norm_histogram_bins", 100),
+        min_value=getattr(args, "projected_norm_histogram_min", 0.0),
+        max_value=getattr(args, "projected_norm_histogram_max", 3.0),
+        layers=getattr(args, "projected_norm_histogram_layers", "all"),
+        steps=getattr(args, "projected_norm_histogram_steps", "all"),
+    )
+
+
+@dataclass
 class TokenOverlayDumpConfig:
     """Opt-in full token dump for step-wise eviction/leverage overlays."""
 
