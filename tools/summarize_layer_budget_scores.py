@@ -67,6 +67,53 @@ def write_frame_wide(rows: list[dict[str, str]], output_path: Path) -> tuple[lis
     return layers, layer_scores, frame_rows
 
 
+def write_budget_frame_wide(
+    rows: list[dict[str, str]], output_path: Path
+) -> tuple[list[int], dict[int, list[float]], list[dict[str, object]]]:
+    by_step: dict[int, list[dict[str, str]]] = defaultdict(list)
+    layers = sorted({int(row["layer"]) for row in rows})
+    for row in rows:
+        by_step[int(row["step"])].append(row)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "step",
+        "strategy",
+        "total_budget",
+        "assigned_budget",
+        "total_capacity",
+        "active_layers",
+        "mean_budget",
+    ] + [f"budget_layer_{layer:02d}" for layer in layers]
+
+    layer_budgets: dict[int, list[float]] = {layer: [] for layer in layers}
+    frame_rows: list[dict[str, object]] = []
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for step in sorted(by_step):
+            step_rows = by_step[step]
+            row_by_layer = {int(row["layer"]): row for row in step_rows}
+            budgets = []
+            out: dict[str, object] = {
+                "step": step,
+                "strategy": step_rows[0].get("strategy", ""),
+                "total_budget": step_rows[0].get("total_budget", ""),
+                "assigned_budget": step_rows[0].get("assigned_budget", ""),
+                "total_capacity": step_rows[0].get("total_capacity", ""),
+                "active_layers": step_rows[0].get("active_layers", ""),
+            }
+            for layer in layers:
+                budget = _float_or_zero(row_by_layer.get(layer, {}).get("final_budget", "0"))
+                out[f"budget_layer_{layer:02d}"] = f"{budget:.9g}"
+                budgets.append(budget)
+                layer_budgets[layer].append(budget)
+            out["mean_budget"] = f"{mean(budgets):.9g}" if budgets else "0"
+            writer.writerow(out)
+            frame_rows.append(out)
+    return layers, layer_budgets, frame_rows
+
+
 def write_layer_means(layer_scores: dict[int, list[float]], output_path: Path) -> list[tuple[int, float]]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     means = []
@@ -81,7 +128,27 @@ def write_layer_means(layer_scores: dict[int, list[float]], output_path: Path) -
     return means
 
 
-def plot_layer_mean_bar(layer_means: list[tuple[int, float]], output_path: Path) -> None:
+def write_layer_mean_budgets(layer_budgets: dict[int, list[float]], output_path: Path) -> list[tuple[int, float]]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    means = []
+    with output_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["layer", "mean_budget", "num_frames"])
+        writer.writeheader()
+        for layer in sorted(layer_budgets):
+            values = layer_budgets[layer]
+            layer_mean = mean(values) if values else 0.0
+            means.append((layer, layer_mean))
+            writer.writerow({"layer": layer, "mean_budget": f"{layer_mean:.9g}", "num_frames": len(values)})
+    return means
+
+
+def plot_layer_mean_bar(
+    layer_means: list[tuple[int, float]],
+    output_path: Path,
+    title: str = "Mean Layer-Budget Score by Layer",
+    ylabel: str = "mean score",
+    color: str = "#4C78A8",
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -91,10 +158,10 @@ def plot_layer_mean_bar(layer_means: list[tuple[int, float]], output_path: Path)
     layers = [layer for layer, _ in layer_means]
     values = [value for _, value in layer_means]
     fig, ax = plt.subplots(figsize=(10, 4), dpi=160)
-    ax.bar(layers, values, color="#4C78A8", edgecolor="white")
-    ax.set_title("Mean Layer-Budget Score by Layer")
+    ax.bar(layers, values, color=color, edgecolor="white")
+    ax.set_title(title)
     ax.set_xlabel("layer number")
-    ax.set_ylabel("mean score")
+    ax.set_ylabel(ylabel)
     ax.set_xticks(layers)
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
@@ -121,33 +188,89 @@ def plot_frame_mean_hist(values: list[float], output_path: Path) -> None:
     plt.close(fig)
 
 
+def get_step_budgets(rows: list[dict[str, str]], step: int) -> list[tuple[int, float]]:
+    step_rows = [row for row in rows if int(row["step"]) == step]
+    if not step_rows:
+        available = sorted({int(row["step"]) for row in rows})
+        raise SystemExit(f"Step {step} not found. Available steps: {available}")
+    return [
+        (int(row["layer"]), _float_or_zero(row.get("final_budget", "0")))
+        for row in sorted(step_rows, key=lambda row: int(row["layer"]))
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_csv", type=Path)
     parser.add_argument("--output_dir", type=Path, default=None)
+    parser.add_argument("--step", type=int, default=None, help="Plot final_budget by layer for one step")
+    parser.add_argument(
+        "--latest-step",
+        action="store_true",
+        help="Plot final_budget by layer for the latest logged step",
+    )
     args = parser.parse_args()
+    if args.step is not None and args.latest_step:
+        raise SystemExit("--step and --latest-step cannot be used together")
 
     input_csv = args.input_csv
     output_dir = args.output_dir or input_csv.parent
     rows = read_rows(input_csv)
     if not rows:
         raise SystemExit(f"No rows found in {input_csv}")
+    if "final_budget" not in rows[0]:
+        raise SystemExit(
+            f"{input_csv} is missing final_budget; budget plots require "
+            "the layer_budget_scores.csv schema written by StreamVGGT."
+        )
 
     frame_csv = output_dir / "layer_budget_scores_by_frame.csv"
     layer_mean_csv = output_dir / "layer_budget_layer_mean_scores.csv"
     layer_bar = output_dir / "layer_budget_layer_mean_score_by_layer.png"
     frame_hist = output_dir / "layer_budget_frame_mean_score_hist.png"
+    budget_frame_csv = output_dir / "layer_budget_budgets_by_frame.csv"
+    budget_layer_mean_csv = output_dir / "layer_budget_layer_mean_budgets.csv"
+    budget_layer_bar = output_dir / "layer_budget_layer_mean_budget_by_layer.png"
 
     _, layer_scores, frame_rows = write_frame_wide(rows, frame_csv)
     layer_means = write_layer_means(layer_scores, layer_mean_csv)
     frame_means = [_float_or_zero(str(row["mean_score"])) for row in frame_rows]
     plot_layer_mean_bar(layer_means, layer_bar)
     plot_frame_mean_hist(frame_means, frame_hist)
+    _, layer_budgets, _ = write_budget_frame_wide(rows, budget_frame_csv)
+    budget_layer_means = write_layer_mean_budgets(layer_budgets, budget_layer_mean_csv)
+    plot_layer_mean_bar(
+        budget_layer_means,
+        budget_layer_bar,
+        title="Mean Layer Budget by Layer",
+        ylabel="mean final_budget",
+        color="#F58518",
+    )
+
+    step_plot = None
+    if args.latest_step:
+        selected_step = max(int(row["step"]) for row in rows)
+    else:
+        selected_step = args.step
+    if selected_step is not None:
+        step_plot = output_dir / f"layer_budget_step_{selected_step:06d}_budget_by_layer.png"
+        plot_layer_mean_bar(
+            get_step_budgets(rows, selected_step),
+            step_plot,
+            title=f"Layer Budget by Layer at Step {selected_step}",
+            ylabel="final_budget",
+            color="#E45756",
+        )
 
     print(f"wrote {frame_csv}")
     print(f"wrote {layer_mean_csv}")
     print(f"wrote {layer_bar}")
     print(f"wrote {frame_hist}")
+    print(f"wrote {budget_frame_csv}")
+    print(f"wrote {budget_layer_mean_csv}")
+    print(f"wrote {budget_layer_bar}")
+    if step_plot is not None:
+        print(f"wrote {step_plot}")
 
 
 if __name__ == "__main__":

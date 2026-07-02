@@ -199,6 +199,11 @@ def validate_streamvggt_args(args):
             "Error: --layer_budget_depth_sigma must be > 0, "
             f"got {args.layer_budget_depth_sigma}."
         )
+    if not (0.0 <= args.layer_budget_depth_floor <= 1.0):
+        raise SystemExit(
+            "Error: --layer_budget_depth_floor must be in [0, 1], "
+            f"got {args.layer_budget_depth_floor}."
+        )
     if args.layer_budget_value_gamma < 0:
         raise SystemExit(
             "Error: --layer_budget_value_gamma must be >= 0, "
@@ -280,6 +285,7 @@ def validate_streamvggt_args(args):
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
             f"layer_budget_depth_mu={args.layer_budget_depth_mu}, "
             f"layer_budget_depth_sigma={args.layer_budget_depth_sigma}, "
+            f"layer_budget_depth_floor={args.layer_budget_depth_floor}, "
             f"layer_budget_value_gamma={args.layer_budget_value_gamma}, "
             f"layer_budget_value_norm_type={args.layer_budget_value_norm_type}, "
             f"layer_budget_norm_source={args.layer_budget_norm_source}, "
@@ -624,6 +630,7 @@ def get_args_parser():
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
     parser.add_argument("--layer_budget_depth_mu", "--layer-budget-depth-mu", type=float, default=0.5, help="Center of Gaussian depth prior for depth_weighted_leverage_pr")
     parser.add_argument("--layer_budget_depth_sigma", "--layer-budget-depth-sigma", type=float, default=0.2, help="Width of Gaussian depth prior for depth_weighted_leverage_pr")
+    parser.add_argument("--layer_budget_depth_floor", "--layer-budget-depth-floor", type=float, default=0.0, help="Minimum depth prior for depth_weighted_leverage_pr; 0 preserves the raw Gaussian")
     parser.add_argument("--layer_budget_value_gamma", "--layer-budget-value-gamma", type=float, default=0.5)
     parser.add_argument("--slots_per_direction", "--slots-per-direction", type=float, default=4.0)
     parser.add_argument("--hybrid_beta", "--hybrid-beta", type=float, default=0.5)
@@ -1140,8 +1147,9 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             layer_budget_eps=args.layer_budget_eps,
                             layer_budget_depth_mu=args.layer_budget_depth_mu,
                             layer_budget_depth_sigma=args.layer_budget_depth_sigma,
-                        slots_per_direction=args.slots_per_direction,
-                        hybrid_beta=args.hybrid_beta,
+                            layer_budget_depth_floor=args.layer_budget_depth_floor,
+                            slots_per_direction=args.slots_per_direction,
+                            hybrid_beta=args.hybrid_beta,
                             eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                             eviction_protect_special_tokens=args.eviction_protect_special_tokens,
                             eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,

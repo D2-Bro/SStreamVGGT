@@ -18,7 +18,9 @@ import tempfile
 from tqdm import tqdm
 import uuid
 import json
+import subprocess
 from collections import defaultdict
+from pathlib import Path
 from streamvggt.layers.confidence_state import parse_confidence_gate_init
 from streamvggt.layers.recent_merge import RecentMergeConfig
 from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
@@ -117,6 +119,23 @@ def parse_eviction_policy_layers(spec, num_layers):
                 )
             selected.add(layer)
     return selected
+
+
+def summarize_layer_budget_log(log_path):
+    if not log_path or not os.path.exists(log_path):
+        return
+    script_path = Path(__file__).resolve().parents[3] / "tools" / "summarize_layer_budget_scores.py"
+    if not script_path.exists():
+        print(f"[LayerBudget] summary script not found: {script_path}")
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(script_path), str(log_path)],
+            check=True,
+        )
+    except Exception as exc:
+        print(f"[LayerBudget] failed to summarize {log_path}: {exc}")
+
 
 
 def get_args_parser():
@@ -376,6 +395,7 @@ def get_args_parser():
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
     parser.add_argument("--layer_budget_depth_mu", "--layer-budget-depth-mu", type=float, default=0.5, help="Center of Gaussian depth prior for depth_weighted_leverage_pr")
     parser.add_argument("--layer_budget_depth_sigma", "--layer-budget-depth-sigma", type=float, default=0.2, help="Width of Gaussian depth prior for depth_weighted_leverage_pr")
+    parser.add_argument("--layer_budget_depth_floor", "--layer-budget-depth-floor", type=float, default=0.0, help="Minimum depth prior for depth_weighted_leverage_pr; 0 preserves the raw Gaussian")
     parser.add_argument("--layer_budget_value_gamma", "--layer-budget-value-gamma", type=float, default=0.5)
     parser.add_argument("--slots_per_direction", "--slots-per-direction", type=float, default=4.0)
     parser.add_argument("--hybrid_beta", "--hybrid-beta", type=float, default=0.5)
@@ -394,6 +414,19 @@ def get_args_parser():
         default="value",
         choices=("value", "key"),
         help="Tensor source for value_weighted_leverage_pr norm prior: value cache or key cache",
+    )
+    parser.add_argument(
+        "--layer_budget_log_scores",
+        "--layer-budget-log-scores",
+        action="store_true",
+        help="Write per-step layer budget scores to layer_budget_scores.csv under each scene output directory",
+    )
+    parser.add_argument(
+        "--layer_budget_log_path",
+        "--layer-budget-log-path",
+        type=str,
+        default=None,
+        help="Optional explicit CSV path for layer budget score logs",
     )
     parser.add_argument(
         "--eviction_protect_recent_frames",
@@ -889,6 +922,11 @@ def main(args):
             "Error: --layer_budget_depth_sigma must be > 0, "
             f"got {args.layer_budget_depth_sigma}."
         )
+    if not (0.0 <= args.layer_budget_depth_floor <= 1.0):
+        raise SystemExit(
+            "Error: --layer_budget_depth_floor must be in [0, 1], "
+            f"got {args.layer_budget_depth_floor}."
+        )
     if args.layer_budget_value_gamma < 0:
         raise SystemExit(
             "Error: --layer_budget_value_gamma must be >= 0, "
@@ -979,6 +1017,7 @@ def main(args):
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
             f"layer_budget_depth_mu={args.layer_budget_depth_mu}, "
             f"layer_budget_depth_sigma={args.layer_budget_depth_sigma}, "
+            f"layer_budget_depth_floor={args.layer_budget_depth_floor}, "
             f"layer_budget_value_gamma={args.layer_budget_value_gamma}, "
             f"layer_budget_value_norm_type={args.layer_budget_value_norm_type}, "
             f"layer_budget_norm_source={args.layer_budget_norm_source}, "
@@ -1308,50 +1347,56 @@ def main(args):
                                 if args.covis_debug_log:
                                     def covis_log_fn(msg):
                                         print(msg)
+                                scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
+                                safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                                scene_key = f"{int(data_idx):04d}_{safe_scene}"
+                                rank_label = f"rank_{accelerator.process_index}"
                                 eviction_nn_analysis_config = None
                                 leverage_score_histogram_config = None
                                 projected_norm_histogram_config = None
                                 token_overlay_dump_config = None
+                                layer_budget_log_path = None
                                 if args.eviction_nn_analysis_dir:
-                                    scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
-                                    safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                                     nn_dir = osp.join(
                                         args.eviction_nn_analysis_dir,
                                         name_data,
-                                        f"rank_{accelerator.process_index}",
-                                        f"{int(data_idx):04d}_{safe_scene}",
+                                        rank_label,
+                                        scene_key,
                                     )
                                     eviction_nn_analysis_config = eviction_nn_config_from_args(args, output_dir=nn_dir)
                                 if args.leverage_score_histogram_dir:
-                                    scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
-                                    safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                                     hist_dir = osp.join(
                                         args.leverage_score_histogram_dir,
                                         name_data,
-                                        f"rank_{accelerator.process_index}",
-                                        f"{int(data_idx):04d}_{safe_scene}",
+                                        rank_label,
+                                        scene_key,
                                     )
                                     leverage_score_histogram_config = leverage_score_histogram_config_from_args(args, output_dir=hist_dir)
                                 if args.projected_norm_histogram_dir:
-                                    scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
-                                    safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                                     norm_hist_dir = osp.join(
                                         args.projected_norm_histogram_dir,
                                         name_data,
-                                        f"rank_{accelerator.process_index}",
-                                        f"{int(data_idx):04d}_{safe_scene}",
+                                        rank_label,
+                                        scene_key,
                                     )
                                     projected_norm_histogram_config = projected_norm_histogram_config_from_args(args, output_dir=norm_hist_dir)
                                 if args.token_overlay_dump_dir:
-                                    scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
-                                    safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                                     overlay_dump_dir = osp.join(
                                         args.token_overlay_dump_dir,
                                         name_data,
-                                        f"rank_{accelerator.process_index}",
-                                        f"{int(data_idx):04d}_{safe_scene}",
+                                        rank_label,
+                                        scene_key,
                                     )
                                     token_overlay_dump_config = token_overlay_dump_config_from_args(args, output_dir=overlay_dump_dir)
+                                if args.layer_budget_log_path:
+                                    layer_budget_log_path = args.layer_budget_log_path
+                                elif args.layer_budget_log_scores:
+                                    layer_budget_log_path = osp.join(
+                                        args.output_dir,
+                                        name_data,
+                                        scene_key,
+                                        "layer_budget_scores.csv",
+                                    )
 
                                 results = model.inference(
                                     batch,
@@ -1405,8 +1450,10 @@ def main(args):
                                     layer_budget_eps=args.layer_budget_eps,
                                     layer_budget_depth_mu=args.layer_budget_depth_mu,
                                     layer_budget_depth_sigma=args.layer_budget_depth_sigma,
+                                    layer_budget_depth_floor=args.layer_budget_depth_floor,
                                     slots_per_direction=args.slots_per_direction,
                                     hybrid_beta=args.hybrid_beta,
+                                    layer_budget_log_path=layer_budget_log_path,
                                     eviction_protect_recent_frames=args.eviction_protect_recent_frames,
                                     eviction_protect_special_tokens=args.eviction_protect_special_tokens,
                                     eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
@@ -1441,6 +1488,7 @@ def main(args):
                                     leverage_score_histogram_config.flush()
                                 if projected_norm_histogram_config is not None:
                                     projected_norm_histogram_config.flush()
+                                summarize_layer_budget_log(layer_budget_log_path)
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize(device)
                                 infer_time = time.perf_counter() - infer_start

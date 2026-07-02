@@ -263,6 +263,8 @@ def validate_args(args):
         raise ValueError(f"--layer_budget_depth_mu must be in [0, 1], got {args.layer_budget_depth_mu}")
     if args.layer_budget_depth_sigma <= 0:
         raise ValueError(f"--layer_budget_depth_sigma must be > 0, got {args.layer_budget_depth_sigma}")
+    if not (0.0 <= args.layer_budget_depth_floor <= 1.0):
+        raise ValueError(f"--layer_budget_depth_floor must be in [0, 1], got {args.layer_budget_depth_floor}")
     if args.slots_per_direction <= 0:
         raise ValueError(f"--slots_per_direction must be > 0, got {args.slots_per_direction}")
     if not (0.0 <= args.hybrid_beta <= 1.0):
@@ -446,6 +448,7 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             layer_budget_eps=args.layer_budget_eps,
             layer_budget_depth_mu=args.layer_budget_depth_mu,
             layer_budget_depth_sigma=args.layer_budget_depth_sigma,
+            layer_budget_depth_floor=args.layer_budget_depth_floor,
             slots_per_direction=args.slots_per_direction,
             hybrid_beta=args.hybrid_beta,
             eviction_nn_analysis_config=eviction_nn_analysis_config,
@@ -636,6 +639,7 @@ def main():
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
     parser.add_argument("--layer_budget_depth_mu", "--layer-budget-depth-mu", type=float, default=0.5, help="Center of Gaussian depth prior for depth_weighted_leverage_pr")
     parser.add_argument("--layer_budget_depth_sigma", "--layer-budget-depth-sigma", type=float, default=0.2, help="Width of Gaussian depth prior for depth_weighted_leverage_pr")
+    parser.add_argument("--layer_budget_depth_floor", "--layer-budget-depth-floor", type=float, default=0.0, help="Minimum depth prior for depth_weighted_leverage_pr; 0 preserves the raw Gaussian")
     parser.add_argument("--slots_per_direction", "--slots-per-direction", type=float, default=4.0)
     parser.add_argument("--hybrid_beta", "--hybrid-beta", type=float, default=0.5)
     parser.add_argument("--eviction_protect_recent_frames", "--eviction-protect-recent-frames", type=int, default=0)

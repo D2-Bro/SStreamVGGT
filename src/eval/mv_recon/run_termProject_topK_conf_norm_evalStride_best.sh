@@ -15,7 +15,7 @@ layer_budget_min_tokens=0
 layer_budget_eps=1e-12
 layer_budget_depth_mu=0.6
 layer_budget_depth_sigma=0.2
-layer_budget_depth_floor=0.2
+layer_budget_depth_floor=0.1
 layer_budget_value_gamma=0.7
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
@@ -51,11 +51,6 @@ first_frame_special_args=()
 if [ "$first_frame_special_tokens_only" = true ]; then
     first_frame_special_args=(--first_frame_special_tokens_only)
 fi
-layer_budget_log_scores=true
-layer_budget_log_args=()
-if [ "$layer_budget_log_scores" = true ]; then
-    layer_budget_log_args=(--layer_budget_log_scores)
-fi
 
 leverage_dpp_recency_lambda=1.0
 leverage_dpp_recency_window=10
@@ -80,6 +75,7 @@ fi
 
 output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_confDepth_spe${leverage_conf_gate_special_mode}_init${leverage_conf_gate_init}_norm_evalStride${eval_frame_stride}_${layer_budget_strategy}${layer_budget_depth_mu}${layer_budget_depth_sigma}f${layer_budget_depth_floor}_${budget_suffix}"
 projected_norm_histogram_dir="${output_dir}/projected_norm_histograms"
+budget_distribution_dir="${output_dir}/budget_distribution"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -87,7 +83,7 @@ export OPENBLAS_NUM_THREADS=16
 export MKL_NUM_THREADS=16
 export NUMEXPR_NUM_THREADS=16
 
-accelerate launch --num_processes 3 --main_process_port 29102 ./eval/mv_recon/launch.py \
+accelerate launch --num_processes 1 --main_process_port 29102 ./eval/mv_recon/launch.py \
     --weights "$model_weights" \
     --output_dir "$output_dir" \
     --model_name "$model_name" \
@@ -140,6 +136,8 @@ accelerate launch --num_processes 3 --main_process_port 29102 ./eval/mv_recon/la
     --projected_norm_histogram_dir "$projected_norm_histogram_dir" \
     --leverage_conf_gate_init "$leverage_conf_gate_init" \
     --eval_frame_stride "$eval_frame_stride" \
+    --leverage_normalize_rows \
+    --layer_budget_log_scores \
+    --layer_budget_log_path "$budget_distribution_dir"
     "${first_frame_special_args[@]}" \
-    "${layer_budget_log_args[@]}"
 # Add --profile_eviction to the launch command above when measuring eviction latency.

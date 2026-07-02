@@ -290,6 +290,7 @@ class Aggregator(nn.Module):
         layer_budget_eps: float = 1e-12,
         layer_budget_depth_mu: float = 0.5,
         layer_budget_depth_sigma: float = 0.2,
+        layer_budget_depth_floor: float = 0.0,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         layer_budget_log_path: Optional[str] = None,
@@ -341,6 +342,8 @@ class Aggregator(nn.Module):
             raise ValueError(f"layer_budget_depth_mu must be in [0, 1], got {layer_budget_depth_mu}")
         if float(layer_budget_depth_sigma) <= 0.0:
             raise ValueError(f"layer_budget_depth_sigma must be > 0, got {layer_budget_depth_sigma}")
+        if not (0.0 <= float(layer_budget_depth_floor) <= 1.0):
+            raise ValueError(f"layer_budget_depth_floor must be in [0, 1], got {layer_budget_depth_floor}")
         parsed_global_attn_idx_ranges = self._normalize_global_attn_idx_ranges(global_attn_idx_ranges)
         range_mode_enabled = parsed_global_attn_idx_ranges is not None
 
@@ -422,6 +425,7 @@ class Aggregator(nn.Module):
             layer_budget_eps=layer_budget_eps,
             layer_budget_depth_mu=layer_budget_depth_mu,
             layer_budget_depth_sigma=layer_budget_depth_sigma,
+            layer_budget_depth_floor=layer_budget_depth_floor,
             slots_per_direction=slots_per_direction,
             hybrid_beta=hybrid_beta,
             layer_budget_log_path=layer_budget_log_path,
@@ -857,6 +861,7 @@ class Aggregator(nn.Module):
         layer_budget_eps: float = 1e-12,
         layer_budget_depth_mu: float = 0.5,
         layer_budget_depth_sigma: float = 0.2,
+        layer_budget_depth_floor: float = 0.0,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         eviction_protect_recent_frames: int = 0,
@@ -1122,6 +1127,7 @@ class Aggregator(nn.Module):
         layer_budget_eps: float = 1e-12,
         layer_budget_depth_mu: float = 0.5,
         layer_budget_depth_sigma: float = 0.2,
+        layer_budget_depth_floor: float = 0.0,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         eviction_protect_recent_frames: int = 0,
@@ -1617,6 +1623,7 @@ class Aggregator(nn.Module):
         base_scores,
         mu: float,
         sigma: float,
+        floor: float = 0.0,
         capacities: Optional[Dict[int, int]] = None,
     ):
         base = torch.nan_to_num(torch.as_tensor(base_scores).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -1628,6 +1635,9 @@ class Aggregator(nn.Module):
         positions = torch.arange(depth, device=base.device, dtype=base.dtype) / denom
         sigma_value = max(float(sigma), 1e-12)
         prior = torch.exp(-((positions - float(mu)) ** 2) / (2.0 * sigma_value * sigma_value))
+        floor_value = min(max(float(floor), 0.0), 1.0)
+        if floor_value > 0.0:
+            prior = floor_value + (1.0 - floor_value) * prior
         if capacities is not None:
             active = torch.zeros_like(base, dtype=torch.bool)
             for layer, capacity in capacities.items():
@@ -1700,6 +1710,7 @@ class Aggregator(nn.Module):
         layer_budget_eps: float = 1e-12,
         layer_budget_depth_mu: float = 0.5,
         layer_budget_depth_sigma: float = 0.2,
+        layer_budget_depth_floor: float = 0.0,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         layer_budget_log_path: Optional[str] = None,
@@ -1756,6 +1767,7 @@ class Aggregator(nn.Module):
                     self.last_layer_budget_scores,
                     layer_budget_depth_mu,
                     layer_budget_depth_sigma,
+                    floor=layer_budget_depth_floor,
                     capacities=capacities,
                 )
                 allocation_alpha = layer_budget_alpha
