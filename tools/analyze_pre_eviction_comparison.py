@@ -18,7 +18,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PREFERRED_POLICIES = ("mean", "svd_leverage", "layer_svd_leverage")
+PREFERRED_POLICIES = (
+    "mean",
+    "svd_leverage",
+    "layer_svd_leverage",
+    "normalized_layer_svd_leverage",
+    "projected_norm_layer_leverage",
+)
 
 
 def comparison_policies(comp: dict[str, Any]) -> tuple[str, ...]:
@@ -649,6 +655,33 @@ def analyze_comparison(path: Path, args: argparse.Namespace, out_dir: Path) -> t
             delta[f"{key}_layer_svd_minus_head_svd"] = float(
                 by_policy["layer_svd_leverage"][key] - by_policy["svd_leverage"][key]
             )
+        if "normalized_layer_svd_leverage" in by_policy:
+            delta[f"{key}_normalized_layer_svd_minus_mean"] = float(
+                by_policy["normalized_layer_svd_leverage"][key] - by_policy["mean"][key]
+            )
+            delta[f"{key}_normalized_layer_svd_minus_head_svd"] = float(
+                by_policy["normalized_layer_svd_leverage"][key] - by_policy["svd_leverage"][key]
+            )
+            if "layer_svd_leverage" in by_policy:
+                delta[f"{key}_normalized_layer_svd_minus_layer_svd"] = float(
+                    by_policy["normalized_layer_svd_leverage"][key] - by_policy["layer_svd_leverage"][key]
+                )
+        if "projected_norm_layer_leverage" in by_policy:
+            delta[f"{key}_projected_norm_layer_minus_mean"] = float(
+                by_policy["projected_norm_layer_leverage"][key] - by_policy["mean"][key]
+            )
+            delta[f"{key}_projected_norm_layer_minus_head_svd"] = float(
+                by_policy["projected_norm_layer_leverage"][key] - by_policy["svd_leverage"][key]
+            )
+            if "layer_svd_leverage" in by_policy:
+                delta[f"{key}_projected_norm_layer_minus_layer_svd"] = float(
+                    by_policy["projected_norm_layer_leverage"][key] - by_policy["layer_svd_leverage"][key]
+                )
+            if "normalized_layer_svd_leverage" in by_policy:
+                delta[f"{key}_projected_norm_layer_minus_normalized_layer_svd"] = float(
+                    by_policy["projected_norm_layer_leverage"][key]
+                    - by_policy["normalized_layer_svd_leverage"][key]
+                )
 
     with (head_dir / "comparison_delta.json").open("w", encoding="utf-8") as f:
         json.dump(delta, f, indent=2)

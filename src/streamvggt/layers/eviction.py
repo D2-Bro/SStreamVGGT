@@ -429,6 +429,7 @@ class EvictionManager:
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_projected_key_cache: bool = False,
         leverage_approx_method: str = "right_sketch",
         leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
@@ -652,6 +653,27 @@ class EvictionManager:
                 "leverage_similarity_feature_projection='random' reuses projected leverage features "
                 "and requires leverage_approx_method='right_sketch' or 'right_sketch_ridge'"
             )
+        if leverage_projected_key_cache:
+            if policy != "svd_leverage":
+                raise ValueError("leverage_projected_key_cache requires policy='svd_leverage'")
+            if leverage_granularity != "layer":
+                raise ValueError("leverage_projected_key_cache requires leverage_granularity='layer'")
+            if leverage_feature != "key":
+                raise ValueError("leverage_projected_key_cache requires leverage_feature='key'")
+            if leverage_projection != "random":
+                raise ValueError("leverage_projected_key_cache requires leverage_projection='random'")
+            if leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+                raise ValueError(
+                    "leverage_projected_key_cache requires "
+                    "leverage_approx_method='right_sketch' or 'right_sketch_ridge'"
+                )
+            if leverage_eviction_selector == "layer_head_fast_dpp" or (
+                leverage_eviction_selector == "similarity_topk"
+                and leverage_similarity_granularity == "head"
+            ):
+                raise ValueError(
+                    "leverage_projected_key_cache only supports shared layer keep-set selectors"
+                )
         self.policy = policy
         self.debug = debug
         self.leverage_sketch_dim = leverage_sketch_dim
@@ -660,6 +682,7 @@ class EvictionManager:
         self.leverage_projection = leverage_projection
         self.leverage_head_mean_dim = int(leverage_head_mean_dim)
         self.leverage_normalize_rows = bool(leverage_normalize_rows)
+        self.leverage_projected_key_cache = bool(leverage_projected_key_cache)
         self.leverage_approx_method = leverage_approx_method
         self.leverage_ridge_lambda = float(leverage_ridge_lambda)
         self.leverage_ridge_lambda_mode = leverage_ridge_lambda_mode
@@ -707,6 +730,14 @@ class EvictionManager:
         self._last_similarity_head_features: Optional[torch.Tensor] = None
         self._leverage_diag_context: Dict[str, object] = {}
         self._leverage_diag_emitted_once = False
+        self._projected_key_cache: Optional[torch.Tensor] = None
+        self._projected_key_head_cache: Optional[torch.Tensor] = None
+        self._projected_key_pre_norm_cache: Optional[torch.Tensor] = None
+        self._projected_key_cache_meta: Optional[Dict[str, object]] = None
+        self._last_projected_key_features: Optional[torch.Tensor] = None
+        self._last_projected_key_head_features: Optional[torch.Tensor] = None
+        self._last_projected_key_pre_norms: Optional[torch.Tensor] = None
+        self._last_projected_key_cache_meta: Optional[Dict[str, object]] = None
 
     def select(
         self,
@@ -772,6 +803,10 @@ class EvictionManager:
         self._last_similarity_layer_features = None
         self._last_similarity_head_features = None
         self._last_projected_pre_norms = None
+        self._last_projected_key_features = None
+        self._last_projected_key_head_features = None
+        self._last_projected_key_pre_norms = None
+        self._last_projected_key_cache_meta = None
         self._capture_projected_norms = bool(capture_projected_norms)
         need_mean_scores = self.policy in ("mean", "baseline_mean") or need_summary or self.debug
         mean_scores = self._mean_scores(candidate_k) if need_mean_scores else None
@@ -988,6 +1023,7 @@ class EvictionManager:
                     f"leverage_projection={self.leverage_projection} "
                     f"leverage_head_mean_dim={self.leverage_head_mean_dim} "
                     f"leverage_normalize_rows={self.leverage_normalize_rows} "
+                    f"leverage_projected_key_cache={self.leverage_projected_key_cache} "
                     f"leverage_eviction_selector={self.leverage_eviction_selector} "
                     f"leverage_similarity_granularity={self.leverage_similarity_granularity} "
                     f"leverage_similarity_feature_projection={self.leverage_similarity_feature_projection} "
@@ -1935,8 +1971,189 @@ class EvictionManager:
             kept[b] = all_indices[keep_mask].sort(dim=-1).values
         return kept
 
+    def reset_projected_key_cache(self) -> None:
+        self._projected_key_cache = None
+        self._projected_key_head_cache = None
+        self._projected_key_pre_norm_cache = None
+        self._projected_key_cache_meta = None
+        self._last_projected_key_features = None
+        self._last_projected_key_head_features = None
+        self._last_projected_key_pre_norms = None
+        self._last_projected_key_cache_meta = None
 
+    def _projected_key_cache_meta_for(
+        self,
+        *,
+        batch_size: int,
+        num_heads: int,
+        head_dim: int,
+        sketch_dim: int,
+        device: torch.device,
+    ) -> Dict[str, object]:
+        return {
+            "batch_size": int(batch_size),
+            "num_heads": int(num_heads),
+            "head_dim": int(head_dim),
+            "sketch_dim": int(sketch_dim),
+            "device": str(device),
+        }
 
+    def _projected_key_cache_length(
+        self,
+        *,
+        batch_size: int,
+        num_heads: int,
+        num_tokens: int,
+        head_dim: int,
+        sketch_dim: int,
+        device: torch.device,
+    ) -> int:
+        if not self.leverage_projected_key_cache:
+            return 0
+        cache = self._projected_key_cache
+        head_cache = self._projected_key_head_cache
+        norm_cache = self._projected_key_pre_norm_cache
+        meta = self._projected_key_cache_meta
+        expected = self._projected_key_cache_meta_for(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            sketch_dim=sketch_dim,
+            device=device,
+        )
+        if cache is None or head_cache is None or norm_cache is None or meta != expected:
+            return 0
+        cache_len = int(cache.shape[1])
+        if cache_len > int(num_tokens):
+            self.reset_projected_key_cache()
+            return 0
+        if cache.shape != (batch_size, cache_len, sketch_dim):
+            self.reset_projected_key_cache()
+            return 0
+        if head_cache.shape != (batch_size, num_heads, cache_len, sketch_dim):
+            self.reset_projected_key_cache()
+            return 0
+        if norm_cache.shape != (batch_size, cache_len):
+            self.reset_projected_key_cache()
+            return 0
+        return cache_len
+
+    def _project_key_with_omega(self, mat_k: torch.Tensor, omega_key: torch.Tensor):
+        head_projected_raw = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
+        layer_projected_raw = head_projected_raw.sum(dim=1)
+        pre_norms = torch.linalg.vector_norm(layer_projected_raw.detach(), ord=2, dim=-1)
+        layer_projected = self._maybe_normalize_rows(layer_projected_raw)
+        head_projected = self._maybe_normalize_rows(head_projected_raw)
+        return layer_projected, head_projected, pre_norms
+
+    def _capture_projected_pre_normalization_norm_values(self, norms: torch.Tensor) -> None:
+        if getattr(self, "_capture_projected_norms", False):
+            self._last_projected_pre_norms = norms.detach()
+
+    def _layer_key_projected_features(
+        self,
+        mat_k: torch.Tensor,
+        omega_key: torch.Tensor,
+        sketch_dim: int,
+        profile: Dict[str, float],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, H, N, D = mat_k.shape
+        meta = self._projected_key_cache_meta_for(
+            batch_size=B,
+            num_heads=H,
+            head_dim=D,
+            sketch_dim=sketch_dim,
+            device=mat_k.device,
+        )
+        cache_len = self._projected_key_cache_length(
+            batch_size=B,
+            num_heads=H,
+            num_tokens=N,
+            head_dim=D,
+            sketch_dim=sketch_dim,
+            device=mat_k.device,
+        )
+        if cache_len > 0:
+            layer_parts = [self._projected_key_cache[:, :cache_len].to(device=mat_k.device)]
+            head_parts = [self._projected_key_head_cache[:, :, :cache_len].to(device=mat_k.device)]
+            norm_parts = [self._projected_key_pre_norm_cache[:, :cache_len].to(device=mat_k.device)]
+            if cache_len < N:
+                suffix_layer, suffix_head, suffix_norms = self._project_key_with_omega(
+                    mat_k[:, :, cache_len:, :],
+                    omega_key,
+                )
+                layer_parts.append(suffix_layer)
+                head_parts.append(suffix_head)
+                norm_parts.append(suffix_norms)
+            leverage_matrix = torch.cat(layer_parts, dim=1)
+            head_leverage_matrix = torch.cat(head_parts, dim=2)
+            pre_norms = torch.cat(norm_parts, dim=1)
+            profile["projection_cache_hits"] = float(cache_len)
+            profile["projection_cache_misses"] = float(N - cache_len)
+        else:
+            leverage_matrix, head_leverage_matrix, pre_norms = self._project_key_with_omega(mat_k, omega_key)
+            profile["projection_cache_hits"] = 0.0
+            profile["projection_cache_misses"] = float(N)
+
+        self._capture_projected_pre_normalization_norm_values(pre_norms)
+        self._last_projected_key_features = leverage_matrix.detach()
+        self._last_projected_key_head_features = head_leverage_matrix.detach()
+        self._last_projected_key_pre_norms = pre_norms.detach()
+        self._last_projected_key_cache_meta = meta
+        return leverage_matrix, head_leverage_matrix
+
+    def update_projected_key_cache_after_eviction(
+        self,
+        kept_candidate_indices: torch.Tensor,
+        *,
+        tail_k: Optional[torch.Tensor] = None,
+    ) -> None:
+        if not self.leverage_projected_key_cache:
+            return
+        features = self._last_projected_key_features
+        head_features = self._last_projected_key_head_features
+        pre_norms = self._last_projected_key_pre_norms
+        meta = self._last_projected_key_cache_meta
+        if features is None or head_features is None or pre_norms is None or meta is None:
+            self.reset_projected_key_cache()
+            return
+        if kept_candidate_indices.ndim != 3 or kept_candidate_indices.shape[0] != features.shape[0]:
+            self.reset_projected_key_cache()
+            return
+        B, N, S = features.shape
+        H = int(meta["num_heads"])
+        if kept_candidate_indices.shape[1] < 1 or head_features.shape[:3] != (B, H, N):
+            self.reset_projected_key_cache()
+            return
+        row_indices = kept_candidate_indices[:, 0, :].to(device=features.device, dtype=torch.long)
+        if row_indices.numel() > 0 and (int(row_indices.min().item()) < 0 or int(row_indices.max().item()) >= N):
+            self.reset_projected_key_cache()
+            return
+        gather_layer = row_indices.unsqueeze(-1).expand(B, row_indices.shape[1], S)
+        next_features = torch.gather(features, 1, gather_layer)
+        next_norms = torch.gather(pre_norms, 1, row_indices)
+        gather_head = row_indices[:, None, :, None].expand(B, H, row_indices.shape[1], S)
+        next_head_features = torch.gather(head_features, 2, gather_head)
+
+        if tail_k is not None and int(tail_k.shape[2]) > 0:
+            with torch.cuda.amp.autocast(enabled=False):
+                tail = torch.nan_to_num(tail_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+                omega = self._get_leverage_right_sketch(
+                    H * int(meta["head_dim"]),
+                    int(meta["sketch_dim"]),
+                    device=tail.device,
+                    seed=self.leverage_random_seed,
+                )
+                omega_key = omega[: H * int(meta["head_dim"])].view(H, int(meta["head_dim"]), int(meta["sketch_dim"]))
+                tail_features, tail_head_features, tail_norms = self._project_key_with_omega(tail, omega_key)
+            next_features = torch.cat([next_features, tail_features.detach()], dim=1)
+            next_head_features = torch.cat([next_head_features, tail_head_features.detach()], dim=2)
+            next_norms = torch.cat([next_norms, tail_norms.detach()], dim=1)
+
+        self._projected_key_cache = next_features.detach()
+        self._projected_key_head_cache = next_head_features.detach()
+        self._projected_key_pre_norm_cache = next_norms.detach()
+        self._projected_key_cache_meta = dict(meta)
 
     def _similarity_projection_error(self, granularity: str) -> ValueError:
         return ValueError(
@@ -3446,24 +3663,32 @@ class EvictionManager:
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
             projection_start = time.perf_counter() if do_profile else 0.0
             omega_key = omega[: H * D].view(H, D, sketch_dim)
-            head_key_matrix = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
-            if lowdim_concat:
-                if mat_v is None or omega_value is None:
-                    raise ValueError("leverage_feature='key_value_lowdim_concat' requires value cache tensor")
-                omega_value_view = omega_value.view(H, D, sketch_dim)
-                head_value_matrix = torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
-                head_leverage_matrix = torch.cat([head_key_matrix, head_value_matrix], dim=-1)
-                leverage_matrix = torch.cat([head_key_matrix.sum(dim=1), head_value_matrix.sum(dim=1)], dim=-1)
-                self._last_layer_feature_shape = (int(N), int(leverage_matrix.shape[-1]))
+            if self.leverage_projected_key_cache and not lowdim_concat and mat_v is None:
+                leverage_matrix, head_leverage_matrix = self._layer_key_projected_features(
+                    mat_k,
+                    omega_key,
+                    sketch_dim,
+                    profile,
+                )
             else:
-                head_leverage_matrix = head_key_matrix
-                if mat_v is not None:
-                    omega_value_view = omega[H * D :].view(H, D, sketch_dim)
-                    head_leverage_matrix = head_leverage_matrix + torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
-                leverage_matrix = head_leverage_matrix.sum(dim=1)
-            self._capture_projected_pre_normalization_norms(leverage_matrix)
-            leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
-            head_leverage_matrix = self._maybe_normalize_rows(head_leverage_matrix)
+                head_key_matrix = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
+                if lowdim_concat:
+                    if mat_v is None or omega_value is None:
+                        raise ValueError("leverage_feature='key_value_lowdim_concat' requires value cache tensor")
+                    omega_value_view = omega_value.view(H, D, sketch_dim)
+                    head_value_matrix = torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
+                    head_leverage_matrix = torch.cat([head_key_matrix, head_value_matrix], dim=-1)
+                    leverage_matrix = torch.cat([head_key_matrix.sum(dim=1), head_value_matrix.sum(dim=1)], dim=-1)
+                    self._last_layer_feature_shape = (int(N), int(leverage_matrix.shape[-1]))
+                else:
+                    head_leverage_matrix = head_key_matrix
+                    if mat_v is not None:
+                        omega_value_view = omega[H * D :].view(H, D, sketch_dim)
+                        head_leverage_matrix = head_leverage_matrix + torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
+                    leverage_matrix = head_leverage_matrix.sum(dim=1)
+                self._capture_projected_pre_normalization_norms(leverage_matrix)
+                leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
+                head_leverage_matrix = self._maybe_normalize_rows(head_leverage_matrix)
             self._store_projected_similarity_features(leverage_matrix, "layer")
             self._store_projected_similarity_features(head_leverage_matrix, "head")
             if do_profile:

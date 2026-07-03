@@ -211,6 +211,13 @@ def get_args_parser():
         help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
     )
     parser.add_argument(
+        "--leverage_projected_key_cache",
+        "--leverage-projected-key-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reuse cached layer-wise random projected key features for surviving tokens",
+    )
+    parser.add_argument(
         "--leverage_approx_method",
         "--leverage-approx-method",
         type=str,
@@ -962,6 +969,27 @@ def main(args):
             "Error: --leverage_approx_method right_sketch_ridge requires "
             "--leverage_ridge_dim >= 1."
         )
+    if args.leverage_projected_key_cache:
+        if args.eviction_policy != "svd_leverage":
+            raise SystemExit("Error: --leverage_projected_key_cache requires --eviction_policy svd_leverage.")
+        if args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_granularity layer.")
+        if args.leverage_feature != "key":
+            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_feature key.")
+        if args.leverage_projection != "random":
+            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_projection random.")
+        if args.leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+            raise SystemExit(
+                "Error: --leverage_projected_key_cache requires --leverage_approx_method "
+                "right_sketch or right_sketch_ridge."
+            )
+        if args.leverage_eviction_selector == "layer_head_fast_dpp" or (
+            args.leverage_eviction_selector == "similarity_topk"
+            and args.leverage_similarity_granularity == "head"
+        ):
+            raise SystemExit(
+                "Error: --leverage_projected_key_cache only supports shared layer keep-set selectors."
+            )
     if args.layer_budget_strategy not in ("uniform", "cosine_precomputed") and (
         args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
     ):
@@ -997,6 +1025,7 @@ def main(args):
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
+            f"projected_key_cache={args.leverage_projected_key_cache}, "
             f"selector={args.leverage_eviction_selector}, "
             f"risk_mode={args.leverage_eviction_risk_mode}, "
             f"high_outlier_z={args.leverage_high_outlier_z}, "
@@ -1409,6 +1438,7 @@ def main(args):
                                     leverage_projection=args.leverage_projection,
                                     leverage_head_mean_dim=args.leverage_head_mean_dim,
                                     leverage_normalize_rows=args.leverage_normalize_rows,
+                                    leverage_projected_key_cache=args.leverage_projected_key_cache,
                                     leverage_approx_method=args.leverage_approx_method,
                                     leverage_ridge_lambda=args.leverage_ridge_lambda,
                                     leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,

@@ -263,6 +263,7 @@ def run_inference(args: argparse.Namespace):
                 "--leverage_ridge_dim >= 1 or --leverage_right_jl_dim >= 1."
             )
             return
+        args.leverage_ridge_dim = int(resolved_ridge_dim)
     try:
         global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
     except ValueError as exc:
@@ -447,8 +448,6 @@ def run_inference(args: argparse.Namespace):
                 leverage_projection=args.leverage_projection,
                 leverage_head_mean_dim=args.leverage_head_mean_dim,
                 leverage_approx_method=args.leverage_approx_method,
-                leverage_left_sketch_dim=args.leverage_left_sketch_dim,
-                leverage_right_jl_dim=args.leverage_right_jl_dim,
                 leverage_ridge_lambda=args.leverage_ridge_lambda,
                 leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
                 leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,

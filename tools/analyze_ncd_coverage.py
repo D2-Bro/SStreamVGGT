@@ -13,7 +13,13 @@ import torch
 import torch.nn.functional as F
 
 
-POLICIES = ("mean", "svd_leverage", "layer_svd_leverage")
+POLICIES = (
+    "mean",
+    "svd_leverage",
+    "layer_svd_leverage",
+    "normalized_layer_svd_leverage",
+    "projected_norm_layer_leverage",
+)
 
 
 def parse_args() -> argparse.Namespace:

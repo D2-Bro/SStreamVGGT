@@ -9,7 +9,7 @@ model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 max_frames='500'
 eviction_policy='svd_leverage'
 # Switch to leverage_entropy to test the entropy effective-count allocator.
-layer_budget_strategy='depth_weighted_leverage_pr' #[leverage_pr, uniform, leverage_entropy, depth_weighted_leverage_pr, value_weighted_leverage_pr]
+layer_budget_strategy='value_weighted_leverage_pr' #[leverage_pr, uniform, leverage_entropy, depth_weighted_leverage_pr, value_weighted_leverage_pr]
 layer_budget_alpha=0.7
 layer_budget_min_tokens=0
 layer_budget_eps=1e-12
@@ -35,11 +35,12 @@ leverage_dpp_diversity_beta=1.0
 leverage_dpp_feature_projection=random
 
 leverage_approx_method=right_sketch_ridge
+leverage_projected_key_cache=false
 leverage_ridge_lambda=0
 leverage_ridge_lambda_mode=absolute
 leverage_ridge_score_chunk_size=4096
 leverage_ridge_jitter=1e-6
-leverage_ridge_dim=256
+leverage_ridge_dim=64
 leverage_random_seed=42
 
 history_anchor_strategy=none
@@ -72,6 +73,10 @@ if [ -n "$budget_frame_multiplier" ]; then
     budget_args=(--budget_frame_multiplier "$budget_frame_multiplier")
     budget_suffix="budgetFrameMult${budget_frame_multiplier}"
 fi
+projected_key_cache_args=()
+if [ "$leverage_projected_key_cache" = true ]; then
+    projected_key_cache_args=(--leverage_projected_key_cache)
+fi
 
 output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_confDepth_spe${leverage_conf_gate_special_mode}_init${leverage_conf_gate_init}_norm_evalStride${eval_frame_stride}_${layer_budget_strategy}${layer_budget_depth_mu}${layer_budget_depth_sigma}f${layer_budget_depth_floor}_${budget_suffix}"
 projected_norm_histogram_dir="${output_dir}/projected_norm_histograms"
@@ -83,7 +88,7 @@ export OPENBLAS_NUM_THREADS=16
 export MKL_NUM_THREADS=16
 export NUMEXPR_NUM_THREADS=16
 
-accelerate launch --num_processes 1 --main_process_port 29102 ./eval/mv_recon/launch.py \
+accelerate launch --num_processes 3 --main_process_port 29102 ./eval/mv_recon/launch.py \
     --weights "$model_weights" \
     --output_dir "$output_dir" \
     --model_name "$model_name" \
@@ -116,6 +121,7 @@ accelerate launch --num_processes 1 --main_process_port 29102 ./eval/mv_recon/la
     --leverage_ridge_score_chunk_size "$leverage_ridge_score_chunk_size" \
     --leverage_ridge_jitter "$leverage_ridge_jitter" \
     --leverage_ridge_dim "$leverage_ridge_dim" \
+    "${projected_key_cache_args[@]}" \
     --leverage_random_seed "$leverage_random_seed" \
     --layer_budget_value_gamma "$layer_budget_value_gamma" \
     --layer_budget_value_norm_type "$layer_budget_value_norm_type" \
@@ -137,7 +143,8 @@ accelerate launch --num_processes 1 --main_process_port 29102 ./eval/mv_recon/la
     --leverage_conf_gate_init "$leverage_conf_gate_init" \
     --eval_frame_stride "$eval_frame_stride" \
     --leverage_normalize_rows \
-    --layer_budget_log_scores \
-    --layer_budget_log_path "$budget_distribution_dir"
     "${first_frame_special_args[@]}" \
 # Add --profile_eviction to the launch command above when measuring eviction latency.
+
+# --layer_budget_log_scores \
+#     --layer_budget_log_path "$budget_distribution_dir"

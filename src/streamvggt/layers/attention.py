@@ -63,6 +63,10 @@ class Attention(nn.Module):
 
     def _reset_cache_state(self):
         self.num_anchor_tokens = 0
+        for eviction in self._eviction_managers.values():
+            reset = getattr(eviction, "reset_projected_key_cache", None)
+            if reset is not None:
+                reset()
 
     def eviction(
         self, 
@@ -90,6 +94,7 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_projected_key_cache: bool = False,
         leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
@@ -271,6 +276,7 @@ class Attention(nn.Module):
             leverage_projection,
             leverage_head_mean_dim,
             leverage_normalize_rows,
+            leverage_projected_key_cache,
             leverage_approx_method,            leverage_ridge_lambda,
             leverage_ridge_lambda_mode,
             leverage_ridge_score_chunk_size,
@@ -318,6 +324,7 @@ class Attention(nn.Module):
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
                 leverage_normalize_rows=leverage_normalize_rows,
+                leverage_projected_key_cache=leverage_projected_key_cache,
                 leverage_approx_method=leverage_approx_method,                leverage_ridge_lambda=leverage_ridge_lambda,
                 leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
                 leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
@@ -557,6 +564,10 @@ class Attention(nn.Module):
             if confidence_state is not None
             else None
         )
+        eviction.update_projected_key_cache_after_eviction(
+            top_indices,
+            tail_k=k[:, :, tail_start:N, :] if tail_count > 0 else None,
+        )
         if profile_eviction:
             if final_k.is_cuda and torch.cuda.is_available():
                 torch.cuda.synchronize(final_k.device)
@@ -602,6 +613,7 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_projected_key_cache: bool = False,
         leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
@@ -848,6 +860,7 @@ class Attention(nn.Module):
                     "leverage_feature": leverage_feature,
                     "leverage_projection": leverage_projection,
                     "leverage_head_mean_dim": leverage_head_mean_dim,
+                    "leverage_projected_key_cache": leverage_projected_key_cache,
                     "leverage_approx_method": leverage_approx_method,                    "leverage_ridge_lambda": leverage_ridge_lambda,
                     "leverage_ridge_lambda_mode": leverage_ridge_lambda_mode,
                     "leverage_ridge_score_chunk_size": leverage_ridge_score_chunk_size,
