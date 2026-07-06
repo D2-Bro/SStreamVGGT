@@ -284,7 +284,8 @@ def run_inference(args: argparse.Namespace):
         print(
             "Using SVD leverage granularity: "
             f"{args.leverage_granularity} (feature={args.leverage_feature}, "
-            f"projection={args.leverage_projection}, head_mean_dim={args.leverage_head_mean_dim})"
+            f"projection={args.leverage_projection}, head_mean_dim={args.leverage_head_mean_dim}, "
+            f"normalize_before_projection={args.leverage_normalize_before_projection})"
         )
         print(
             "Using SVD leverage selector: "
@@ -447,6 +448,7 @@ def run_inference(args: argparse.Namespace):
                 leverage_feature=args.leverage_feature,
                 leverage_projection=args.leverage_projection,
                 leverage_head_mean_dim=args.leverage_head_mean_dim,
+                leverage_normalize_before_projection=args.leverage_normalize_before_projection,
                 leverage_approx_method=args.leverage_approx_method,
                 leverage_ridge_lambda=args.leverage_ridge_lambda,
                 leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
@@ -473,7 +475,7 @@ def run_inference(args: argparse.Namespace):
                 voxel_covis_config=voxel_covis_config,
                 global_attn_idx_ranges=global_attn_idx_ranges,
                 global_attn_debug=args.global_attn_debug,
-                leverage_normalize_rows=args.leverage_normalize_rows
+                leverage_normalize_rows=args.leverage_normalize_rows,
             )
 
     torch.cuda.synchronize()
@@ -706,6 +708,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of mean-pooled channel groups per head for leverage_projection=head_mean",
+    )
+    parser.add_argument(
+        "--leverage_normalize_before_projection",
+        "--leverage-normalize-before-projection",
+        action="store_true",
+        help="L2 normalize layer-wise key rows before random leverage projection",
     )
     parser.add_argument(
         "--leverage_approx_method",

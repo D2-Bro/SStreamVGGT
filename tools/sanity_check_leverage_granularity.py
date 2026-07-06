@@ -2175,6 +2175,125 @@ def check_leverage_diag_output_and_invariance() -> None:
     if "[LeverageDiag]" in buffer.getvalue():
         raise AssertionError("leverage_diag_interval=0 should only print once per manager")
 
+def _layer_token_normalize_keys(k: torch.Tensor) -> torch.Tensor:
+    norm = k.float().square().sum(dim=(1, 3), keepdim=True).sqrt().clamp_min(1e-12)
+    return k.float() / norm
+
+
+def _head_token_normalize_keys(k: torch.Tensor) -> torch.Tensor:
+    norm = k.float().square().sum(dim=3, keepdim=True).sqrt().clamp_min(1e-12)
+    return k.float() / norm
+
+
+def check_layer_key_normalize_before_projection() -> None:
+    k, v = _make_cache()
+    candidate_k = k[:, :, 2:, :]
+    manual_k = _layer_token_normalize_keys(candidate_k)
+    manual_head_k = _head_token_normalize_keys(candidate_k)
+    base_kwargs = {
+        "policy": "svd_leverage",
+        "leverage_granularity": "layer",
+        "leverage_feature": "key",
+        "leverage_projection": "random",
+        "leverage_random_seed": 123,
+    }
+    for approx_kwargs in (
+        {"leverage_approx_method": "right_sketch", "leverage_sketch_dim": 4},
+        {"leverage_approx_method": "right_sketch_ridge", "leverage_ridge_dim": 4},
+    ):
+        normalized = EvictionManager(
+            **base_kwargs,
+            **approx_kwargs,
+            leverage_normalize_before_projection=True,
+        )
+        manual = EvictionManager(**base_kwargs, **approx_kwargs)
+        normalized_scores = normalized._layer_svd_leverage_scores(candidate_k)
+        manual_scores = manual._layer_svd_leverage_scores(manual_k)
+        if not torch.allclose(normalized_scores, manual_scores, atol=1e-5, rtol=1e-4):
+            raise AssertionError(
+                "normalize_before_projection did not match manual layer-token key normalization "
+                f"for {approx_kwargs['leverage_approx_method']}"
+            )
+
+        headwise = EvictionManager(
+            **base_kwargs,
+            **approx_kwargs,
+            leverage_normalize_before_projection=True,
+            leverage_normalize_before_projection_headwise=True,
+        )
+        headwise_scores = headwise._layer_svd_leverage_scores(candidate_k)
+        manual_head_scores = manual._layer_svd_leverage_scores(manual_head_k)
+        if not torch.allclose(headwise_scores, manual_head_scores, atol=1e-5, rtol=1e-4):
+            raise AssertionError(
+                "headwise normalize_before_projection did not match manual per-head key normalization "
+                f"for {approx_kwargs['leverage_approx_method']}"
+            )
+
+    for cache_headwise in (False, True):
+        no_cache = EvictionManager(
+            **base_kwargs,
+            leverage_approx_method="right_sketch_ridge",
+            leverage_ridge_dim=4,
+            leverage_normalize_before_projection=True,
+            leverage_normalize_before_projection_headwise=cache_headwise,
+        )
+        cached = EvictionManager(
+            **base_kwargs,
+            leverage_approx_method="right_sketch_ridge",
+            leverage_ridge_dim=4,
+            leverage_normalize_before_projection=True,
+            leverage_normalize_before_projection_headwise=cache_headwise,
+            leverage_projected_key_cache=True,
+        )
+        no_cache_result = no_cache.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+        cached_result = cached.select(k, cache_budget=7, num_anchor_tokens=2, v=v)
+        if not torch.allclose(no_cache_result.policy_scores, cached_result.policy_scores, atol=1e-5, rtol=1e-4):
+            raise AssertionError(
+                "projected key cache changed normalize_before_projection policy scores "
+                f"for headwise={cache_headwise}"
+            )
+        if not torch.equal(no_cache_result.kept_candidate_indices, cached_result.kept_candidate_indices):
+            raise AssertionError(
+                "projected key cache changed normalize_before_projection kept indices "
+                f"for headwise={cache_headwise}"
+            )
+
+    invalid_headwise_configs = (
+        {},
+    )
+    for cfg in invalid_headwise_configs:
+        kwargs = dict(base_kwargs)
+        kwargs.update(cfg)
+        try:
+            EvictionManager(**kwargs, leverage_normalize_before_projection_headwise=True)
+        except ValueError as exc:
+            if "leverage_normalize_before_projection_headwise" not in str(exc):
+                raise AssertionError(f"unexpected headwise normalize-before-projection error: {exc}") from exc
+        else:
+            raise AssertionError(f"invalid headwise normalize-before-projection config was accepted: {cfg}")
+
+    invalid_configs = (
+        {"leverage_granularity": "head"},
+        {"leverage_feature": "key_value"},
+        {"leverage_projection": "head_mean"},
+        {"leverage_approx_method": "full_d_ridge"},
+    )
+    for cfg in invalid_configs:
+        kwargs = dict(base_kwargs)
+        kwargs.update(cfg)
+        try:
+            EvictionManager(
+                **kwargs,
+                leverage_normalize_before_projection=True,
+                leverage_normalize_before_projection_headwise=True,
+            )
+        except ValueError as exc:
+            if "leverage_normalize_before_projection" not in str(exc):
+                raise AssertionError(f"unexpected normalize-before-projection error: {exc}") from exc
+        else:
+            raise AssertionError(f"invalid normalize-before-projection config was accepted: {cfg}")
+
+
 def check_ridge_invalid_args() -> None:
     invalid_configs = (
         {"leverage_approx_method": "full_d_ridge", "leverage_ridge_lambda": -1e-3},
@@ -2214,6 +2333,7 @@ def main() -> None:
     check_sketch_and_exact_modes()
     check_approx_methods()
     check_leverage_diag_output_and_invariance()
+    check_layer_key_normalize_before_projection()
     check_ridge_invalid_args()
     check_leverage_score_histogram_config()
     check_outlier_then_low_risk_mode()

@@ -224,22 +224,43 @@ def _layer_policy_scores_to_cpu(scores: torch.Tensor) -> torch.Tensor:
     return scores.reshape(-1)
 
 
+def _resolve_projected_layer_leverage_ridge_dims(args: argparse.Namespace) -> list[int]:
+    raw = getattr(args, "projected_layer_leverage_ridge_dims", None)
+    if raw:
+        dims = [int(part.strip()) for part in str(raw).split(",") if part.strip()]
+    else:
+        dims = [int(args.projected_layer_leverage_ridge_dim)]
+    dims = list(dict.fromkeys(dims))
+    if not dims or any(dim < 1 for dim in dims):
+        raise ValueError(f"projected layer leverage ridge dims must be >= 1, got {dims}")
+    return dims
+
+
+def _projected_layer_policy_name(ridge_dim: int, ridge_dims: list[int]) -> str:
+    if len(ridge_dims) == 1:
+        return "projected_norm_layer_leverage"
+    return f"projected_norm_layer_leverage_r{int(ridge_dim)}"
+
+
 def build_projected_norm_layer_leverage_results(
     paths: list[Path],
     args: argparse.Namespace,
-) -> dict[Path, dict[str, torch.Tensor]]:
+) -> dict[str, dict[Path, dict[str, torch.Tensor]]]:
     """Compute SStreamVGGT-style projected-normalized layer leverage decisions.
 
     This mirrors the online layer path used by mv_recon for
     right_sketch_ridge: per-head key projection, layer aggregation,
     row normalization, then ridge leverage scoring.
     """
+    ridge_dims = _resolve_projected_layer_leverage_ridge_dims(args)
     snapshots_by_group: dict[tuple[int, int, int], list[tuple[Path, dict[str, Any]]]] = {}
     for path in paths:
         meta = torch.load(path, map_location="cpu").get("meta", {})
         snapshots_by_group.setdefault(_snapshot_group_key(meta), []).append((path, meta))
 
-    results: dict[Path, dict[str, torch.Tensor]] = {}
+    results: dict[str, dict[Path, dict[str, torch.Tensor]]] = {
+        _projected_layer_policy_name(dim, ridge_dims): {} for dim in ridge_dims
+    }
     for group_key, group_items in sorted(snapshots_by_group.items()):
         group_items = sorted(group_items, key=lambda item: int(item[1].get("head_id", 0)))
         loaded = [(path, torch.load(path, map_location="cpu")) for path, _ in group_items]
@@ -266,66 +287,69 @@ def build_projected_norm_layer_leverage_results(
             if has_values and args.projected_layer_leverage_feature in ("key_value", "key_value_lowdim_concat")
             else None
         )
-        manager = EvictionManager(
-            policy="svd_leverage",
-            leverage_sketch_dim=0,
-            leverage_granularity="layer",
-            leverage_feature=args.projected_layer_leverage_feature,
-            leverage_projection="random",
-            leverage_normalize_rows=True,
-            leverage_approx_method="right_sketch_ridge",
-            leverage_ridge_lambda=args.projected_layer_leverage_ridge_lambda,
-            leverage_ridge_lambda_mode=args.projected_layer_leverage_ridge_lambda_mode,
-            leverage_ridge_score_chunk_size=args.projected_layer_leverage_ridge_score_chunk_size,
-            leverage_ridge_jitter=args.projected_layer_leverage_ridge_jitter,
-            leverage_ridge_dim=args.projected_layer_leverage_ridge_dim,
-            leverage_random_seed=args.projected_layer_leverage_random_seed,
-            leverage_eviction_selector="topk",
-        )
-        selection = manager.select(
-            layer_keys,
-            cache_budget=cache_budget,
-            num_anchor_tokens=num_anchor_tokens,
-            v=layer_values,
-        )
-        kept_candidate = selection.kept_candidate_indices[0, 0].cpu().long()
-        if int(kept_candidate.numel()) != int(num_to_keep):
-            raise ValueError(
-                f"Projected layer leverage kept {kept_candidate.numel()} candidates, expected {num_to_keep}"
-            )
-        layer_result = _candidate_indices_from_kept(
-            kept_candidate,
-            num_anchor_tokens=num_anchor_tokens,
-            candidate_count=candidate_count,
-        )
-        layer_result["policy_scores"] = _layer_policy_scores_to_cpu(selection.policy_scores)
-        layer_result["mean_scores"] = _layer_policy_scores_to_cpu(selection.mean_scores)
-        layer_result["score_definition"] = (
-            "SStreamVGGT layer right-sketch-ridge leverage over projected then "
-            "row-normalized layer key features"
-        )
-        layer_result["projected_layer_leverage_config"] = {
-            "feature": args.projected_layer_leverage_feature,
-            "ridge_dim": int(args.projected_layer_leverage_ridge_dim),
-            "ridge_lambda": float(args.projected_layer_leverage_ridge_lambda),
-            "ridge_lambda_mode": args.projected_layer_leverage_ridge_lambda_mode,
-            "ridge_score_chunk_size": int(args.projected_layer_leverage_ridge_score_chunk_size),
-            "ridge_jitter": float(args.projected_layer_leverage_ridge_jitter),
-            "random_seed": int(args.projected_layer_leverage_random_seed),
-            "feature_shape": tuple(manager._last_layer_feature_shape) if manager._last_layer_feature_shape else None,
-        }
-
         step_idx, layer_id, batch_id = group_key
-        print(
-            f"projected normalized layer leverage layer={layer_id:02d} batch={batch_id:02d} "
-            f"step={step_idx:06d} heads={len(loaded)} tokens={cache_size} evict={eviction_count} "
-            f"ridge_dim={args.projected_layer_leverage_ridge_dim}"
-        )
-        for path, _ in loaded:
-            results[path] = {
-                key: value.clone() if isinstance(value, torch.Tensor) else value
-                for key, value in layer_result.items()
+        for ridge_dim in ridge_dims:
+            policy_name = _projected_layer_policy_name(ridge_dim, ridge_dims)
+            manager = EvictionManager(
+                policy="svd_leverage",
+                leverage_sketch_dim=0,
+                leverage_granularity="layer",
+                leverage_feature=args.projected_layer_leverage_feature,
+                leverage_projection="random",
+                leverage_normalize_rows=True,
+                leverage_approx_method="right_sketch_ridge",
+                leverage_ridge_lambda=args.projected_layer_leverage_ridge_lambda,
+                leverage_ridge_lambda_mode=args.projected_layer_leverage_ridge_lambda_mode,
+                leverage_ridge_score_chunk_size=args.projected_layer_leverage_ridge_score_chunk_size,
+                leverage_ridge_jitter=args.projected_layer_leverage_ridge_jitter,
+                leverage_ridge_dim=int(ridge_dim),
+                leverage_random_seed=args.projected_layer_leverage_random_seed,
+                leverage_eviction_selector="topk",
+            )
+            selection = manager.select(
+                layer_keys,
+                cache_budget=cache_budget,
+                num_anchor_tokens=num_anchor_tokens,
+                v=layer_values,
+            )
+            kept_candidate = selection.kept_candidate_indices[0, 0].cpu().long()
+            if int(kept_candidate.numel()) != int(num_to_keep):
+                raise ValueError(
+                    f"{policy_name} kept {kept_candidate.numel()} candidates, expected {num_to_keep}"
+                )
+            layer_result = _candidate_indices_from_kept(
+                kept_candidate,
+                num_anchor_tokens=num_anchor_tokens,
+                candidate_count=candidate_count,
+            )
+            layer_result["policy_scores"] = _layer_policy_scores_to_cpu(selection.policy_scores)
+            layer_result["mean_scores"] = _layer_policy_scores_to_cpu(selection.mean_scores)
+            layer_result["score_definition"] = (
+                "SStreamVGGT layer right-sketch-ridge leverage over projected then "
+                "row-normalized layer key features"
+            )
+            layer_result["projected_layer_leverage_config"] = {
+                "feature": args.projected_layer_leverage_feature,
+                "ridge_dim": int(ridge_dim),
+                "ridge_lambda": float(args.projected_layer_leverage_ridge_lambda),
+                "ridge_lambda_mode": args.projected_layer_leverage_ridge_lambda_mode,
+                "ridge_score_chunk_size": int(args.projected_layer_leverage_ridge_score_chunk_size),
+                "ridge_jitter": float(args.projected_layer_leverage_ridge_jitter),
+                "random_seed": int(args.projected_layer_leverage_random_seed),
+                "feature_shape": tuple(manager._last_layer_feature_shape) if manager._last_layer_feature_shape else None,
+                "policy_name": policy_name,
             }
+
+            print(
+                f"{policy_name} layer={layer_id:02d} batch={batch_id:02d} "
+                f"step={step_idx:06d} heads={len(loaded)} tokens={cache_size} evict={eviction_count} "
+                f"ridge_dim={ridge_dim}"
+            )
+            for path, _ in loaded:
+                results[policy_name][path] = {
+                    key: value.clone() if isinstance(value, torch.Tensor) else value
+                    for key, value in layer_result.items()
+                }
     return results
 
 
@@ -361,7 +385,7 @@ def compare_snapshot(
     output_dir: Path,
     layer_svd_results: dict[Path, dict[str, torch.Tensor]] | None = None,
     normalized_layer_svd_results: dict[Path, dict[str, torch.Tensor]] | None = None,
-    projected_norm_layer_results: dict[Path, dict[str, torch.Tensor]] | None = None,
+    projected_norm_layer_results: dict[str, dict[Path, dict[str, torch.Tensor]]] | None = None,
 ) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu")
     keys = payload["old_key"].float()
@@ -390,9 +414,12 @@ def compare_snapshot(
     normalized_layer_svd = None
     if normalized_layer_svd_results is not None:
         normalized_layer_svd = normalized_layer_svd_results[path]
-    projected_norm_layer = None
+    projected_norm_layers: dict[str, dict[str, torch.Tensor]] = {}
     if projected_norm_layer_results is not None:
-        projected_norm_layer = projected_norm_layer_results[path]
+        projected_norm_layers = {
+            policy_name: policy_results[path]
+            for policy_name, policy_results in projected_norm_layer_results.items()
+        }
 
     overlap, overlap_ratio = _overlap_ratio(mean["evict_indices"], svd["evict_indices"])
 
@@ -462,28 +489,28 @@ def compare_snapshot(
         )
 
 
-    if projected_norm_layer is not None:
+    for projected_policy_name, projected_norm_layer in projected_norm_layers.items():
         projected_overlap, projected_overlap_ratio = _overlap_ratio(
             mean["evict_indices"], projected_norm_layer["evict_indices"]
         )
         head_vs_projected_overlap, head_vs_projected_overlap_ratio = _overlap_ratio(
             svd["evict_indices"], projected_norm_layer["evict_indices"]
         )
-        result_payload["projected_norm_layer_leverage"] = projected_norm_layer
+        result_payload[projected_policy_name] = projected_norm_layer
         result_payload["summary"].update(
             {
-                "projected_norm_layer_leverage_evicted_count": int(
+                f"{projected_policy_name}_evicted_count": int(
                     projected_norm_layer["evict_indices"].numel()
                 ),
-                "mean_vs_projected_norm_layer_evicted_overlap_count": int(projected_overlap),
-                "mean_vs_projected_norm_layer_evicted_overlap_ratio": projected_overlap_ratio,
-                "head_svd_vs_projected_norm_layer_evicted_overlap_count": int(
+                f"mean_vs_{projected_policy_name}_evicted_overlap_count": int(projected_overlap),
+                f"mean_vs_{projected_policy_name}_evicted_overlap_ratio": projected_overlap_ratio,
+                f"head_svd_vs_{projected_policy_name}_evicted_overlap_count": int(
                     head_vs_projected_overlap
                 ),
-                "head_svd_vs_projected_norm_layer_evicted_overlap_ratio": (
+                f"head_svd_vs_{projected_policy_name}_evicted_overlap_ratio": (
                     head_vs_projected_overlap_ratio
                 ),
-                "projected_norm_layer_leverage_score_summary": _score_summary(
+                f"{projected_policy_name}_score_summary": _score_summary(
                     projected_norm_layer["policy_scores"]
                 ),
             }
@@ -494,10 +521,10 @@ def compare_snapshot(
             )
             result_payload["summary"].update(
                 {
-                    "layer_svd_vs_projected_norm_layer_evicted_overlap_count": int(
+                    f"layer_svd_vs_{projected_policy_name}_evicted_overlap_count": int(
                         layer_vs_projected_overlap
                     ),
-                    "layer_svd_vs_projected_norm_layer_evicted_overlap_ratio": (
+                    f"layer_svd_vs_{projected_policy_name}_evicted_overlap_ratio": (
                         layer_vs_projected_overlap_ratio
                     ),
                 }
@@ -508,10 +535,10 @@ def compare_snapshot(
             )
             result_payload["summary"].update(
                 {
-                    "normalized_layer_svd_vs_projected_norm_layer_evicted_overlap_count": int(
+                    f"normalized_layer_svd_vs_{projected_policy_name}_evicted_overlap_count": int(
                         normalized_vs_projected_overlap
                     ),
-                    "normalized_layer_svd_vs_projected_norm_layer_evicted_overlap_ratio": (
+                    f"normalized_layer_svd_vs_{projected_policy_name}_evicted_overlap_ratio": (
                         normalized_vs_projected_overlap_ratio
                     ),
                 }
@@ -532,11 +559,11 @@ def compare_snapshot(
             result_payload["normalized_layer_svd_leverage"]["evicted_key"] = keys[
                 normalized_layer_svd["evict_indices"]
             ]
-        if projected_norm_layer is not None:
-            result_payload["projected_norm_layer_leverage"]["retained_key"] = keys[
+        for projected_policy_name, projected_norm_layer in projected_norm_layers.items():
+            result_payload[projected_policy_name]["retained_key"] = keys[
                 projected_norm_layer["retain_indices"]
             ]
-            result_payload["projected_norm_layer_leverage"]["evicted_key"] = keys[
+            result_payload[projected_policy_name]["evicted_key"] = keys[
                 projected_norm_layer["evict_indices"]
             ]
         if values is not None:
@@ -554,11 +581,11 @@ def compare_snapshot(
                 result_payload["normalized_layer_svd_leverage"]["evicted_value"] = values[
                     normalized_layer_svd["evict_indices"]
                 ]
-            if projected_norm_layer is not None:
-                result_payload["projected_norm_layer_leverage"]["retained_value"] = values[
+            for projected_policy_name, projected_norm_layer in projected_norm_layers.items():
+                result_payload[projected_policy_name]["retained_value"] = values[
                     projected_norm_layer["retain_indices"]
                 ]
-                result_payload["projected_norm_layer_leverage"]["evicted_value"] = values[
+                result_payload[projected_policy_name]["evicted_value"] = values[
                     projected_norm_layer["evict_indices"]
                 ]
 
@@ -597,12 +624,10 @@ def compare_snapshot(
             if normalized_layer_svd is not None
             else ""
         )
-        + (
-            f" projected_norm_layer={projected_norm_layer['evict_indices'].numel()} "
-            "mean_projected_norm_layer_overlap="
-            f"{result_payload['summary']['mean_vs_projected_norm_layer_evicted_overlap_ratio']:.4f}"
-            if projected_norm_layer is not None
-            else ""
+        + "".join(
+            f" {policy_name}={policy_result['evict_indices'].numel()} "
+            f"mean_overlap={result_payload['summary'][f'mean_vs_{policy_name}_evicted_overlap_ratio']:.4f}"
+            for policy_name, policy_result in projected_norm_layers.items()
         )
     )
 
@@ -699,6 +724,17 @@ def main() -> None:
         type=int,
         default=64,
         help="Projection dimension for projected_norm_layer_leverage right_sketch_ridge",
+    )
+    parser.add_argument(
+        "--projected_layer_leverage_ridge_dims",
+        "--projected-layer-leverage-ridge-dims",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated projection dimensions to evaluate in one pass. "
+            "When multiple dims are provided, output policy keys are suffixed, e.g. "
+            "projected_norm_layer_leverage_r64."
+        ),
     )
     parser.add_argument(
         "--projected_layer_leverage_ridge_lambda",
@@ -807,6 +843,9 @@ def main() -> None:
         "normalized_layer_svd_vs_projected_norm_layer_evicted_overlap_count",
         "normalized_layer_svd_vs_projected_norm_layer_evicted_overlap_ratio",
     ]
+    fieldnames = list(dict.fromkeys(fieldnames + sorted({
+        key for row in rows for key in row.keys() if key not in fieldnames
+    })))
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()

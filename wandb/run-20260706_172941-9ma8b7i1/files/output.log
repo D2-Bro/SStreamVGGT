@@ -1,0 +1,18 @@
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'num_processes' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'max_frames' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'budget_frame_multiplier' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'eval_frame_stride' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'layer_budget_alpha' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'layer_budget_value_gamma' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'leverage_ridge_dim' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'leverage_conf_gate_special_mode' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'leverage_conf_gate_floor' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'leverage_conf_gate_depth_alpha' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'leverage_conf_gate_point_beta' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'leverage_conf_gate_k' was locked by 'sweep' (ignored update).
+[34m[1mwandb[0m: [33mWARNING[0m Config item 'leverage_conf_gate_init' was locked by 'sweep' (ignored update).
+Traceback (most recent call last):
+  File "/home/dongjae/SStreamVGGT/tools/wandb_mv_recon_sweep.py", line 183, in main
+    str(cfg["layer_budget_min_tokens"]),
+        ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyError: 'layer_budget_min_tokens'

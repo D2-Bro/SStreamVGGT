@@ -1,0 +1,149 @@
+_wandb:
+    value:
+        cli_version: 0.28.0
+        e:
+            sux84578i8e8hg54bao8ntzw328jfjl6:
+                args:
+                    - --budget_frame_multiplier=8
+                    - --eval_frame_stride=5
+                    - --layer_budget_alpha=0
+                    - --layer_budget_value_gamma=0
+                    - --leverage_conf_gate_depth_alpha=0
+                    - --leverage_conf_gate_floor=0
+                    - --leverage_conf_gate_init=mean
+                    - --leverage_conf_gate_k=1
+                    - --leverage_conf_gate_point_beta=0
+                    - --leverage_conf_gate_special_mode=mean
+                    - --leverage_ridge_dim=64
+                    - --max_frames=500
+                    - --num_processes=3
+                codePath: tools/wandb_mv_recon_sweep.py
+                codePathLocal: tools/wandb_mv_recon_sweep.py
+                cpu_count: 128
+                cpu_count_logical: 256
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "7901523349504"
+                        used: "6757299408896"
+                email: vwjdehdwov@gmail.com
+                executable: /opt/conda/envs/OVGGT/bin/python
+                git:
+                    commit: 8aed0af22526f876944dec25438c87fb6a92df7d
+                    remote: https://github.com/D2-Bro/SStreamVGGT.git
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-faf616fa-bdbd-0876-866e-2f01af56a0e7
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-76b1c81d-41c8-a1cb-e195-bcfcce46e435
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-4315098c-610f-44bd-0cb9-0031172ad7a8
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-75985211-1763-dd91-b8ad-b23a2522547e
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-9db4ad15-8a8a-2dce-1acb-e7a62a9477d5
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-20172105-9088-144d-ef00-119a7d6f360f
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-5b074600-9e9c-88e9-0704-cb59a49090bd
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-afcaaaa1-2d92-ac14-3820-c8fb36c049d3
+                host: 40e28fcc17db
+                memory:
+                    total: "540815302656"
+                os: Linux-5.15.0-126-generic-x86_64-with-glibc2.35
+                program: /home/dongjae/SStreamVGGT/tools/wandb_mv_recon_sweep.py
+                python: CPython 3.11.15
+                root: /home/dongjae/SStreamVGGT
+                startedAt: "2026-07-06T06:49:21.796090Z"
+                writerId: sux84578i8e8hg54bao8ntzw328jfjl6
+        m: []
+        python_version: 3.11.15
+        t:
+            "3":
+                - 2
+                - 14
+            "4": 3.11.15
+            "5": 0.28.0
+            "12": 0.28.0
+            "13": linux-x86_64
+base_script:
+    value: src/eval/mv_recon/launch.py
+budget_frame_multiplier:
+    value: "8"
+eval_frame_stride:
+    value: 5
+layer_budget_alpha:
+    value: 0
+layer_budget_depth_floor:
+    value: 0.1
+layer_budget_depth_mu:
+    value: 0.6
+layer_budget_depth_sigma:
+    value: 0.2
+layer_budget_eps:
+    value: 1e-12
+layer_budget_min_tokens:
+    value: 0
+layer_budget_norm_source:
+    value: key
+layer_budget_value_gamma:
+    value: 0
+layer_budget_value_norm_type:
+    value: mean
+leverage_conf_gate_depth_alpha:
+    value: 0
+leverage_conf_gate_floor:
+    value: 0
+leverage_conf_gate_init:
+    value: mean
+leverage_conf_gate_k:
+    value: 1
+leverage_conf_gate_point_beta:
+    value: 0
+leverage_conf_gate_special_mode:
+    value: mean
+leverage_random_seed:
+    value: 42
+leverage_ridge_dim:
+    value: 64
+main_process_port:
+    value: 29469
+max_frames:
+    value: 500
+num_processes:
+    value: 3
+output_dir:
+    value: /home/dongjae/SStreamVGGT/eval_results/mv_recon/wandb_oqslj6dq_headNorm_a0_mu0.6_sig0.2_dim64_seed42_evalStride5_budgetFrameMult8
+reference_script:
+    value: src/eval/mv_recon/run_termProject_topK_conf_headNorm_evalStride_best.sh
+total_budget:
+    value: 200000
+weights:
+    value: ../ckpt/checkpoints.pth

@@ -1,0 +1,28 @@
+wandb_version: 1
+
+budget_frame_multiplier:
+  value: '5'
+eval_frame_stride:
+  value: 10
+layer_budget_alpha:
+  value: 0
+layer_budget_value_gamma:
+  value: 0
+leverage_conf_gate_depth_alpha:
+  value: 0
+leverage_conf_gate_floor:
+  value: 0
+leverage_conf_gate_init:
+  value: mean
+leverage_conf_gate_k:
+  value: 1
+leverage_conf_gate_point_beta:
+  value: 0
+leverage_conf_gate_special_mode:
+  value: mean
+leverage_ridge_dim:
+  value: 96
+max_frames:
+  value: 500
+num_processes:
+  value: 3

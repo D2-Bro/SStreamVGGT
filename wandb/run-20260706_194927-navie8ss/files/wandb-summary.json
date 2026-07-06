@@ -1,0 +1,1 @@
+{"_wandb":{"runtime":1759},"mean_fps":3.93,"mean_nc1_med":0.738,"mean_nc1":0.651,"_timestamp":1.78333672811636e+09,"mean_time":120.205,"mean_nc_med":0.729,"_step":0,"mean_comp_med":0.008,"mean_nc":0.646,"_runtime":1759,"mean_nc2":0.641,"mean_acc":0.039,"mean_nc2_med":0.721,"output_dir_exists":1,"mean_comp":0.027,"mean_acc_med":0.017}

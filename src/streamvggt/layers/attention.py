@@ -94,6 +94,8 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_normalize_before_projection: bool = False,
+        leverage_normalize_before_projection_headwise: bool = False,
         leverage_projected_key_cache: bool = False,
         leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
@@ -276,6 +278,8 @@ class Attention(nn.Module):
             leverage_projection,
             leverage_head_mean_dim,
             leverage_normalize_rows,
+            leverage_normalize_before_projection,
+            leverage_normalize_before_projection_headwise,
             leverage_projected_key_cache,
             leverage_approx_method,            leverage_ridge_lambda,
             leverage_ridge_lambda_mode,
@@ -324,6 +328,8 @@ class Attention(nn.Module):
                 leverage_projection=leverage_projection,
                 leverage_head_mean_dim=leverage_head_mean_dim,
                 leverage_normalize_rows=leverage_normalize_rows,
+                leverage_normalize_before_projection=leverage_normalize_before_projection,
+                leverage_normalize_before_projection_headwise=leverage_normalize_before_projection_headwise,
                 leverage_projected_key_cache=leverage_projected_key_cache,
                 leverage_approx_method=leverage_approx_method,                leverage_ridge_lambda=leverage_ridge_lambda,
                 leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
@@ -613,6 +619,8 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_normalize_before_projection: bool = False,
+        leverage_normalize_before_projection_headwise: bool = False,
         leverage_projected_key_cache: bool = False,
         leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
@@ -860,6 +868,8 @@ class Attention(nn.Module):
                     "leverage_feature": leverage_feature,
                     "leverage_projection": leverage_projection,
                     "leverage_head_mean_dim": leverage_head_mean_dim,
+                    "leverage_normalize_before_projection": leverage_normalize_before_projection,
+                    "leverage_normalize_before_projection_headwise": leverage_normalize_before_projection_headwise,
                     "leverage_projected_key_cache": leverage_projected_key_cache,
                     "leverage_approx_method": leverage_approx_method,                    "leverage_ridge_lambda": leverage_ridge_lambda,
                     "leverage_ridge_lambda_mode": leverage_ridge_lambda_mode,
@@ -908,6 +918,8 @@ class Attention(nn.Module):
                 }
                 if leverage_normalize_rows:
                     eviction_kwargs["leverage_normalize_rows"] = leverage_normalize_rows
+                eviction_kwargs["leverage_normalize_before_projection"] = leverage_normalize_before_projection
+                eviction_kwargs["leverage_normalize_before_projection_headwise"] = leverage_normalize_before_projection_headwise
                 effective_anchor_count = (
                     int(anchor_token_count)
                     if anchor_token_count is not None

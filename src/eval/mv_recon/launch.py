@@ -162,7 +162,7 @@ def get_args_parser():
     parser.add_argument("--freeze", action="store_true")
     parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
     parser.add_argument("--use_proj", action="store_true")
-    parser.add_argument("--eviction_policy", type=str, default="mean", help="Cache eviction policy: mean, baseline_mean, svd_leverage, or dpp")
+    parser.add_argument("--eviction_policy", type=str, default="svd_leverage", help="Cache eviction policy: mean, baseline_mean, svd_leverage, or dpp")
     parser.add_argument(
         "--eviction_policy_layers",
         "--eviction-policy-layers",
@@ -179,7 +179,7 @@ def get_args_parser():
     parser.add_argument(
         "--leverage_granularity",
         type=str,
-        default="head",
+        default="layer",
         choices=("head", "layer"),
         help="Granularity for svd_leverage eviction: per-head or one shared layer-wise score vector",
     )
@@ -211,6 +211,20 @@ def get_args_parser():
         help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
     )
     parser.add_argument(
+        "--leverage_normalize_before_projection",
+        "--leverage-normalize-before-projection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="L2-normalize layer-wise key rows before random leverage projection",
+    )
+    parser.add_argument(
+        "--leverage_normalize_before_projection_headwise",
+        "--leverage-normalize-before-projection-headwise",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When normalizing before projection, normalize each head key row independently",
+    )
+    parser.add_argument(
         "--leverage_projected_key_cache",
         "--leverage-projected-key-cache",
         action=argparse.BooleanOptionalAction,
@@ -221,7 +235,7 @@ def get_args_parser():
         "--leverage_approx_method",
         "--leverage-approx-method",
         type=str,
-        default="exact_qr",
+        default="right_sketch_ridge",
         choices=("exact_qr", "right_sketch", "full_d_ridge", "right_sketch_ridge"),
         help="Leverage approximation: exact QR, right-sketched/Compactor-style, or ridge-based scoring",
     )
@@ -229,14 +243,14 @@ def get_args_parser():
         "--leverage_ridge_lambda",
         "--leverage-ridge-lambda",
         type=float,
-        default=1e-3,
+        default=0,
         help="Ridge lambda for full_d_ridge and right_sketch_ridge leverage scoring",
     )
     parser.add_argument(
         "--leverage_ridge_lambda_mode",
         "--leverage-ridge-lambda-mode",
         type=str,
-        default="relative",
+        default="absolute",
         choices=("relative", "absolute"),
         help="Use absolute lambda or scale it by trace(X^T X) / D",
     )
@@ -278,7 +292,7 @@ def get_args_parser():
         "--leverage_random_seed",
         "--leverage-random-seed",
         type=int,
-        default=0,
+        default=42,
         help="Random seed for leverage sketches",
     )
     parser.add_argument(
@@ -969,6 +983,25 @@ def main(args):
             "Error: --leverage_approx_method right_sketch_ridge requires "
             "--leverage_ridge_dim >= 1."
         )
+    if args.leverage_normalize_before_projection_headwise and not args.leverage_normalize_before_projection:
+        raise SystemExit(
+            "Error: --leverage_normalize_before_projection_headwise requires "
+            "--leverage_normalize_before_projection."
+        )
+    if args.leverage_normalize_before_projection:
+        if args.eviction_policy != "svd_leverage":
+            raise SystemExit("Error: --leverage_normalize_before_projection requires --eviction_policy svd_leverage.")
+        if args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_granularity layer.")
+        if args.leverage_feature != "key":
+            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_feature key.")
+        if args.leverage_projection != "random":
+            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_projection random.")
+        if args.leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+            raise SystemExit(
+                "Error: --leverage_normalize_before_projection requires --leverage_approx_method "
+                "right_sketch or right_sketch_ridge."
+            )
     if args.leverage_projected_key_cache:
         if args.eviction_policy != "svd_leverage":
             raise SystemExit("Error: --leverage_projected_key_cache requires --eviction_policy svd_leverage.")
@@ -1025,6 +1058,8 @@ def main(args):
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
+            f"normalize_before_projection={args.leverage_normalize_before_projection}, "
+            f"normalize_before_projection_headwise={args.leverage_normalize_before_projection_headwise}, "
             f"projected_key_cache={args.leverage_projected_key_cache}, "
             f"selector={args.leverage_eviction_selector}, "
             f"risk_mode={args.leverage_eviction_risk_mode}, "
@@ -1153,15 +1188,15 @@ def main(args):
         ),
         # "ETH3D": ETH3D
             # 20),
-        "NRGBD": NRGBD(
-            split="test",
-            ROOT="/home/dongjae/data/neural_rgbd_data",
-            resolution=resolution,
-            num_seq=1,
-            full_video=True,
-            kf_every=2,
-            max_frames=args.max_frames,
-        ),
+        # "NRGBD": NRGBD(
+        #     split="test",
+        #     ROOT="/home/dongjae/data/neural_rgbd_data",
+        #     resolution=resolution,
+        #     num_seq=1,
+        #     full_video=True,
+        #     kf_every=2,
+        #     max_frames=args.max_frames,
+        # ),
         # "Replica": Replica(
         #     split="test",
         #     ROOT=os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica"),
@@ -1438,6 +1473,8 @@ def main(args):
                                     leverage_projection=args.leverage_projection,
                                     leverage_head_mean_dim=args.leverage_head_mean_dim,
                                     leverage_normalize_rows=args.leverage_normalize_rows,
+                                    leverage_normalize_before_projection=args.leverage_normalize_before_projection,
+                                    leverage_normalize_before_projection_headwise=args.leverage_normalize_before_projection_headwise,
                                     leverage_projected_key_cache=args.leverage_projected_key_cache,
                                     leverage_approx_method=args.leverage_approx_method,
                                     leverage_ridge_lambda=args.leverage_ridge_lambda,

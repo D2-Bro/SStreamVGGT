@@ -429,6 +429,8 @@ class EvictionManager:
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_normalize_before_projection: bool = False,
+        leverage_normalize_before_projection_headwise: bool = False,
         leverage_projected_key_cache: bool = False,
         leverage_approx_method: str = "right_sketch",
         leverage_ridge_lambda: float = 1e-3,
@@ -653,6 +655,26 @@ class EvictionManager:
                 "leverage_similarity_feature_projection='random' reuses projected leverage features "
                 "and requires leverage_approx_method='right_sketch' or 'right_sketch_ridge'"
             )
+        if leverage_normalize_before_projection:
+            if policy != "svd_leverage":
+                raise ValueError("leverage_normalize_before_projection requires policy='svd_leverage'")
+            if leverage_granularity != "layer":
+                raise ValueError("leverage_normalize_before_projection requires leverage_granularity='layer'")
+            if leverage_feature != "key":
+                raise ValueError("leverage_normalize_before_projection requires leverage_feature='key'")
+            if leverage_projection != "random":
+                raise ValueError("leverage_normalize_before_projection requires leverage_projection='random'")
+            if leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+                raise ValueError(
+                    "leverage_normalize_before_projection requires "
+                    "leverage_approx_method='right_sketch' or 'right_sketch_ridge'"
+                )
+        if leverage_normalize_before_projection_headwise and not leverage_normalize_before_projection:
+            raise ValueError(
+                "leverage_normalize_before_projection_headwise requires "
+                "leverage_normalize_before_projection=True"
+            )
+
         if leverage_projected_key_cache:
             if policy != "svd_leverage":
                 raise ValueError("leverage_projected_key_cache requires policy='svd_leverage'")
@@ -682,6 +704,8 @@ class EvictionManager:
         self.leverage_projection = leverage_projection
         self.leverage_head_mean_dim = int(leverage_head_mean_dim)
         self.leverage_normalize_rows = bool(leverage_normalize_rows)
+        self.leverage_normalize_before_projection = bool(leverage_normalize_before_projection)
+        self.leverage_normalize_before_projection_headwise = bool(leverage_normalize_before_projection_headwise)
         self.leverage_projected_key_cache = bool(leverage_projected_key_cache)
         self.leverage_approx_method = leverage_approx_method
         self.leverage_ridge_lambda = float(leverage_ridge_lambda)
@@ -1012,6 +1036,8 @@ class EvictionManager:
                 msg += (
                     f" layer_budget_strategy={self.layer_budget_strategy} "
                     f"leverage_approx_method={self.leverage_approx_method} "
+                    f"leverage_normalize_before_projection={self.leverage_normalize_before_projection} "
+                    f"leverage_normalize_before_projection_headwise={self.leverage_normalize_before_projection_headwise} "
                     f" leverage_sketch_dim={sketch_label} "
                     f"leverage_ridge_lambda={self.leverage_ridge_lambda} "
                     f"leverage_ridge_lambda_mode={self.leverage_ridge_lambda_mode} "
@@ -1996,6 +2022,8 @@ class EvictionManager:
             "head_dim": int(head_dim),
             "sketch_dim": int(sketch_dim),
             "device": str(device),
+            "normalize_before_projection": bool(self.leverage_normalize_before_projection),
+            "normalize_before_projection_headwise": bool(self.leverage_normalize_before_projection_headwise),
         }
 
     def _projected_key_cache_length(
@@ -2038,7 +2066,17 @@ class EvictionManager:
             return 0
         return cache_len
 
+    def _normalize_layer_key_before_projection(self, mat_k: torch.Tensor) -> torch.Tensor:
+        if not self.leverage_normalize_before_projection:
+            return mat_k
+        if self.leverage_normalize_before_projection_headwise:
+            norm = mat_k.square().sum(dim=3, keepdim=True).sqrt().clamp_min(1e-12)
+        else:
+            norm = mat_k.square().sum(dim=(1, 3), keepdim=True).sqrt().clamp_min(1e-12)
+        return mat_k / norm
+
     def _project_key_with_omega(self, mat_k: torch.Tensor, omega_key: torch.Tensor):
+        mat_k = self._normalize_layer_key_before_projection(mat_k)
         head_projected_raw = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
         layer_projected_raw = head_projected_raw.sum(dim=1)
         pre_norms = torch.linalg.vector_norm(layer_projected_raw.detach(), ord=2, dim=-1)
@@ -3671,6 +3709,7 @@ class EvictionManager:
                     profile,
                 )
             else:
+                mat_k = self._normalize_layer_key_before_projection(mat_k)
                 head_key_matrix = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
                 if lowdim_concat:
                     if mat_v is None or omega_value is None:

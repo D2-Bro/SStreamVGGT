@@ -1,0 +1,38 @@
+program: tools/wandb_mv_recon_sweep.py
+project: sstreamvggt-mv-recon
+name: mv-recon-termproject-headnorm
+method: grid
+
+metric:
+  name: mean_acc
+  goal: minimize
+
+parameters:
+  num_processes:
+    value: 3
+  max_frames:
+    value: 500
+  budget_frame_multiplier:
+    values: ["5", "6", "7", "8", "9", "10"]
+  eval_frame_stride:
+    value: 10
+
+  layer_budget_alpha:
+    values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  layer_budget_value_gamma:
+    values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+  leverage_ridge_dim:
+    values: [64, 96, 128, 160, 192, 224, 256]
+  leverage_conf_gate_special_mode:
+    value: mean
+  leverage_conf_gate_init:
+    value: mean
+  leverage_conf_gate_floor:
+    values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  leverage_conf_gate_depth_alpha:
+    values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  leverage_conf_gate_point_beta:
+    values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  leverage_conf_gate_k:
+    values: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]

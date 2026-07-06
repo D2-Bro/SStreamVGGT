@@ -1,0 +1,32 @@
+{
+  "os": "Linux-5.15.0-126-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.11.15",
+  "startedAt": "2026-07-06T08:29:47.003320Z",
+  "args": [
+    "--budget_frame_multiplier=5",
+    "--eval_frame_stride=10",
+    "--layer_budget_alpha=0",
+    "--layer_budget_value_gamma=0",
+    "--leverage_conf_gate_depth_alpha=0",
+    "--leverage_conf_gate_floor=0",
+    "--leverage_conf_gate_init=mean",
+    "--leverage_conf_gate_k=1",
+    "--leverage_conf_gate_point_beta=0",
+    "--leverage_conf_gate_special_mode=mean",
+    "--leverage_ridge_dim=96",
+    "--max_frames=500",
+    "--num_processes=3"
+  ],
+  "program": "/home/dongjae/SStreamVGGT/tools/wandb_mv_recon_sweep.py",
+  "codePath": "tools/wandb_mv_recon_sweep.py",
+  "codePathLocal": "tools/wandb_mv_recon_sweep.py",
+  "git": {
+    "remote": "https://github.com/D2-Bro/SStreamVGGT.git",
+    "commit": "8aed0af22526f876944dec25438c87fb6a92df7d"
+  },
+  "email": "vwjdehdwov@gmail.com",
+  "root": "/home/dongjae/SStreamVGGT",
+  "host": "40e28fcc17db",
+  "executable": "/opt/conda/envs/OVGGT/bin/python",
+  "writerId": "qjoc4kefvfg8erzne57whht47kxkjn8i"
+}

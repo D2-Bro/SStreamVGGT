@@ -13,13 +13,29 @@ import torch
 import torch.nn.functional as F
 
 
-POLICIES = (
+PREFERRED_POLICIES = (
     "mean",
     "svd_leverage",
     "layer_svd_leverage",
     "normalized_layer_svd_leverage",
     "projected_norm_layer_leverage",
 )
+
+
+def comparison_policies(comparison: dict) -> tuple[str, ...]:
+    policies = [policy for policy in PREFERRED_POLICIES if policy in comparison]
+    extras = sorted(
+        key
+        for key, value in comparison.items()
+        if key not in policies and isinstance(value, dict) and "evict_indices" in value
+    )
+    return tuple(policies + extras)
+
+def ordered_row_policies(rows: list[dict]) -> tuple[str, ...]:
+    seen = {row["policy"] for row in rows}
+    preferred = [policy for policy in PREFERRED_POLICIES if policy in seen]
+    extras = sorted(policy for policy in seen if policy not in preferred)
+    return tuple(preferred + extras)
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,9 +152,7 @@ def main() -> None:
         keys = source["old_key"].float()
         meta = comparison["meta"]
 
-        for policy in POLICIES:
-            if policy not in comparison:
-                continue
+        for policy in comparison_policies(comparison):
             row = {
                 "policy": policy,
                 "layer_id": int(meta["layer_id"]),
@@ -155,6 +169,7 @@ def main() -> None:
 
     print(f"rows {len(rows)}")
 
+    policies = ordered_row_policies(rows)
     summary: dict[str, object] = {"rows": rows, "aggregates": {}}
     aggregates = summary["aggregates"]
     assert isinstance(aggregates, dict)
@@ -165,7 +180,7 @@ def main() -> None:
         for metric in ("mean", "median", "p95", "p99", "max", "frac_gt_2", "frac_gt_5", "frac_gt_10"):
             print(f"\nncd{k}_{metric}")
             aggregates[f"ncd{k}"][metric] = {}
-            for policy in POLICIES:
+            for policy in policies:
                 stats = stat([row[f"ncd{k}_{metric}"] for row in rows if row["policy"] == policy])
                 if stats is None:
                     continue
@@ -175,7 +190,7 @@ def main() -> None:
     for k in args.k:
         for metric in ("p95", "frac_gt_5", "frac_gt_10"):
             print(f"\nlayer means ncd{k}_{metric}")
-            for policy in POLICIES:
+            for policy in policies:
                 by_layer = defaultdict(list)
                 for row in rows:
                     if row["policy"] == policy:
