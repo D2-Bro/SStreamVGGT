@@ -78,7 +78,7 @@ if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
 
-output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_confDepth_spe${leverage_conf_gate_special_mode}_init${leverage_conf_gate_init}_headNorm_evalStride${eval_frame_stride}_${layer_budget_strategy}${layer_budget_depth_mu}${layer_budget_depth_sigma}f${layer_budget_depth_floor}_${budget_suffix}_seed${leverage_random_seed}_chunk4"
+output_dir="${workdir}/eval_results/mv_recon/S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_noCrop_icpvox${icp_voxel_size}_confDepth_spe${leverage_conf_gate_special_mode}_init${leverage_conf_gate_init}_headNorm_evalStride${eval_frame_stride}_${layer_budget_strategy}${layer_budget_depth_mu}${layer_budget_depth_sigma}f${layer_budget_depth_floor}_${budget_suffix}_seed${leverage_random_seed}_chunk1_cacheRLS4"
 projected_norm_histogram_dir="${output_dir}/projected_norm_histograms"
 budget_distribution_dir="${output_dir}/budget_distribution"
 echo "$output_dir"
@@ -142,7 +142,8 @@ accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/la
     --eval_frame_stride "$eval_frame_stride" \
     --leverage_normalize_before_projection \
     --leverage_normalize_before_projection_headwise \
-    --stream_chunk_size 4 \
+    --stream_chunk_size 1 \
+    --rls_refresh_interval 4 \
     "${first_frame_special_args[@]}" \
 # Add --profile_eviction to the launch command above when measuring eviction latency.
 

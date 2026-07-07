@@ -859,32 +859,45 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 pts3d_conf = pts3d_conf_all[:, local_idx]
 
                 if leverage_conf_gate:
-                    token_depth_conf = sample_token_confidence(
-                        depth_conf,
-                        images.shape[-2:],
-                        tokens_per_frame,
-                        self.aggregator.patch_start_idx,
-                        self.aggregator.patch_size,
-                    )
-                    token_point_conf = sample_token_confidence(
-                        pts3d_conf if self.point_head is not None else None,
-                        images.shape[-2:],
-                        tokens_per_frame,
-                        self.aggregator.patch_start_idx,
-                        self.aggregator.patch_size,
-                        batch_size=token_depth_conf.shape[0],
-                        device=token_depth_conf.device,
-                    )
-                    token_conf_gate = make_token_confidence_gate(
-                        token_depth_conf,
-                        token_point_conf,
-                        floor=leverage_conf_gate_floor,
-                        depth_alpha=leverage_conf_gate_depth_alpha,
-                        point_beta=leverage_conf_gate_point_beta,
-                        normalizer_k=leverage_conf_gate_k,
-                        preserve_prefix_tokens=self.aggregator.patch_start_idx,
-                        prefix_token_mode=leverage_conf_gate_special_mode,
-                    )
+                    use_depth_conf = float(leverage_conf_gate_depth_alpha) != 0.0
+                    use_point_conf = float(leverage_conf_gate_point_beta) != 0.0
+                    token_depth_conf = None
+                    token_point_conf = None
+                    if use_depth_conf:
+                        token_depth_conf = sample_token_confidence(
+                            depth_conf,
+                            images.shape[-2:],
+                            tokens_per_frame,
+                            self.aggregator.patch_start_idx,
+                            self.aggregator.patch_size,
+                        )
+                    if use_point_conf:
+                        token_point_conf = sample_token_confidence(
+                            pts3d_conf if self.point_head is not None else None,
+                            images.shape[-2:],
+                            tokens_per_frame,
+                            self.aggregator.patch_start_idx,
+                            self.aggregator.patch_size,
+                            batch_size=depth_conf.shape[0],
+                            device=depth_conf.device,
+                        )
+                    if token_depth_conf is None and token_point_conf is None:
+                        token_conf_gate = torch.ones(
+                            (depth_conf.shape[0], tokens_per_frame),
+                            device=depth_conf.device,
+                            dtype=torch.float32,
+                        )
+                    else:
+                        token_conf_gate = make_token_confidence_gate(
+                            token_depth_conf,
+                            token_point_conf,
+                            floor=leverage_conf_gate_floor,
+                            depth_alpha=leverage_conf_gate_depth_alpha,
+                            point_beta=leverage_conf_gate_point_beta,
+                            normalizer_k=leverage_conf_gate_k,
+                            preserve_prefix_tokens=self.aggregator.patch_start_idx,
+                            prefix_token_mode=leverage_conf_gate_special_mode,
+                        )
                     for layer_id, layer_kv in enumerate(past_key_values):
                         if layer_kv is None:
                             continue

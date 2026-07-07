@@ -189,6 +189,9 @@ class Aggregator(nn.Module):
         self._dynamic_budget_profile_total = 0.0
         self._dynamic_budget_profile_count = 0
         for block in list(self.frame_blocks) + list(self.global_blocks):
+            reset_block_profile = getattr(block, "reset_profile_stats", None)
+            if reset_block_profile is not None:
+                reset_block_profile()
             reset = getattr(getattr(block, "attn", None), "_reset_cache_state", None)
             if reset is not None:
                 reset()
@@ -473,7 +476,7 @@ class Aggregator(nn.Module):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos, profile_eviction=profile_eviction
                     )
                     for _ in frame_intermediates:
                         self._record_global_attn_debug(
@@ -784,7 +787,7 @@ class Aggregator(nn.Module):
             return output_list, self.patch_start_idx, past_key_values
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, profile_eviction: bool = False):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -800,13 +803,13 @@ class Aggregator(nn.Module):
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
 
-            tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+            tokens = self.frame_blocks[frame_idx](tokens, pos=pos, profile_eviction=profile_eviction)
             frame_idx += 1
             intermediates.append(tokens.reshape(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention_as_frame(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention_as_frame(self, tokens, B, S, P, C, global_idx, pos=None, profile_eviction: bool = False):
         """
         Run an original global block independently per current frame/token group.
         This intentionally bypasses any streaming KV cache reads/writes.
@@ -821,7 +824,7 @@ class Aggregator(nn.Module):
         if pos is not None:
             assert pos.shape == (B * S, P, 2), f"Expected disabled global pos {(B * S, P, 2)}, got {pos.shape}"
 
-        tokens = self.global_blocks[global_idx](tokens, pos=pos)
+        tokens = self.global_blocks[global_idx](tokens, pos=pos, profile_eviction=profile_eviction)
         assert tokens.shape == (B * S, P, C), f"Expected disabled global output {(B * S, P, C)}, got {tokens.shape}"
         intermediate = tokens.reshape(B, S, P, C)
         assert intermediate.shape == (B, S, P, C), f"Expected disabled global intermediate {(B, S, P, C)}, got {intermediate.shape}"
@@ -1077,11 +1080,11 @@ class Aggregator(nn.Module):
                             )
                 else:
                     tokens, global_idx, block_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos, block_count=1
+                        tokens, B, S, P, C, global_idx, pos=pos, block_count=1, profile_eviction=profile_eviction
                     )
             else:
                 tokens, global_idx, block_intermediates = self._process_global_attention_as_frame(
-                    tokens, B, S, P, C, global_idx, pos=pos
+                    tokens, B, S, P, C, global_idx, pos=pos, profile_eviction=profile_eviction
                 )
 
             intermediates.extend(block_intermediates)
@@ -1325,7 +1328,7 @@ class Aggregator(nn.Module):
                 else:
                     tokens, block_kv, scores = block_result
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask, profile_eviction=profile_eviction)
 
             global_idx += 1
             intermediates.append(tokens.reshape(B, S, P, C))
@@ -1944,12 +1947,99 @@ class Aggregator(nn.Module):
                 "normalization",
                 "gram",
                 "cholesky",
+                "inverse_build",
                 "score_calc",
                 "total",
             ],
         )
         if leverage_line is not None:
             lines.append(leverage_line)
+
+        def _collect_block_profile(blocks):
+            totals: Dict[str, float] = {}
+            count = 0
+            for block in blocks:
+                get_stats = getattr(block, "get_block_profile_stats", None)
+                if get_stats is None:
+                    continue
+                stats = get_stats()
+                count += int(stats.get("count", 0))
+                for name, value in stats.get("totals", {}).items():
+                    totals[name] = totals.get(name, 0.0) + float(value)
+            return count, totals
+
+        frame_block_count, frame_block_totals = _collect_block_profile(self.frame_blocks)
+        frame_block_line = self._format_profile_line(
+            "frame_block",
+            frame_block_count,
+            frame_block_totals,
+            ["block", "attention", "mlp", "noncache_block", "noncache_attention", "noncache_mlp"],
+        )
+        if frame_block_line is not None:
+            lines.append(frame_block_line)
+
+        global_block_count, global_block_totals = _collect_block_profile(self.global_blocks)
+        global_block_line = self._format_profile_line(
+            "global_block",
+            global_block_count,
+            global_block_totals,
+            [
+                "block",
+                "attention",
+                "mlp",
+                "cache_block",
+                "cache_attention",
+                "cache_mlp",
+                "noncache_block",
+                "noncache_attention",
+                "noncache_mlp",
+            ],
+        )
+        if global_block_line is not None:
+            lines.append(global_block_line)
+
+        def _collect_attention_forward_profile(blocks):
+            totals: Dict[str, float] = {}
+            count = 0
+            for block in blocks:
+                attn = getattr(block, "attn", None)
+                get_stats = getattr(attn, "get_eviction_profile_stats", None)
+                if get_stats is None:
+                    continue
+                stats = get_stats()
+                count += int(stats.get("attention_forward_count", 0))
+                for name, value in stats.get("attention_forward_totals", {}).items():
+                    totals[name] = totals.get(name, 0.0) + float(value)
+            return count, totals
+
+        attention_forward_keys = [
+            "forward_total",
+            "qkv_projection",
+            "qk_norm_rope",
+            "cache_concat_update",
+            "cache_read_prepare",
+            "attention_kernel",
+            "output_projection",
+        ]
+        frame_attention_count, frame_attention_totals = _collect_attention_forward_profile(self.frame_blocks)
+        frame_attention_line = self._format_profile_line(
+            "frame_attention",
+            frame_attention_count,
+            frame_attention_totals,
+            attention_forward_keys,
+        )
+        if frame_attention_line is not None:
+            lines.append(frame_attention_line)
+
+        global_attention_count, global_attention_totals = _collect_attention_forward_profile(self.global_blocks)
+        global_attention_line = self._format_profile_line(
+            "global_attention",
+            global_attention_count,
+            global_attention_totals,
+            attention_forward_keys,
+        )
+        if global_attention_line is not None:
+            lines.append(global_attention_line)
 
         if total_inference_time is not None:
             count = int(frame_count) if frame_count is not None else 0

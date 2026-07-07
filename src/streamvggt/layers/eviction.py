@@ -1151,6 +1151,7 @@ class EvictionManager:
                     "omega_gemm",
                     "gram",
                     "cholesky",
+                    "inverse_build",
                     "score_solve",
                     "scoring",
                     "score_calc",
@@ -1189,6 +1190,7 @@ class EvictionManager:
                 "omega_gemm",
                 "gram",
                 "cholesky",
+                "inverse_build",
                 "score_solve",
                 "scoring",
                 "score_calc",
@@ -3357,6 +3359,17 @@ class EvictionManager:
                     profile["lambda_value"] = float(torch.nan_to_num(lam.detach().float()).mean().item())
                     profile["cholesky_retries"] = float(retries)
 
+                if chol is not None:
+                    inverse_start = time.perf_counter() if do_profile else 0.0
+                    try:
+                        inv_a = torch.cholesky_inverse(chol)
+                    except RuntimeError:
+                        inv_a = None
+                    if do_profile:
+                        sync_tensor = inv_a if inv_a is not None else chol
+                        self._sync_for_timing(sync_tensor)
+                        profile["inverse_build"] = time.perf_counter() - inverse_start
+
                 if chol is not None or inv_a is not None:
                     self.cached_ktk = gram.detach()
                     self.cached_rls_chol = chol.detach() if chol is not None else None
@@ -3386,6 +3399,7 @@ class EvictionManager:
                 if do_profile:
                     profile["gram"] = 0.0
                     profile["cholesky"] = 0.0
+                    profile["inverse_build"] = 0.0
                     profile["lambda_value"] = float(torch.nan_to_num(lam.detach().float()).mean().item())
                     profile["cholesky_retries"] = 0.0
 
@@ -3395,7 +3409,12 @@ class EvictionManager:
             profile["rls_cache_hit_count"] = float(self.rls_cache_hit_count)
 
             score_start = time.perf_counter() if do_profile else 0.0
-            if chol is not None:
+            if inv_a is not None:
+                transformed = work @ inv_a
+                scores = (transformed * work).sum(dim=-1)
+                fallback = fallback_state
+                score_backend = "pinv" if chol is None else "inverse"
+            elif chol is not None:
                 chunks = []
                 chunk_size = int(self.leverage_ridge_score_chunk_size)
                 for start in range(0, num_tokens, chunk_size):
@@ -3405,13 +3424,11 @@ class EvictionManager:
                     chunks.append((rhs * solved).sum(dim=-2))
                 scores = torch.cat(chunks, dim=-1) if chunks else torch.empty(*work.shape[:-1], device=work.device, dtype=torch.float32)
                 fallback = 0.0
-            elif inv_a is not None:
-                transformed = work @ inv_a
-                scores = (transformed * work).sum(dim=-1)
-                fallback = 1.0
+                score_backend = "chol_solve"
             else:
                 scores = work.square().sum(dim=-1)
                 fallback = max(fallback_state, 2.0)
+                score_backend = "norm_fallback"
             scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
             self._maybe_print_leverage_diag(
                 scores=scores,
@@ -3427,6 +3444,7 @@ class EvictionManager:
                 profile["score_solve"] = time.perf_counter() - score_start
                 profile["scoring"] = profile["score_solve"]
                 profile["fallback"] = fallback
+                profile["score_backend"] = score_backend
                 profile["score_min"] = float(scores.min().item()) if scores.numel() > 0 else 0.0
                 profile["score_max"] = float(scores.max().item()) if scores.numel() > 0 else 0.0
                 profile["score_mean"] = float(scores.mean().item()) if scores.numel() > 0 else 0.0

@@ -1,5 +1,7 @@
 import logging
 import os
+import time
+import inspect
 from typing import Callable, List, Any, Tuple, Dict, Union, Optional, Set
 import warnings
 
@@ -67,6 +69,37 @@ class Block(nn.Module):
         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.sample_drop_ratio = drop_path
+        self._block_profile_totals = {}
+        self._block_profile_count = 0
+
+    def _profile_sync(self, tensor: Optional[Tensor]) -> None:
+        if tensor is not None and tensor.is_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize(tensor.device)
+
+    def _profile_start(self, tensor: Optional[Tensor], enabled: bool) -> float:
+        if not enabled:
+            return 0.0
+        self._profile_sync(tensor)
+        return time.perf_counter()
+
+    def _profile_record(self, name: str, start: float, tensor: Optional[Tensor], enabled: bool) -> None:
+        if not enabled:
+            return
+        self._profile_sync(tensor)
+        self._block_profile_totals[name] = self._block_profile_totals.get(name, 0.0) + (time.perf_counter() - start)
+
+    def reset_profile_stats(self) -> None:
+        self._block_profile_totals = {}
+        self._block_profile_count = 0
+        reset = getattr(self.attn, "reset_profile_stats", None)
+        if reset is not None:
+            reset()
+
+    def get_block_profile_stats(self) -> Dict[str, Any]:
+        return {
+            "count": self._block_profile_count,
+            "totals": dict(self._block_profile_totals),
+        }
 
     def forward(
         self,
@@ -256,23 +289,37 @@ class Block(nn.Module):
                 output, new_kv, scores = attn_result
                 return self.ls1(output), new_kv, scores
             else:
+                attn_kwargs = {"pos": pos}
                 if attn_mask is not None:
-                    return self.ls1(self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask))
-                else:
-                    return self.ls1(self.attn(self.norm1(x), pos=pos))
+                    attn_kwargs["attn_mask"] = attn_mask
+                if "profile_eviction" in inspect.signature(self.attn.forward).parameters:
+                    attn_kwargs["profile_eviction"] = profile_eviction
+                return self.ls1(self.attn(self.norm1(x), **attn_kwargs))
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
         
+        profile_block = bool(profile_eviction)
+
         if use_cache:
+            block_start = self._profile_start(x, profile_block)
+            attn_start = self._profile_start(x, profile_block)
             cache_result = attn_residual_func(x, pos=pos, past_key_values=past_key_values, use_cache=True, cache_budget=cache_budget)
-            if len(cache_result) == 4:
-                attn_output, new_kv, scores, special_kv_sidecar = cache_result
-                x = x + attn_output
-                x = x + ffn_residual_func(x)
-                return x, new_kv, scores, special_kv_sidecar
-            attn_output, new_kv, scores = cache_result
+            attn_output = cache_result[0]
+            self._profile_record("attention", attn_start, attn_output, profile_block)
+            self._profile_record("cache_attention", attn_start, attn_output, profile_block)
             x = x + attn_output
-            x = x + ffn_residual_func(x)
+            mlp_start = self._profile_start(x, profile_block)
+            mlp_output = ffn_residual_func(x)
+            self._profile_record("mlp", mlp_start, mlp_output, profile_block)
+            self._profile_record("cache_mlp", mlp_start, mlp_output, profile_block)
+            x = x + mlp_output
+            self._profile_record("block", block_start, x, profile_block)
+            self._profile_record("cache_block", block_start, x, profile_block)
+            self._block_profile_count += 1 if profile_block else 0
+            if len(cache_result) == 4:
+                _, new_kv, scores, special_kv_sidecar = cache_result
+                return x, new_kv, scores, special_kv_sidecar
+            _, new_kv, scores = cache_result
             return x, new_kv, scores
 
         if self.training and self.sample_drop_ratio > 0.1:
@@ -292,8 +339,20 @@ class Block(nn.Module):
             x = x + self.drop_path1(attn_residual_func(x, pos=pos, attn_mask=attn_mask))
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x, pos=pos, attn_mask=attn_mask)
-            x = x + ffn_residual_func(x)
+            block_start = self._profile_start(x, profile_block)
+            attn_start = self._profile_start(x, profile_block)
+            attn_output = attn_residual_func(x, pos=pos, attn_mask=attn_mask)
+            self._profile_record("attention", attn_start, attn_output, profile_block)
+            self._profile_record("noncache_attention", attn_start, attn_output, profile_block)
+            x = x + attn_output
+            mlp_start = self._profile_start(x, profile_block)
+            mlp_output = ffn_residual_func(x)
+            self._profile_record("mlp", mlp_start, mlp_output, profile_block)
+            self._profile_record("noncache_mlp", mlp_start, mlp_output, profile_block)
+            x = x + mlp_output
+            self._profile_record("block", block_start, x, profile_block)
+            self._profile_record("noncache_block", block_start, x, profile_block)
+            self._block_profile_count += 1 if profile_block else 0
         return x
 
 def drop_add_residual_stochastic_depth(

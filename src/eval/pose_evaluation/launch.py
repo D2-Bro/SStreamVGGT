@@ -268,6 +268,27 @@ def validate_streamvggt_args(args):
                 "Error: --leverage_normalize_before_projection requires --leverage_approx_method "
                 "exact_qr, right_sketch, or right_sketch_ridge."
             )
+    if args.leverage_projected_key_cache:
+        if args.eviction_policy != "svd_leverage":
+            raise SystemExit("Error: --leverage_projected_key_cache requires --eviction_policy svd_leverage.")
+        if args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_granularity layer.")
+        if args.leverage_feature != "key":
+            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_feature key.")
+        if args.leverage_projection != "random":
+            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_projection random.")
+        if args.leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+            raise SystemExit(
+                "Error: --leverage_projected_key_cache requires --leverage_approx_method "
+                "right_sketch or right_sketch_ridge."
+            )
+        if args.leverage_eviction_selector == "layer_head_fast_dpp" or (
+            args.leverage_eviction_selector == "similarity_topk"
+            and args.leverage_similarity_granularity == "head"
+        ):
+            raise SystemExit(
+                "Error: --leverage_projected_key_cache only supports shared layer keep-set selectors."
+            )
     if args.layer_budget_strategy not in ("uniform", "cosine_precomputed") and (
         args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
     ):
@@ -302,6 +323,7 @@ def validate_streamvggt_args(args):
             f"normalize_rows={args.leverage_normalize_rows}, "
             f"normalize_before_projection={args.leverage_normalize_before_projection}, "
             f"normalize_before_projection_headwise={args.leverage_normalize_before_projection_headwise}, "
+            f"projected_key_cache={args.leverage_projected_key_cache}, "
             f"selector={args.leverage_eviction_selector}, "
             f"risk_mode={args.leverage_eviction_risk_mode}, "
             f"high_outlier_z={args.leverage_high_outlier_z}, "
@@ -501,6 +523,13 @@ def get_args_parser():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="When normalizing before projection, normalize each head key row independently",
+    )
+    parser.add_argument(
+        "--leverage_projected_key_cache",
+        "--leverage-projected-key-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reuse cached layer-wise random projected key features for surviving tokens",
     )
     parser.add_argument(
         "--leverage_approx_method",
@@ -1195,6 +1224,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_normalize_rows=args.leverage_normalize_rows,
                             leverage_normalize_before_projection=args.leverage_normalize_before_projection,
                             leverage_normalize_before_projection_headwise=args.leverage_normalize_before_projection_headwise,
+                            leverage_projected_key_cache=args.leverage_projected_key_cache,
                             leverage_approx_method=args.leverage_approx_method,
                             leverage_ridge_lambda=args.leverage_ridge_lambda,
                             leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,

@@ -158,6 +158,33 @@ def check_backward_reuse_path() -> None:
         raise AssertionError("backward through cached RLS scoring path did not produce a valid gradient")
 
 
+def check_inverse_backend_matches_cholesky_solve() -> None:
+    torch.manual_seed(23)
+    manager = _manager("full_d_ridge", interval=4, profile=True)
+    for frame_idx in (0, 1):
+        mat = torch.randn(11, 5)
+        _set_frame(manager, frame_idx)
+        scores = manager.compute_svd_leverage_scores(mat)
+        profile = manager._last_leverage_profile
+        if manager.cached_rls_inv is None or manager.cached_rls_chol is None:
+            raise AssertionError("expected both cached inverse and cached Cholesky factor")
+        if profile.get("score_backend") != "inverse":
+            raise AssertionError(f"expected inverse scoring backend, got {profile}")
+        work = torch.nan_to_num(mat.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        rhs = work.transpose(-2, -1).contiguous()
+        solved = torch.cholesky_solve(rhs, manager.cached_rls_chol)
+        expected = torch.nan_to_num((rhs * solved).sum(dim=-2), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        if not torch.allclose(scores, expected, atol=1e-4, rtol=1e-4):
+            raise AssertionError("inverse-cache scores differ from Cholesky-solve reference")
+    if manager.rls_refresh_count != 1 or manager.rls_cache_hit_count != 1:
+        raise AssertionError(
+            f"expected one refresh and one cache hit, got refresh={manager.rls_refresh_count} "
+            f"hits={manager.rls_cache_hit_count}"
+        )
+    if float(manager._last_leverage_profile.get("inverse_build", -1.0)) != 0.0:
+        raise AssertionError(f"cache-hit profile should not rebuild inverse: {manager._last_leverage_profile}")
+
+
 def check_invalid_interval() -> None:
     try:
         _manager("full_d_ridge", interval=0)
@@ -177,6 +204,7 @@ def main() -> None:
     if torch.cuda.is_available():
         check_device_dtype(torch.device("cuda"))
     check_backward_reuse_path()
+    check_inverse_backend_matches_cholesky_solve()
     check_invalid_interval()
     print("RLS refresh interval smoke tests passed")
 

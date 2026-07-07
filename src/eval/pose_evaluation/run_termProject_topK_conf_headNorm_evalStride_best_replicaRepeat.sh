@@ -11,7 +11,7 @@ model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # pose_evaluation metadata without creating duplicated files on disk.
 export SSTREAMVGGT_REPLICA_ROOT="${SSTREAMVGGT_REPLICA_ROOT:-/home/dongjae/data/replica/Replica}"
 
-eval_dataset="replica_repeat"
+eval_dataset="replica"
 # To run only one scene, uncomment for example:
 # seq_args=(--seq_list Apart-1)
 seq_args=()
@@ -49,7 +49,7 @@ leverage_dpp_feature_projection="random"
 leverage_approx_method="right_sketch_ridge"
 leverage_ridge_lambda="0"
 leverage_ridge_lambda_mode="absolute"
-leverage_ridge_score_chunk_size="4096"
+leverage_ridge_score_chunk_size="8192"
 leverage_ridge_jitter="1e-6"
 leverage_ridge_dim="256"
 leverage_random_seed="42"
@@ -74,6 +74,7 @@ leverage_conf_gate_point_beta="0.0"
 leverage_conf_gate_k="1.0"
 leverage_conf_gate_special_mode="mean"
 leverage_conf_gate_init="mean"
+leverage_projected_key_cache=false
 
 budget_args=(--budget "$total_budget")
 budget_suffix="budget${total_budget}"
@@ -81,7 +82,11 @@ if [ -n "$budget_frame_multiplier" ]; then
     budget_args=(--budget_frame_multiplier "$budget_frame_multiplier")
     budget_suffix="budgetFrameMult${budget_frame_multiplier}"
 fi
-output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_confDepth_spe${leverage_conf_gate_special_mode}_init${leverage_conf_gate_init}_headNorm_poseStride${pose_eval_stride}_${layer_budget_strategy}${layer_budget_depth_mu}${layer_budget_depth_sigma}f${layer_budget_depth_floor}_${budget_suffix}_seed${leverage_random_seed}_stride${kf_every}_chunk4_cacheRLS4"
+projected_key_cache_args=()
+if [ "$leverage_projected_key_cache" = true ]; then
+    projected_key_cache_args=(--leverage_projected_key_cache)
+fi
+output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_confDepth_spe${leverage_conf_gate_special_mode}_init${leverage_conf_gate_init}_headNorm_poseStride${pose_eval_stride}_${layer_budget_strategy}${layer_budget_depth_mu}${layer_budget_depth_sigma}f${layer_budget_depth_floor}_${budget_suffix}_seed${leverage_random_seed}_stride${kf_every}_chunk1_cacheRLS16"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -147,9 +152,9 @@ accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evalua
     --leverage_conf_gate_k "$leverage_conf_gate_k" \
     --leverage_conf_gate_special_mode "$leverage_conf_gate_special_mode" \
     --leverage_conf_gate_init "$leverage_conf_gate_init" \
-    --profile_eviction \
-    --stream_chunk_size 4 \
-    --rls_refresh_interval 4 \
+    --stream_chunk_size 1 \
+    --rls_refresh_interval 16 \
+    "${projected_key_cache_args[@]}" \
     "${first_frame_special_args[@]}"
 
 # Add --profile_eviction to the launch command above when measuring eviction latency.

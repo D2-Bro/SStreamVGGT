@@ -29,6 +29,23 @@ from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig, SvdEvic
 XFORMERS_AVAILABLE = False
 
 
+def _materialize_kv_by_keep_indices(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    keep_indices: torch.Tensor,
+    *,
+    head_shared: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    B, H, _, D = k.shape
+    final_cache_size = keep_indices.shape[2]
+    if head_shared and B == 1:
+        indices = keep_indices[0, 0].to(device=k.device, dtype=torch.long)
+        return k.index_select(2, indices), v.index_select(2, indices)
+
+    expanded_indices = keep_indices.to(device=k.device, dtype=torch.long).unsqueeze(-1)
+    expanded_indices = expanded_indices.expand(B, H, final_cache_size, D)
+    return torch.gather(k, 2, expanded_indices), torch.gather(v, 2, expanded_indices)
+
 
 class Attention(nn.Module):
     def __init__(
@@ -62,11 +79,15 @@ class Attention(nn.Module):
         self._eviction_managers = {}
         self._eviction_profile_totals = {}
         self._eviction_profile_count = 0
+        self._attention_forward_profile_totals = {}
+        self._attention_forward_profile_count = 0
 
     def _reset_cache_state(self):
         self.num_anchor_tokens = 0
         self._eviction_profile_totals = {}
         self._eviction_profile_count = 0
+        self._attention_forward_profile_totals = {}
+        self._attention_forward_profile_count = 0
         for eviction in self._eviction_managers.values():
             reset = getattr(eviction, "reset_projected_key_cache", None)
             if reset is not None:
@@ -77,6 +98,34 @@ class Attention(nn.Module):
             reset_profile = getattr(eviction, "reset_profile_stats", None)
             if reset_profile is not None:
                 reset_profile()
+
+    def reset_profile_stats(self):
+        self._eviction_profile_totals = {}
+        self._eviction_profile_count = 0
+        self._attention_forward_profile_totals = {}
+        self._attention_forward_profile_count = 0
+        for eviction in self._eviction_managers.values():
+            reset_profile = getattr(eviction, "reset_profile_stats", None)
+            if reset_profile is not None:
+                reset_profile()
+
+    def _profile_sync(self, tensor: Optional[torch.Tensor]) -> None:
+        if tensor is not None and tensor.is_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize(tensor.device)
+
+    def _profile_start(self, tensor: Optional[torch.Tensor], enabled: bool) -> float:
+        if not enabled:
+            return 0.0
+        self._profile_sync(tensor)
+        return time.perf_counter()
+
+    def _record_forward_profile(self, name: str, start: float, tensor: Optional[torch.Tensor], enabled: bool) -> None:
+        if not enabled:
+            return
+        self._profile_sync(tensor)
+        self._attention_forward_profile_totals[name] = (
+            self._attention_forward_profile_totals.get(name, 0.0) + (time.perf_counter() - start)
+        )
 
     def _record_eviction_profile(self, **metrics):
         self._eviction_profile_count += 1
@@ -97,6 +146,8 @@ class Attention(nn.Module):
         return {
             "attention_count": self._eviction_profile_count,
             "attention_totals": dict(self._eviction_profile_totals),
+            "attention_forward_count": self._attention_forward_profile_count,
+            "attention_forward_totals": dict(self._attention_forward_profile_totals),
             "leverage_count": leverage_count,
             "leverage_totals": leverage_totals,
         }
@@ -223,8 +274,9 @@ class Attention(nn.Module):
                 keep_indices = torch.cat([anchor_indices, candidate_indices], dim=2)
             else:
                 keep_indices = anchor_indices
-            final_cache_size = keep_indices.shape[2]
-            expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, final_cache_size, D)
+            final_k, final_v = _materialize_kv_by_keep_indices(
+                k, v, keep_indices, head_shared=True
+            )
             final_metadata = (
                 metadata.gather(keep_indices.detach().cpu())
                 if metadata is not None
@@ -241,8 +293,6 @@ class Attention(nn.Module):
                     f"cache={N} budget={cache_budget} anchors={num_anchor_tokens} "
                     f"keep_candidates={keep_candidate_count}"
                 )
-            final_k = torch.gather(k, 2, expanded_indices)
-            final_v = torch.gather(v, 2, expanded_indices)
             if confidence_state is not None:
                 return final_k, final_v, final_metadata, final_confidence_state, 0.0
             return final_k, final_v, final_metadata, 0.0
@@ -256,11 +306,11 @@ class Attention(nn.Module):
         if cache_budget <= num_anchor_tokens and not eviction_protect_special_tokens:
             keep_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
             keep_indices = keep_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
-            expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, num_anchor_tokens, D)
+            final_k, final_v = _materialize_kv_by_keep_indices(
+                k, v, keep_indices, head_shared=True
+            )
             final_metadata = metadata.gather(keep_indices.detach().cpu()) if metadata is not None else None
             final_confidence_state = confidence_state.gather(keep_indices) if confidence_state is not None else None
-            final_k = torch.gather(k, 2, expanded_indices)
-            final_v = torch.gather(v, 2, expanded_indices)
             if confidence_state is not None:
                 return final_k, final_v, final_metadata, final_confidence_state, 0.0
             return final_k, final_v, final_metadata, 0.0
@@ -288,6 +338,11 @@ class Attention(nn.Module):
                 and leverage_similarity_granularity == "head"
                 and leverage_granularity == "layer"
             )
+        )
+        head_shared_keep_indices = (
+            eviction_policy == "svd_leverage"
+            and leverage_granularity == "layer"
+            and not head_specific_keep_sets
         )
         if (
             head_specific_keep_sets
@@ -596,10 +651,9 @@ class Attention(nn.Module):
             tail_indices = tail_indices.view(1, 1, tail_count).expand(B, H, tail_count)
             keep_parts.append(tail_indices)
         keep_indices = torch.cat(keep_parts, dim=2)
-        final_cache_size = keep_indices.shape[2]
-        expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, final_cache_size, D)
-        final_k = torch.gather(k, 2, expanded_indices)
-        final_v = torch.gather(v, 2, expanded_indices)
+        final_k, final_v = _materialize_kv_by_keep_indices(
+            k, v, keep_indices, head_shared=head_shared_keep_indices
+        )
         final_metadata = (
             metadata.gather(keep_indices.detach().cpu())
             if metadata is not None
@@ -720,19 +774,26 @@ class Attention(nn.Module):
         history_anchor_max_frames: int = 0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
+        profile_forward = bool(profile_eviction)
+        forward_start = self._profile_start(x, profile_forward)
+        qkv_start = self._profile_start(x, profile_forward)
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+        self._record_forward_profile("qkv_projection", qkv_start, q, profile_forward)
         scores = None
+        norm_rope_start = self._profile_start(q, profile_forward)
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.rope is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
+        self._record_forward_profile("qk_norm_rope", norm_rope_start, q, profile_forward)
 
         if use_cache and self.num_anchor_tokens == 0:
             self.num_anchor_tokens = k.shape[2] 
 
         if use_cache:
+            cache_concat_start = self._profile_start(k, profile_forward)
             cache_write_current_frame = bool(cache_write_current_frame)
             cache_evict_current_frame = cache_write_current_frame and bool(cache_evict_current_frame)
             original_past_key_values = past_key_values
@@ -904,6 +965,7 @@ class Attention(nn.Module):
                 v = write_v if cache_write_current_frame else current_v
                 metadata = write_metadata if cache_write_current_frame else metadata
                 confidence_state = write_confidence_state if cache_write_current_frame else confidence_state
+            self._record_forward_profile("cache_concat_update", cache_concat_start, k, profile_forward)
 
             if (
                 cache_write_current_frame
@@ -1027,6 +1089,7 @@ class Attention(nn.Module):
                 else:
                     k, v, metadata, scores = eviction_result
 
+            cache_read_start = self._profile_start(k, profile_forward)
             if cache_write_current_frame:
                 new_kv = pack_kv_cache(k, v, metadata, confidence_state)
             else:
@@ -1058,6 +1121,7 @@ class Attention(nn.Module):
                 if confidence_state is not None and sidecar_confidence_state is not None:
                     read_confidence_state = confidence_state.concat(sidecar_confidence_state)
 
+            self._record_forward_profile("cache_read_prepare", cache_read_start, read_k, profile_forward)
             if voxel_covis_enabled and read_metadata is not None and voxel_covis_frame_ids is not None:
                 k_read, v_read, covis_attn_mask = _filter_kv_for_voxel_covis(
                     read_k,
@@ -1080,6 +1144,7 @@ class Attention(nn.Module):
             k_for_attn = k
             v_for_attn = v
 
+        attention_kernel_start = self._profile_start(q, profile_forward)
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q,
@@ -1104,9 +1169,14 @@ class Attention(nn.Module):
 
             x = attn @ v_for_attn
 
+        self._record_forward_profile("attention_kernel", attention_kernel_start, x, profile_forward)
+        output_projection_start = self._profile_start(x, profile_forward)
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        self._record_forward_profile("output_projection", output_projection_start, x, profile_forward)
+        self._record_forward_profile("forward_total", forward_start, x, profile_forward)
+        self._attention_forward_profile_count += 1 if profile_forward else 0
         if use_cache:
             if current_special_kv is not None:
                 return x, new_kv, scores, current_special_kv
