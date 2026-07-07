@@ -664,10 +664,10 @@ class EvictionManager:
                 raise ValueError("leverage_normalize_before_projection requires leverage_feature='key'")
             if leverage_projection != "random":
                 raise ValueError("leverage_normalize_before_projection requires leverage_projection='random'")
-            if leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+            if leverage_approx_method not in ("exact_qr", "right_sketch", "right_sketch_ridge"):
                 raise ValueError(
                     "leverage_normalize_before_projection requires "
-                    "leverage_approx_method='right_sketch' or 'right_sketch_ridge'"
+                    "leverage_approx_method='exact_qr', 'right_sketch', or 'right_sketch_ridge'"
                 )
         if leverage_normalize_before_projection_headwise and not leverage_normalize_before_projection:
             raise ValueError(
@@ -3494,6 +3494,11 @@ class EvictionManager:
             "total": 0.0,
             "fallback": 0.0,
         }
+        if self.leverage_normalize_before_projection:
+            candidate_k = self._normalize_layer_key_before_projection(
+                torch.nan_to_num(candidate_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            )
+
         for batch_idx in range(B):
             feature_start = time.perf_counter() if self.debug else 0.0
             x_key = candidate_k[batch_idx].transpose(0, 1).reshape(N, H * D)

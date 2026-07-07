@@ -2198,6 +2198,7 @@ def check_layer_key_normalize_before_projection() -> None:
         "leverage_random_seed": 123,
     }
     for approx_kwargs in (
+        {"leverage_approx_method": "exact_qr", "leverage_sketch_dim": 0},
         {"leverage_approx_method": "right_sketch", "leverage_sketch_dim": 4},
         {"leverage_approx_method": "right_sketch_ridge", "leverage_ridge_dim": 4},
     ):

@@ -41,7 +41,7 @@ leverage_ridge_lambda_mode=absolute
 leverage_ridge_score_chunk_size=4096
 leverage_ridge_jitter=1e-6
 leverage_ridge_dim=64
-leverage_random_seed=20
+leverage_random_seed=42
 
 history_anchor_strategy=none
 camera_motion_threshold=0.2

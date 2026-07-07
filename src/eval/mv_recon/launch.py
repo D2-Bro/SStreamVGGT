@@ -997,10 +997,10 @@ def main(args):
             raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_feature key.")
         if args.leverage_projection != "random":
             raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_projection random.")
-        if args.leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+        if args.leverage_approx_method not in ("exact_qr", "right_sketch", "right_sketch_ridge"):
             raise SystemExit(
                 "Error: --leverage_normalize_before_projection requires --leverage_approx_method "
-                "right_sketch or right_sketch_ridge."
+                "exact_qr, right_sketch, or right_sketch_ridge."
             )
     if args.leverage_projected_key_cache:
         if args.eviction_policy != "svd_leverage":

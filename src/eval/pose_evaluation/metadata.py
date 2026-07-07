@@ -71,6 +71,139 @@ def _replica_image_files(dir_path):
     return sorted(glob.glob(os.path.join(dir_path, "frame*.jpg")))
 
 
+def _replica_repeat_image_files(dir_path):
+    filelist = _replica_image_files(dir_path)
+    return filelist + list(reversed(filelist))
+
+
+def _replica_frame_index(image_path):
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    if not stem.startswith("frame") or not stem[5:].isdigit():
+        raise ValueError(f"Unsupported Replica frame filename: {image_path}")
+    return int(stem[5:])
+
+
+def _replica_repeat_gt_traj_from_filelist(img_path, anno_path, seq, filelist):
+    import numpy as np
+    from eval.pose_evaluation.evo_utils import replica_pose_rows_to_traj_tum
+
+    if not filelist:
+        raise ValueError(f"No selected frames for Replica repeat sequence {seq}")
+
+    traj_path = os.path.join(anno_path, seq, "traj.txt")
+    if not os.path.exists(traj_path):
+        raise FileNotFoundError(f"Missing Replica traj.txt for sequence {seq}: {traj_path}")
+
+    traj_rows = np.loadtxt(traj_path, dtype=np.float64)
+    if traj_rows.ndim == 1:
+        traj_rows = traj_rows[None, :]
+    if traj_rows.ndim != 2 or traj_rows.shape[1] not in (12, 16):
+        raise ValueError(
+            f"Unsupported Replica trajectory shape {traj_rows.shape} in {traj_path}"
+        )
+
+    selected_rows = []
+    for image_path in filelist:
+        frame_idx = _replica_frame_index(image_path)
+        if frame_idx >= traj_rows.shape[0]:
+            raise IndexError(
+                f"Frame index {frame_idx} from {image_path} is outside trajectory length {traj_rows.shape[0]}"
+            )
+        selected_rows.append(traj_rows[frame_idx])
+
+    return replica_pose_rows_to_traj_tum(np.stack(selected_rows, axis=0))
+
+
+def _replica_multiagent_root():
+    return os.environ.get(
+        "SSTREAMVGGT_REPLICA_MULTIAGENT_ROOT",
+        "/home/dongjae/data/ReplicaMultiagent",
+    )
+
+
+def _replica_multiagent_part_dirs(scene_dir):
+    if not os.path.isdir(scene_dir):
+        return []
+    return sorted(
+        part_dir
+        for part_dir in glob.glob(os.path.join(scene_dir, "*"))
+        if os.path.isdir(part_dir)
+        and os.path.isdir(os.path.join(part_dir, "results"))
+        and os.path.exists(os.path.join(part_dir, "traj.txt"))
+    )
+
+
+def _replica_multiagent_sequences(root=None):
+    root = root or _replica_multiagent_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        scene
+        for scene in os.listdir(root)
+        if len(_replica_multiagent_part_dirs(os.path.join(root, scene))) >= 2
+    )
+
+
+def _replica_multiagent_image_files(scene_dir):
+    part_dirs = _replica_multiagent_part_dirs(scene_dir)
+    if len(part_dirs) < 2:
+        raise FileNotFoundError(
+            f"ReplicaMultiagent scene needs at least two part folders with results/ and traj.txt: {scene_dir}"
+        )
+
+    filelist = []
+    for part_dir in part_dirs:
+        part_files = _replica_image_files(os.path.join(part_dir, "results"))
+        if not part_files:
+            raise FileNotFoundError(f"No ReplicaMultiagent RGB frames found in {part_dir}/results")
+        filelist.extend(part_files)
+    return filelist
+
+
+def _replica_multiagent_frame_index(image_path):
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    if not stem.startswith("frame") or not stem[5:].isdigit():
+        raise ValueError(f"Unsupported ReplicaMultiagent frame filename: {image_path}")
+    return int(stem[5:])
+
+
+def _replica_multiagent_gt_traj_from_filelist(img_path, anno_path, seq, filelist):
+    import numpy as np
+    from eval.pose_evaluation.evo_utils import replica_pose_rows_to_traj_tum
+
+    if not filelist:
+        raise ValueError(f"No selected frames for ReplicaMultiagent sequence {seq}")
+
+    traj_cache = {}
+    selected_rows = []
+    for image_path in filelist:
+        results_dir = os.path.dirname(image_path)
+        part_dir = os.path.dirname(results_dir)
+        traj_path = os.path.join(part_dir, "traj.txt")
+        if not os.path.exists(traj_path):
+            raise FileNotFoundError(f"Missing ReplicaMultiagent traj.txt for frame {image_path}")
+
+        if traj_path not in traj_cache:
+            traj_rows = np.loadtxt(traj_path, dtype=np.float64)
+            if traj_rows.ndim == 1:
+                traj_rows = traj_rows[None, :]
+            if traj_rows.ndim != 2 or traj_rows.shape[1] not in (12, 16):
+                raise ValueError(
+                    f"Unsupported ReplicaMultiagent trajectory shape {traj_rows.shape} in {traj_path}"
+                )
+            traj_cache[traj_path] = traj_rows
+
+        frame_idx = _replica_multiagent_frame_index(image_path)
+        traj_rows = traj_cache[traj_path]
+        if frame_idx >= traj_rows.shape[0]:
+            raise IndexError(
+                f"Frame index {frame_idx} from {image_path} is outside trajectory length {traj_rows.shape[0]}"
+            )
+        selected_rows.append(traj_rows[frame_idx])
+
+    return replica_pose_rows_to_traj_tum(np.stack(selected_rows, axis=0))
+
+
 def _nrgbd_root():
     return os.environ.get("SSTREAMVGGT_NRGBD_ROOT", "/home/dongjae/data/neural_rgbd_data")
 
@@ -211,6 +344,36 @@ dataset_metadata = {
         "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq, "traj.txt"),
         "traj_format": "replica",
         "seq_list": _replica_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "replica_repeat": {
+        "img_path": _replica_root(),
+        "anno_path": _replica_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "results"),
+        "filelist_func": _replica_repeat_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: None,
+        "gt_traj_loader": _replica_repeat_gt_traj_from_filelist,
+        "traj_format": "replica_repeat",
+        "seq_list": _replica_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "replica_multiagent": {
+        "img_path": _replica_multiagent_root(),
+        "anno_path": _replica_multiagent_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
+        "filelist_func": _replica_multiagent_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: None,
+        "gt_traj_loader": _replica_multiagent_gt_traj_from_filelist,
+        "traj_format": "replica_multiagent",
+        "seq_list": _replica_multiagent_sequences(),
         "full_seq": False,
         "mask_path_seq_func": lambda mask_path, seq: None,
         "skip_condition": None,

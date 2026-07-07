@@ -239,6 +239,25 @@ def validate_streamvggt_args(args):
             "Error: --leverage_approx_method right_sketch_ridge requires "
             "--leverage_ridge_dim >= 1."
         )
+    if args.leverage_normalize_before_projection_headwise and not args.leverage_normalize_before_projection:
+        raise SystemExit(
+            "Error: --leverage_normalize_before_projection_headwise requires "
+            "--leverage_normalize_before_projection."
+        )
+    if args.leverage_normalize_before_projection:
+        if args.eviction_policy != "svd_leverage":
+            raise SystemExit("Error: --leverage_normalize_before_projection requires --eviction_policy svd_leverage.")
+        if args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_granularity layer.")
+        if args.leverage_feature != "key":
+            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_feature key.")
+        if args.leverage_projection != "random":
+            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_projection random.")
+        if args.leverage_approx_method not in ("exact_qr", "right_sketch", "right_sketch_ridge"):
+            raise SystemExit(
+                "Error: --leverage_normalize_before_projection requires --leverage_approx_method "
+                "exact_qr, right_sketch, or right_sketch_ridge."
+            )
     if args.layer_budget_strategy not in ("uniform", "cosine_precomputed") and (
         args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
     ):
@@ -250,6 +269,11 @@ def validate_streamvggt_args(args):
         raise SystemExit(
             "Error: --layer_budget_strategy cosine_precomputed requires "
             "--layer_budget_proportions_path."
+        )
+    if args.budget_frame_multiplier is not None and args.budget_frame_multiplier < 0.0:
+        raise SystemExit(
+            "Error: --budget_frame_multiplier must be >= 0 when provided, "
+            f"got {args.budget_frame_multiplier}."
         )
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
@@ -265,6 +289,8 @@ def validate_streamvggt_args(args):
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
+            f"normalize_before_projection={args.leverage_normalize_before_projection}, "
+            f"normalize_before_projection_headwise={args.leverage_normalize_before_projection_headwise}, "
             f"selector={args.leverage_eviction_selector}, "
             f"risk_mode={args.leverage_eviction_risk_mode}, "
             f"high_outlier_z={args.leverage_high_outlier_z}, "
@@ -443,6 +469,20 @@ def get_args_parser():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
+    )
+    parser.add_argument(
+        "--leverage_normalize_before_projection",
+        "--leverage-normalize-before-projection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="L2-normalize layer-wise key rows before random leverage projection",
+    )
+    parser.add_argument(
+        "--leverage_normalize_before_projection_headwise",
+        "--leverage-normalize-before-projection-headwise",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When normalizing before projection, normalize each head key row independently",
     )
     parser.add_argument(
         "--leverage_approx_method",
@@ -924,6 +964,13 @@ def get_args_parser():
     parser.add_argument(
         "--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)"
     )
+    parser.add_argument(
+        "--budget_frame_multiplier",
+        "--budget-frame-multiplier",
+        type=float,
+        default=None,
+        help="Set StreamVGGT total budget to ceil(multiplier * tokens_per_frame) * num_global_layers; overrides --budget",
+    )
 
     parser.add_argument(
         "--pose_eval_stride", default=1, type=int, help="stride for pose evaluation"
@@ -1099,6 +1146,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_score_histogram_config = leverage_score_histogram_config_from_args(args, output_dir=hist_dir)
                         output = model.inference(
                             frames,
+                            total_budget=args.budget,
+                            budget_frame_multiplier=args.budget_frame_multiplier,
                             eviction_policy=args.eviction_policy,
                             leverage_sketch_dim=args.leverage_sketch_dim,
                             leverage_granularity=args.leverage_granularity,
@@ -1106,6 +1155,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_projection=args.leverage_projection,
                             leverage_head_mean_dim=args.leverage_head_mean_dim,
                             leverage_normalize_rows=args.leverage_normalize_rows,
+                            leverage_normalize_before_projection=args.leverage_normalize_before_projection,
+                            leverage_normalize_before_projection_headwise=args.leverage_normalize_before_projection_headwise,
                             leverage_approx_method=args.leverage_approx_method,
                             leverage_ridge_lambda=args.leverage_ridge_lambda,
                             leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
@@ -1239,26 +1290,30 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 print(f"Pose encoding and extrinsics saved to: {pose_save_path}")
 
 
-                gt_traj_file = metadata["gt_traj_func"](img_path, anno_path, seq)
-                traj_format = metadata.get("traj_format", None)
-
-                if gt_traj_file is None:
-                    gt_traj = None
-                elif args.eval_dataset == "sintel":
-                    gt_traj = load_traj(
-                        gt_traj_file=gt_traj_file,
-                        stride=effective_stride,
-                        num_frames=len(filelist),
-                    )
-                elif traj_format is not None:
-                    gt_traj = load_traj(
-                        gt_traj_file=gt_traj_file,
-                        traj_format=traj_format,
-                        stride=effective_stride,
-                        num_frames=len(filelist),
-                    )
+                gt_traj_loader = metadata.get("gt_traj_loader", None)
+                if gt_traj_loader is not None:
+                    gt_traj = gt_traj_loader(img_path, anno_path, seq, filelist)
                 else:
-                    gt_traj = None
+                    gt_traj_file = metadata["gt_traj_func"](img_path, anno_path, seq)
+                    traj_format = metadata.get("traj_format", None)
+
+                    if gt_traj_file is None:
+                        gt_traj = None
+                    elif args.eval_dataset == "sintel":
+                        gt_traj = load_traj(
+                            gt_traj_file=gt_traj_file,
+                            stride=effective_stride,
+                            num_frames=len(filelist),
+                        )
+                    elif traj_format is not None:
+                        gt_traj = load_traj(
+                            gt_traj_file=gt_traj_file,
+                            traj_format=traj_format,
+                            stride=effective_stride,
+                            num_frames=len(filelist),
+                        )
+                    else:
+                        gt_traj = None
 
                 if gt_traj is not None:
                     ate, rpe_trans, rpe_rot = eval_metrics(
