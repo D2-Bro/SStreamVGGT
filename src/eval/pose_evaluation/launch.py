@@ -51,6 +51,11 @@ def validate_streamvggt_args(args):
             "Error: --stream_chunk_size must be >= 1, "
             f"got {args.stream_chunk_size}."
         )
+    if args.empty_cache_interval < 0:
+        raise SystemExit(
+            "Error: --empty_cache_interval must be >= 0, "
+            f"got {args.empty_cache_interval}."
+        )
     if args.eviction_protect_recent_frames < 0:
         raise SystemExit(
             "Error: --eviction_protect_recent_frames must be >= 0, "
@@ -467,6 +472,13 @@ def get_args_parser():
         type=int,
         default=1,
         help="Number of consecutive stream frames to process in one chunk-causal forward",
+    )
+    parser.add_argument(
+        "--empty_cache_interval",
+        "--empty-cache-interval",
+        type=int,
+        default=1,
+        help="Call torch.cuda.empty_cache() every N output frames; 0 disables it. Default 1 preserves previous behavior.",
     )
     parser.add_argument("--use_proj", action="store_true")
     parser.add_argument("--eviction_policy", type=str, default="mean", help="Cache eviction policy: mean, baseline_mean, svd_leverage, or dpp")
@@ -1282,6 +1294,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             camera_motion_threshold=args.camera_motion_threshold,
                             anchor_keep_ratio=args.anchor_keep_ratio,
                             profile_eviction=args.profile_eviction,
+                            empty_cache_interval=args.empty_cache_interval,
                             eviction_debug=args.eviction_debug,
                             leverage_score_histogram_config=leverage_score_histogram_config,
                             recent_merge_config=recent_merge_config,

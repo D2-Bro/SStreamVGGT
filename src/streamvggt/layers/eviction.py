@@ -2110,7 +2110,14 @@ class EvictionManager:
             "device": str(device),
             "normalize_before_projection": bool(self.leverage_normalize_before_projection),
             "normalize_before_projection_headwise": bool(self.leverage_normalize_before_projection_headwise),
+            "projected_head_features": bool(self._needs_projected_head_features()),
         }
+
+    def _needs_projected_head_features(self) -> bool:
+        return (
+            self.leverage_similarity_feature_projection == "random"
+            and self.leverage_similarity_granularity == "head"
+        )
 
     def _projected_key_cache_length(
         self,
@@ -2135,7 +2142,10 @@ class EvictionManager:
             sketch_dim=sketch_dim,
             device=device,
         )
-        if cache is None or head_cache is None or norm_cache is None or meta != expected:
+        need_head_features = self._needs_projected_head_features()
+        if cache is None or norm_cache is None or meta != expected:
+            return 0
+        if need_head_features and head_cache is None:
             return 0
         cache_len = int(cache.shape[1])
         if cache_len > int(num_tokens):
@@ -2144,7 +2154,7 @@ class EvictionManager:
         if cache.shape != (batch_size, cache_len, sketch_dim):
             self.reset_projected_key_cache()
             return 0
-        if head_cache.shape != (batch_size, num_heads, cache_len, sketch_dim):
+        if head_cache is not None and head_cache.shape != (batch_size, num_heads, cache_len, sketch_dim):
             self.reset_projected_key_cache()
             return 0
         if norm_cache.shape != (batch_size, cache_len):
@@ -2161,13 +2171,27 @@ class EvictionManager:
             norm = mat_k.square().sum(dim=(1, 3), keepdim=True).sqrt().clamp_min(1e-12)
         return mat_k / norm
 
-    def _project_key_with_omega(self, mat_k: torch.Tensor, omega_key: torch.Tensor):
+    def _project_key_with_omega(
+        self,
+        mat_k: torch.Tensor,
+        omega_key: torch.Tensor,
+        *,
+        need_head_features: bool = False,
+    ):
         mat_k = self._normalize_layer_key_before_projection(mat_k)
-        head_projected_raw = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
-        layer_projected_raw = head_projected_raw.sum(dim=1)
+        B, H, N, D = mat_k.shape
+        sketch_dim = int(omega_key.shape[-1])
+        if need_head_features:
+            head_projected_raw = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
+            layer_projected_raw = head_projected_raw.sum(dim=1)
+        else:
+            flat_k = mat_k.permute(0, 2, 1, 3).reshape(B, N, H * D)
+            omega_flat = omega_key.reshape(H * D, sketch_dim)
+            layer_projected_raw = torch.matmul(flat_k, omega_flat)
+            head_projected_raw = None
         pre_norms = torch.linalg.vector_norm(layer_projected_raw.detach(), ord=2, dim=-1)
         layer_projected = self._maybe_normalize_rows(layer_projected_raw)
-        head_projected = self._maybe_normalize_rows(head_projected_raw)
+        head_projected = self._maybe_normalize_rows(head_projected_raw) if head_projected_raw is not None else None
         return layer_projected, head_projected, pre_norms
 
     def _capture_projected_pre_normalization_norm_values(self, norms: torch.Tensor) -> None:
@@ -2189,6 +2213,7 @@ class EvictionManager:
             sketch_dim=sketch_dim,
             device=mat_k.device,
         )
+        need_head_features = self._needs_projected_head_features()
         cache_len = self._projected_key_cache_length(
             batch_size=B,
             num_heads=H,
@@ -2199,29 +2224,39 @@ class EvictionManager:
         )
         if cache_len > 0:
             layer_parts = [self._projected_key_cache[:, :cache_len].to(device=mat_k.device)]
-            head_parts = [self._projected_key_head_cache[:, :, :cache_len].to(device=mat_k.device)]
+            head_parts = (
+                [self._projected_key_head_cache[:, :, :cache_len].to(device=mat_k.device)]
+                if need_head_features
+                else None
+            )
             norm_parts = [self._projected_key_pre_norm_cache[:, :cache_len].to(device=mat_k.device)]
             if cache_len < N:
                 suffix_layer, suffix_head, suffix_norms = self._project_key_with_omega(
                     mat_k[:, :, cache_len:, :],
                     omega_key,
+                    need_head_features=need_head_features,
                 )
                 layer_parts.append(suffix_layer)
-                head_parts.append(suffix_head)
+                if head_parts is not None and suffix_head is not None:
+                    head_parts.append(suffix_head)
                 norm_parts.append(suffix_norms)
             leverage_matrix = torch.cat(layer_parts, dim=1)
-            head_leverage_matrix = torch.cat(head_parts, dim=2)
+            head_leverage_matrix = torch.cat(head_parts, dim=2) if head_parts is not None else None
             pre_norms = torch.cat(norm_parts, dim=1)
             profile["projection_cache_hits"] = float(cache_len)
             profile["projection_cache_misses"] = float(N - cache_len)
         else:
-            leverage_matrix, head_leverage_matrix, pre_norms = self._project_key_with_omega(mat_k, omega_key)
+            leverage_matrix, head_leverage_matrix, pre_norms = self._project_key_with_omega(
+                mat_k,
+                omega_key,
+                need_head_features=need_head_features,
+            )
             profile["projection_cache_hits"] = 0.0
             profile["projection_cache_misses"] = float(N)
 
         self._capture_projected_pre_normalization_norm_values(pre_norms)
         self._last_projected_key_features = leverage_matrix.detach()
-        self._last_projected_key_head_features = head_leverage_matrix.detach()
+        self._last_projected_key_head_features = head_leverage_matrix.detach() if head_leverage_matrix is not None else None
         self._last_projected_key_pre_norms = pre_norms.detach()
         self._last_projected_key_cache_meta = meta
         return leverage_matrix, head_leverage_matrix
@@ -2238,7 +2273,11 @@ class EvictionManager:
         head_features = self._last_projected_key_head_features
         pre_norms = self._last_projected_key_pre_norms
         meta = self._last_projected_key_cache_meta
-        if features is None or head_features is None or pre_norms is None or meta is None:
+        need_head_features = self._needs_projected_head_features()
+        if features is None or pre_norms is None or meta is None:
+            self.reset_projected_key_cache()
+            return
+        if need_head_features and head_features is None:
             self.reset_projected_key_cache()
             return
         if kept_candidate_indices.ndim != 3 or kept_candidate_indices.shape[0] != features.shape[0]:
@@ -2246,7 +2285,10 @@ class EvictionManager:
             return
         B, N, S = features.shape
         H = int(meta["num_heads"])
-        if kept_candidate_indices.shape[1] < 1 or head_features.shape[:3] != (B, H, N):
+        if kept_candidate_indices.shape[1] < 1:
+            self.reset_projected_key_cache()
+            return
+        if head_features is not None and head_features.shape[:3] != (B, H, N):
             self.reset_projected_key_cache()
             return
         row_indices = kept_candidate_indices[:, 0, :].to(device=features.device, dtype=torch.long)
@@ -2256,8 +2298,11 @@ class EvictionManager:
         gather_layer = row_indices.unsqueeze(-1).expand(B, row_indices.shape[1], S)
         next_features = torch.gather(features, 1, gather_layer)
         next_norms = torch.gather(pre_norms, 1, row_indices)
-        gather_head = row_indices[:, None, :, None].expand(B, H, row_indices.shape[1], S)
-        next_head_features = torch.gather(head_features, 2, gather_head)
+        if head_features is not None:
+            gather_head = row_indices[:, None, :, None].expand(B, H, row_indices.shape[1], S)
+            next_head_features = torch.gather(head_features, 2, gather_head)
+        else:
+            next_head_features = None
 
         if tail_k is not None and int(tail_k.shape[2]) > 0:
             with torch.cuda.amp.autocast(enabled=False):
@@ -2269,13 +2314,18 @@ class EvictionManager:
                     seed=self.leverage_random_seed,
                 )
                 omega_key = omega[: H * int(meta["head_dim"])].view(H, int(meta["head_dim"]), int(meta["sketch_dim"]))
-                tail_features, tail_head_features, tail_norms = self._project_key_with_omega(tail, omega_key)
+                tail_features, tail_head_features, tail_norms = self._project_key_with_omega(
+                    tail,
+                    omega_key,
+                    need_head_features=need_head_features,
+                )
             next_features = torch.cat([next_features, tail_features.detach()], dim=1)
-            next_head_features = torch.cat([next_head_features, tail_head_features.detach()], dim=2)
+            if next_head_features is not None and tail_head_features is not None:
+                next_head_features = torch.cat([next_head_features, tail_head_features.detach()], dim=2)
             next_norms = torch.cat([next_norms, tail_norms.detach()], dim=1)
 
         self._projected_key_cache = next_features.detach()
-        self._projected_key_head_cache = next_head_features.detach()
+        self._projected_key_head_cache = next_head_features.detach() if next_head_features is not None else None
         self._projected_key_pre_norm_cache = next_norms.detach()
         self._projected_key_cache_meta = dict(meta)
 
@@ -3965,6 +4015,7 @@ class EvictionManager:
                 self._sync_for_timing(sync_tensor)
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
             omega_key = omega[: H * D].view(H, D, sketch_dim)
+            need_head_features = self._needs_projected_head_features()
             if self.leverage_projected_key_cache and not lowdim_concat and mat_v is None:
                 projection_start = time.perf_counter() if do_profile else 0.0
                 leverage_matrix, head_leverage_matrix = self._layer_key_projected_features(
@@ -3979,29 +4030,36 @@ class EvictionManager:
             else:
                 mat_k = self._profile_normalize_layer_key_before_projection(mat_k, profile if do_profile else None)
                 projection_start = time.perf_counter() if do_profile else 0.0
-                head_key_matrix = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
-                if lowdim_concat:
-                    if mat_v is None or omega_value is None:
-                        raise ValueError("leverage_feature='key_value_lowdim_concat' requires value cache tensor")
-                    omega_value_view = omega_value.view(H, D, sketch_dim)
-                    head_value_matrix = torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
-                    head_leverage_matrix = torch.cat([head_key_matrix, head_value_matrix], dim=-1)
-                    leverage_matrix = torch.cat([head_key_matrix.sum(dim=1), head_value_matrix.sum(dim=1)], dim=-1)
-                    self._last_layer_feature_shape = (int(N), int(leverage_matrix.shape[-1]))
+                if not need_head_features and not lowdim_concat and mat_v is None:
+                    flat_k = mat_k.permute(0, 2, 1, 3).reshape(B, N, H * D)
+                    leverage_matrix = torch.matmul(flat_k, omega_key.reshape(H * D, sketch_dim))
+                    head_leverage_matrix = None
                 else:
-                    head_leverage_matrix = head_key_matrix
-                    if mat_v is not None:
-                        omega_value_view = omega[H * D :].view(H, D, sketch_dim)
-                        head_leverage_matrix = head_leverage_matrix + torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
-                    leverage_matrix = head_leverage_matrix.sum(dim=1)
+                    head_key_matrix = torch.matmul(mat_k, omega_key.unsqueeze(0))
+                    if lowdim_concat:
+                        if mat_v is None or omega_value is None:
+                            raise ValueError("leverage_feature='key_value_lowdim_concat' requires value cache tensor")
+                        omega_value_view = omega_value.view(H, D, sketch_dim)
+                        head_value_matrix = torch.matmul(mat_v, omega_value_view.unsqueeze(0))
+                        head_leverage_matrix = torch.cat([head_key_matrix, head_value_matrix], dim=-1)
+                        leverage_matrix = torch.cat([head_key_matrix.sum(dim=1), head_value_matrix.sum(dim=1)], dim=-1)
+                        self._last_layer_feature_shape = (int(N), int(leverage_matrix.shape[-1]))
+                    else:
+                        head_leverage_matrix = head_key_matrix
+                        if mat_v is not None:
+                            omega_value_view = omega[H * D :].view(H, D, sketch_dim)
+                            head_leverage_matrix = head_leverage_matrix + torch.matmul(mat_v, omega_value_view.unsqueeze(0))
+                        leverage_matrix = head_leverage_matrix.sum(dim=1)
                 if do_profile:
                     self._sync_for_timing(leverage_matrix)
                     profile["projection_matmul"] = time.perf_counter() - projection_start
                 self._capture_projected_pre_normalization_norms(leverage_matrix)
                 leverage_matrix = self._profile_normalize_rows(leverage_matrix, profile if do_profile else None, "post_projection_normalization")
-                head_leverage_matrix = self._profile_normalize_rows(head_leverage_matrix, profile if do_profile else None, "post_projection_normalization")
+                if head_leverage_matrix is not None:
+                    head_leverage_matrix = self._profile_normalize_rows(head_leverage_matrix, profile if do_profile else None, "post_projection_normalization")
             self._store_projected_similarity_features(leverage_matrix, "layer")
-            self._store_projected_similarity_features(head_leverage_matrix, "head")
+            if head_leverage_matrix is not None:
+                self._store_projected_similarity_features(head_leverage_matrix, "head")
             if do_profile:
                 profile["feature"] = 0.0
                 profile["sketch"] = profile["sketch_matrix_retrieval"] + profile["projection_matmul"]

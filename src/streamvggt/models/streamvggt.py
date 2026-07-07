@@ -275,6 +275,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
         profile_eviction: bool = False,
+        empty_cache_interval: int = 1,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -356,6 +357,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         stream_chunk_size = int(stream_chunk_size)
         if stream_chunk_size < 1:
             raise ValueError(f"stream_chunk_size must be >= 1, got {stream_chunk_size}")
+        empty_cache_interval = int(empty_cache_interval)
+        if empty_cache_interval < 0:
+            raise ValueError(f"empty_cache_interval must be >= 0, got {empty_cache_interval}")
         if stream_chunk_size > 1 and bool(global_cache_history_anchor_special_tokens_only):
             raise ValueError(
                 "stream_chunk_size > 1 is not supported with "
@@ -984,10 +988,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     )
                     _profile_record("result_cache", profile_stage_start)
 
-                profile_stage_start = _profile_start()
-                del res_gpu
-                torch.cuda.empty_cache()
-                _profile_record("empty_cache", profile_stage_start)
+                if empty_cache_interval > 0 and int(global_frame_idx) % empty_cache_interval == 0:
+                    profile_stage_start = _profile_start()
+                    del res_gpu
+                    torch.cuda.empty_cache()
+                    _profile_record("empty_cache", profile_stage_start)
+                else:
+                    del res_gpu
 
             _profile_record("anchor_cache_update", profile_stage_start)
 
