@@ -85,6 +85,57 @@ class KVConfidenceState:
             gate_count=gate_count,
         )
 
+    @classmethod
+    def for_frame_chunk(
+        cls,
+        batch_size: int,
+        num_heads: int,
+        tokens_per_frame: int,
+        frame_ids,
+        device: torch.device,
+        initial_gate: Optional[torch.Tensor | float] = None,
+    ) -> "KVConfidenceState":
+        del num_heads
+        frame_ids = torch.as_tensor(frame_ids, device=device, dtype=torch.long).reshape(-1)
+        tokens_per_frame = int(tokens_per_frame)
+        if tokens_per_frame <= 0:
+            raise ValueError(f"tokens_per_frame must be positive, got {tokens_per_frame}")
+        if frame_ids.numel() <= 0:
+            raise ValueError("frame_ids must contain at least one frame")
+
+        B = int(batch_size)
+        S = int(frame_ids.numel())
+        N = S * tokens_per_frame
+        shape = (B, N)
+        chunk_frame_ids = frame_ids.view(1, S, 1).expand(B, S, tokens_per_frame).reshape(shape).clone()
+        token_indices = torch.arange(tokens_per_frame, device=device, dtype=torch.long).view(1, 1, tokens_per_frame)
+        token_indices = token_indices.expand(B, S, tokens_per_frame).reshape(shape).clone()
+        if initial_gate is None:
+            confidence_gate = torch.ones(shape, device=device, dtype=torch.float32)
+        else:
+            confidence_gate = torch.as_tensor(initial_gate, device=device, dtype=torch.float32)
+            if confidence_gate.ndim == 0:
+                confidence_gate = confidence_gate.view(1, 1).expand(shape).clone()
+            elif confidence_gate.ndim == 1:
+                if confidence_gate.shape[0] != shape[0]:
+                    raise ValueError(f"initial_gate [B] must match batch size {shape[0]}, got {tuple(confidence_gate.shape)}")
+                confidence_gate = confidence_gate.view(shape[0], 1).expand(shape).clone()
+            elif confidence_gate.ndim == 2:
+                if tuple(confidence_gate.shape) != shape:
+                    raise ValueError(f"initial_gate [B, N] must have shape {shape}, got {tuple(confidence_gate.shape)}")
+                confidence_gate = confidence_gate.clone()
+            else:
+                raise ValueError(f"initial_gate must be scalar, [B], or [B, N], got {tuple(confidence_gate.shape)}")
+            confidence_gate = torch.nan_to_num(confidence_gate, nan=1.0, posinf=1.0, neginf=1.0)
+        gate_sum, gate_count = cls._stats_from_gate(confidence_gate)
+        return cls(
+            frame_ids=chunk_frame_ids,
+            token_indices=token_indices,
+            confidence_gate=confidence_gate,
+            gate_sum=gate_sum,
+            gate_count=gate_count,
+        )
+
     def concat(self, other: "KVConfidenceState") -> "KVConfidenceState":
         other_gate_sum = other.gate_sum.to(self.gate_sum.device)
         other_gate_count = other.gate_count.to(self.gate_count.device)

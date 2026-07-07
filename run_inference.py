@@ -90,6 +90,12 @@ def run_inference(args: argparse.Namespace):
         )
     if eviction_nn_analysis_config is not None:
         print(f"Eviction NN analysis enabled: {eviction_nn_analysis_config.output_dir}")
+    if args.stream_chunk_size < 1:
+        print(
+            "Error: --stream_chunk_size must be >= 1, "
+            f"got {args.stream_chunk_size}."
+        )
+        return
     if args.merge_window < 1:
         print(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
         return
@@ -255,6 +261,12 @@ def run_inference(args: argparse.Namespace):
             f"got {args.leverage_ridge_dim}."
         )
         return
+    if args.rls_refresh_interval <= 0:
+        print(
+            "Error: --rls_refresh_interval must be >= 1, "
+            f"got {args.rls_refresh_interval}."
+        )
+        return
     if args.leverage_approx_method == "right_sketch_ridge":
         resolved_ridge_dim = args.leverage_ridge_dim if args.leverage_ridge_dim is not None else args.leverage_right_jl_dim
         if resolved_ridge_dim is None or int(resolved_ridge_dim) < 1:
@@ -279,6 +291,7 @@ def run_inference(args: argparse.Namespace):
             f"r2={args.leverage_right_jl_dim}, ridge_dim={args.leverage_ridge_dim}, "
             f"ridge_lambda={args.leverage_ridge_lambda}, ridge_lambda_mode={args.leverage_ridge_lambda_mode}, "
             f"ridge_chunk={args.leverage_ridge_score_chunk_size}, ridge_jitter={args.leverage_ridge_jitter}, "
+            f"rls_refresh_interval={args.rls_refresh_interval}, "
             f"seed={args.leverage_random_seed})"
         )
         print(
@@ -438,6 +451,7 @@ def run_inference(args: argparse.Namespace):
                 frames,
                 frame_writer=frame_writer,
                 cache_results=cache_results,
+                stream_chunk_size=args.stream_chunk_size,
                 cache_analysis_config=cache_analysis_config,
                 pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                 eviction_nn_analysis_config=eviction_nn_analysis_config,
@@ -455,6 +469,7 @@ def run_inference(args: argparse.Namespace):
                 leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                 leverage_ridge_jitter=args.leverage_ridge_jitter,
                 leverage_ridge_dim=args.leverage_ridge_dim,
+                rls_refresh_interval=args.rls_refresh_interval,
                 leverage_diag=args.leverage_diag,
                 leverage_diag_interval=args.leverage_diag_interval,
                 leverage_random_seed=args.leverage_random_seed,
@@ -559,6 +574,13 @@ if __name__ == "__main__":
         "--no_cache_results",
         action="store_true",
         help="Prediction results will not be accumulated in GPU memory",
+    )
+    parser.add_argument(
+        "--stream_chunk_size",
+        "--stream-chunk-size",
+        type=int,
+        default=1,
+        help="Number of consecutive stream frames to process in one chunk-causal forward",
     )
     parser.add_argument(
         "--frame_stride",
@@ -772,6 +794,13 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Projection dimension for right_sketch_ridge; defaults to --leverage_right_jl_dim when omitted",
+    )
+    parser.add_argument(
+        "--rls_refresh_interval",
+        "--rls-refresh-interval",
+        type=int,
+        default=1,
+        help="Refresh interval for ridge leverage K^T K and Cholesky factorization; 1 refreshes every frame",
     )
     parser.add_argument(
         "--leverage_diag",

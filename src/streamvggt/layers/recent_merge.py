@@ -88,6 +88,40 @@ class KVCacheMetadata:
             accumulated_point_confidence=torch.ones(shape, dtype=torch.float32),
         )
 
+    @classmethod
+    def for_frame_chunk(
+        cls,
+        batch_size: int,
+        num_heads: int,
+        tokens_per_frame: int,
+        frame_ids,
+    ) -> "KVCacheMetadata":
+        frame_ids = torch.as_tensor(frame_ids, dtype=torch.long).reshape(-1)
+        tokens_per_frame = int(tokens_per_frame)
+        if tokens_per_frame <= 0:
+            raise ValueError(f"tokens_per_frame must be positive, got {tokens_per_frame}")
+        if frame_ids.numel() <= 0:
+            raise ValueError("frame_ids must contain at least one frame")
+
+        B = int(batch_size)
+        H = int(num_heads)
+        S = int(frame_ids.numel())
+        N = S * tokens_per_frame
+        shape = (B, H, N)
+        chunk_frame_ids = frame_ids.view(1, 1, S, 1).expand(B, H, S, tokens_per_frame).reshape(shape).clone()
+        token_indices = torch.arange(tokens_per_frame, dtype=torch.int32).view(1, 1, 1, tokens_per_frame)
+        token_indices = token_indices.expand(B, H, S, tokens_per_frame).reshape(shape).clone()
+        return cls(
+            frame_ids=chunk_frame_ids,
+            token_indices=token_indices,
+            accumulated_confidence=torch.ones(shape, dtype=torch.float32),
+            merge_counts=torch.zeros(shape, dtype=torch.int16),
+            last_updated_frame=chunk_frame_ids.to(dtype=torch.int32),
+            voxel_ids=torch.full((*shape, 3), _INVALID_VOXEL, dtype=torch.int32),
+            voxel_valid=torch.zeros(shape, dtype=torch.bool),
+            accumulated_point_confidence=torch.ones(shape, dtype=torch.float32),
+        )
+
     def concat(self, other: "KVCacheMetadata") -> "KVCacheMetadata":
         return KVCacheMetadata(
             frame_ids=torch.cat([self.frame_ids, other.frame_ids], dim=2),

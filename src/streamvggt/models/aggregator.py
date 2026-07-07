@@ -6,6 +6,7 @@
 
 import logging
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -173,6 +174,8 @@ class Aggregator(nn.Module):
         self.last_layer_budget_value_norms = torch.zeros(self.depth)
         self.last_global_attn_debug_trace = []
         self.last_global_special_kv_sidecars = [None] * self.depth
+        self._dynamic_budget_profile_total = 0.0
+        self._dynamic_budget_profile_count = 0
         self.register_buffer("layer_budget_proportions", None, persistent=False)
 
     def reset_stream_state(self) -> None:
@@ -183,6 +186,8 @@ class Aggregator(nn.Module):
         self.last_layer_budget_value_norms.zero_()
         self.last_global_attn_debug_trace = []
         self.last_global_special_kv_sidecars = [None] * self.depth
+        self._dynamic_budget_profile_total = 0.0
+        self._dynamic_budget_profile_count = 0
         for block in list(self.frame_blocks) + list(self.global_blocks):
             reset = getattr(getattr(block, "attn", None), "_reset_cache_state", None)
             if reset is not None:
@@ -236,6 +241,8 @@ class Aggregator(nn.Module):
         past_key_values=None,
         use_cache=False,
         past_frame_idx=0,
+        current_frame_ids: Optional[List[int]] = None,
+        current_frame_idx: Optional[int] = None,
         total_budget=0,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
@@ -245,6 +252,7 @@ class Aggregator(nn.Module):
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
+        profile_eviction: bool = False,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -260,6 +268,7 @@ class Aggregator(nn.Module):
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        rls_refresh_interval: int = 1,
         leverage_diag: bool = False,
         leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
@@ -357,14 +366,17 @@ class Aggregator(nn.Module):
             else:
                 has_past_cache = past_key_values[0] is not None
 
-        if use_cache and has_past_cache:
-            # _, _, S_true, _, _ = past_key_values[0][0].shape
-            S_true = past_frame_idx + 1
+        if current_frame_ids is None:
+            current_frame_ids = [int(past_frame_idx) + offset for offset in range(S)]
         else:
-            S_true = S
-        
-        if use_cache and S > 1:
-            print(f"Use KV cache expects S=1, got S={S}")
+            current_frame_ids = [int(frame_id) for frame_id in current_frame_ids]
+        if len(current_frame_ids) != S:
+            raise ValueError(
+                "current_frame_ids length must match sequence length: "
+                f"len(current_frame_ids)={len(current_frame_ids)}, S={S}"
+            )
+        if current_frame_idx is None:
+            current_frame_idx = int(current_frame_ids[-1])
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
@@ -381,12 +393,11 @@ class Aggregator(nn.Module):
 
         _, P, C = patch_tokens.shape
 
-        if use_cache:
-            camera_token_full = slice_expand_and_flatten(self.camera_token, B, S_true)
-            camera_token = camera_token_full[-1:, :, :]
-            
-            register_token_full = slice_expand_and_flatten(self.register_token, B, S_true)
-            register_token = register_token_full[-1:, :, :]
+        if use_cache and int(past_frame_idx) > 0:
+            camera_token = self.camera_token[:, 1:, ...].expand(B, S, *self.camera_token.shape[2:])
+            camera_token = camera_token.reshape(B * S, *camera_token.shape[2:])
+            register_token = self.register_token[:, 1:, ...].expand(B, S, *self.register_token.shape[2:])
+            register_token = register_token.reshape(B * S, *register_token.shape[2:])
         else:
             camera_token = slice_expand_and_flatten(self.camera_token, B, S)
             register_token = slice_expand_and_flatten(self.register_token, B, S)
@@ -417,6 +428,10 @@ class Aggregator(nn.Module):
             and int(past_frame_idx) != 0
         ):
             current_cache_token_count = S * max(P - int(self.patch_start_idx), 0)
+        if profile_eviction:
+            if images.is_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize(images.device)
+            dynamic_budget_start = time.perf_counter()
         current_budgets = self._calculate_dynamic_budgets(
             total_budget,
             enabled_global_idx_ranges=parsed_global_attn_idx_ranges,
@@ -436,6 +451,12 @@ class Aggregator(nn.Module):
             past_key_values=past_key_values,
             current_token_count=current_cache_token_count,
         )
+        if profile_eviction:
+            if current_budgets.is_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize(current_budgets.device)
+            dynamic_budget_ms = (time.perf_counter() - dynamic_budget_start) * 1000.0
+            self._dynamic_budget_profile_total += dynamic_budget_ms * 0.001
+            self._dynamic_budget_profile_count += 1
         scores = []
         layer_budget_scores = []
         layer_budget_base_scores = []
@@ -489,6 +510,8 @@ class Aggregator(nn.Module):
                             past_key_values=past_key_values,
                             use_cache=use_cache,
                             past_frame_idx=past_frame_idx,
+                            current_frame_ids=current_frame_ids,
+                            current_frame_idx=current_frame_idx,
                             current_budgets=current_budgets,
                             updated_scores=updated_scores,
                             updated_layer_budget_scores=updated_layer_budget_scores,
@@ -503,6 +526,7 @@ class Aggregator(nn.Module):
                             token_overlay_dump_config=token_overlay_dump_config,
                             eviction_policy=eviction_policy,
                             eviction_policy_layers=eviction_policy_layers,
+                            profile_eviction=profile_eviction,
                             eviction_debug=eviction_debug,
                             leverage_sketch_dim=leverage_sketch_dim,
                             leverage_granularity=leverage_granularity,
@@ -518,6 +542,7 @@ class Aggregator(nn.Module):
                             leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=leverage_ridge_jitter,
                             leverage_ridge_dim=leverage_ridge_dim,
+                            rls_refresh_interval=rls_refresh_interval,
                             leverage_diag=leverage_diag,
                             leverage_diag_interval=leverage_diag_interval,
                             leverage_random_seed=leverage_random_seed,
@@ -575,6 +600,8 @@ class Aggregator(nn.Module):
                             past_key_values_block=past_key_values[global_idx] if past_key_values[global_idx] is not None else None,
                             use_cache=True,
                             past_frame_idx=past_frame_idx,
+                            current_frame_ids=current_frame_ids,
+                            current_frame_idx=current_frame_idx,
                             cache_budget=current_budgets[global_idx].item(),
                             cache_analysis_config=cache_analysis_config,
                             pre_eviction_snapshot_config=pre_eviction_snapshot_config,
@@ -584,6 +611,7 @@ class Aggregator(nn.Module):
                             token_overlay_dump_config=token_overlay_dump_config,
                             eviction_policy=eviction_policy,
                             eviction_policy_layers=eviction_policy_layers,
+                            profile_eviction=profile_eviction,
                             eviction_debug=eviction_debug,
                             leverage_sketch_dim=leverage_sketch_dim,
                             leverage_granularity=leverage_granularity,
@@ -599,6 +627,7 @@ class Aggregator(nn.Module):
                             leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=leverage_ridge_jitter,
                             leverage_ridge_dim=leverage_ridge_dim,
+                            rls_refresh_interval=rls_refresh_interval,
                             leverage_diag=leverage_diag,
                             leverage_diag_interval=leverage_diag_interval,
                             leverage_random_seed=leverage_random_seed,
@@ -811,6 +840,8 @@ class Aggregator(nn.Module):
         past_key_values=None,
         use_cache=False,
         past_frame_idx=0,
+        current_frame_ids: Optional[List[int]] = None,
+        current_frame_idx: Optional[int] = None,
         current_budgets=None,
         updated_scores=None,
         updated_layer_budget_scores=None,
@@ -825,6 +856,7 @@ class Aggregator(nn.Module):
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
+        profile_eviction: bool = False,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -840,6 +872,7 @@ class Aggregator(nn.Module):
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        rls_refresh_interval: int = 1,
         leverage_diag: bool = False,
         leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
@@ -920,6 +953,8 @@ class Aggregator(nn.Module):
                         past_key_values_block=past_key_values_block,
                         use_cache=True,
                         past_frame_idx=past_frame_idx,
+                        current_frame_ids=current_frame_ids,
+                        current_frame_idx=current_frame_idx,
                         cache_budget=current_budgets[current_global_idx].item(),
                         cache_analysis_config=cache_analysis_config,
                         pre_eviction_snapshot_config=pre_eviction_snapshot_config,
@@ -929,6 +964,7 @@ class Aggregator(nn.Module):
                         token_overlay_dump_config=token_overlay_dump_config,
                         eviction_policy=eviction_policy,
                         eviction_policy_layers=eviction_policy_layers,
+                        profile_eviction=profile_eviction,
                         eviction_debug=eviction_debug,
                         leverage_sketch_dim=leverage_sketch_dim,
                         leverage_granularity=leverage_granularity,
@@ -944,6 +980,7 @@ class Aggregator(nn.Module):
                         leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                         leverage_ridge_jitter=leverage_ridge_jitter,
                         leverage_ridge_dim=leverage_ridge_dim,
+                        rls_refresh_interval=rls_refresh_interval,
                         leverage_diag=leverage_diag,
                         leverage_diag_interval=leverage_diag_interval,
                         leverage_random_seed=leverage_random_seed,
@@ -1088,6 +1125,8 @@ class Aggregator(nn.Module):
         past_key_values_block=None,
         use_cache=False,
         past_frame_idx=0,
+        current_frame_ids: Optional[List[int]] = None,
+        current_frame_idx: Optional[int] = None,
         cache_budget=None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
@@ -1097,6 +1136,7 @@ class Aggregator(nn.Module):
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
+        profile_eviction: bool = False,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -1112,6 +1152,7 @@ class Aggregator(nn.Module):
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        rls_refresh_interval: int = 1,
         leverage_diag: bool = False,
         leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
@@ -1208,9 +1249,12 @@ class Aggregator(nn.Module):
                     token_overlay_dump_config=token_overlay_dump_config,
                     layer_id=global_idx,
                     step_idx=past_frame_idx,
+                    current_frame_ids=current_frame_ids,
+                    current_frame_idx=current_frame_idx,
                     tokens_per_frame=P,
                     eviction_policy=eviction_policy,
                     eviction_policy_layers=eviction_policy_layers,
+                    profile_eviction=profile_eviction,
                     eviction_debug=eviction_debug,
                     leverage_sketch_dim=leverage_sketch_dim,
                     leverage_granularity=leverage_granularity,
@@ -1226,6 +1270,7 @@ class Aggregator(nn.Module):
                     leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                     leverage_ridge_jitter=leverage_ridge_jitter,
                     leverage_ridge_dim=leverage_ridge_dim,
+                    rls_refresh_interval=rls_refresh_interval,
                     leverage_diag=leverage_diag,
                     leverage_diag_interval=leverage_diag_interval,
                     leverage_random_seed=leverage_random_seed,
@@ -1834,6 +1879,142 @@ class Aggregator(nn.Module):
             )
             return budgets.int()
 
+    @staticmethod
+    def _format_profile_line(label: str, count: int, totals: Dict[str, float], keys: List[str]) -> Optional[str]:
+        if count <= 0:
+            return None
+        parts = [f"[EvictionProfileSummary] {label} count={count}"]
+        for key in keys:
+            total = float(totals.get(key, 0.0))
+            parts.append(f"{key}_total={total * 1000.0:.3f}ms")
+            parts.append(f"{key}_mean={(total / count) * 1000.0:.3f}ms")
+        return " ".join(parts)
+
+    def format_eviction_profile_summary(
+        self,
+        total_inference_time: Optional[float] = None,
+        frame_count: Optional[int] = None,
+        stream_profile_totals: Optional[Dict[str, float]] = None,
+    ) -> Optional[str]:
+        lines = []
+        dynamic_line = self._format_profile_line(
+            "dynamic_budget",
+            self._dynamic_budget_profile_count,
+            {"time": self._dynamic_budget_profile_total},
+            ["time"],
+        )
+        if dynamic_line is not None:
+            lines.append(dynamic_line)
+
+        attention_totals: Dict[str, float] = {}
+        attention_count = 0
+        leverage_totals: Dict[str, float] = {}
+        leverage_count = 0
+        for block in self.global_blocks:
+            attn = getattr(block, "attn", None)
+            get_stats = getattr(attn, "get_eviction_profile_stats", None)
+            if get_stats is None:
+                continue
+            stats = get_stats()
+            attention_count += int(stats.get("attention_count", 0))
+            for name, value in stats.get("attention_totals", {}).items():
+                attention_totals[name] = attention_totals.get(name, 0.0) + float(value)
+            leverage_count += int(stats.get("leverage_count", 0))
+            for name, value in stats.get("leverage_totals", {}).items():
+                leverage_totals[name] = leverage_totals.get(name, 0.0) + float(value)
+
+        attention_line = self._format_profile_line(
+            "eviction",
+            attention_count,
+            attention_totals,
+            ["manager_select", "metadata_index_update", "total_eviction"],
+        )
+        if attention_line is not None:
+            lines.append(attention_line)
+
+        leverage_line = self._format_profile_line(
+            "svd_leverage",
+            leverage_count,
+            leverage_totals,
+            [
+                "candidate_matrix_preparation",
+                "pre_projection_normalization",
+                "projection_matmul",
+                "post_projection_normalization",
+                "normalization",
+                "gram",
+                "cholesky",
+                "score_calc",
+                "total",
+            ],
+        )
+        if leverage_line is not None:
+            lines.append(leverage_line)
+
+        if total_inference_time is not None:
+            count = int(frame_count) if frame_count is not None else 0
+            if count > 0:
+                profiled_total = (
+                    float(self._dynamic_budget_profile_total)
+                    + float(attention_totals.get("total_eviction", 0.0))
+                )
+                total = max(float(total_inference_time), 0.0)
+                other_total = max(total - profiled_total, 0.0)
+                lines.append(
+                    " ".join(
+                        [
+                            f"[EvictionProfileSummary] inference count={count}",
+                            f"total_total={total * 1000.0:.3f}ms",
+                            f"total_mean={(total / count) * 1000.0:.3f}ms",
+                            f"profiled_total={profiled_total * 1000.0:.3f}ms",
+                            f"profiled_mean={(profiled_total / count) * 1000.0:.3f}ms",
+                            f"other_total={other_total * 1000.0:.3f}ms",
+                            f"other_mean={(other_total / count) * 1000.0:.3f}ms",
+                        ]
+                    )
+                )
+
+        if stream_profile_totals is not None:
+            count = int(frame_count) if frame_count is not None else 0
+            if count > 0:
+                stream_totals = {
+                    str(name): float(value)
+                    for name, value in stream_profile_totals.items()
+                }
+                aggregator_profiled = (
+                    float(attention_totals.get("total_eviction", 0.0))
+                    + float(self._dynamic_budget_profile_total)
+                )
+                aggregator_non_eviction = max(
+                    float(stream_totals.get("aggregator_forward", 0.0)) - aggregator_profiled,
+                    0.0,
+                )
+                stream_totals["aggregator_non_eviction"] = aggregator_non_eviction
+                stream_line = self._format_profile_line(
+                    "stream_detail",
+                    count,
+                    stream_totals,
+                    [
+                        "input_prepare",
+                        "aggregator_forward",
+                        "aggregator_non_eviction",
+                        "heads_total",
+                        "camera_head",
+                        "depth_head",
+                        "point_head",
+                        "track_head",
+                        "anchor_cache_update",
+                        "result_pack",
+                        "cpu_transfer",
+                        "frame_writer",
+                        "result_cache",
+                        "empty_cache",
+                    ],
+                )
+                if stream_line is not None:
+                    lines.append(stream_line)
+
+        return "\n".join(lines) if lines else None
 
 def slice_expand_and_flatten(token_tensor, B, S):
     """

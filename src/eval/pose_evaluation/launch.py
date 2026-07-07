@@ -46,6 +46,11 @@ def validate_streamvggt_args(args):
         raise SystemExit(f"Error: --max_frames must be >= 1, got {args.max_frames}.")
     if args.kf_every < 1:
         raise SystemExit(f"Error: --kf_every must be >= 1, got {args.kf_every}.")
+    if args.stream_chunk_size < 1:
+        raise SystemExit(
+            "Error: --stream_chunk_size must be >= 1, "
+            f"got {args.stream_chunk_size}."
+        )
     if args.eviction_protect_recent_frames < 0:
         raise SystemExit(
             "Error: --eviction_protect_recent_frames must be >= 0, "
@@ -234,6 +239,11 @@ def validate_streamvggt_args(args):
             "Error: --leverage_ridge_dim must be >= 1 when provided, "
             f"got {args.leverage_ridge_dim}."
         )
+    if args.rls_refresh_interval <= 0:
+        raise SystemExit(
+            "Error: --rls_refresh_interval must be >= 1, "
+            f"got {args.rls_refresh_interval}."
+        )
     if args.leverage_approx_method == "right_sketch_ridge" and args.leverage_ridge_dim is None:
         raise SystemExit(
             "Error: --leverage_approx_method right_sketch_ridge requires "
@@ -286,6 +296,7 @@ def validate_streamvggt_args(args):
             f"ridge_dim={args.leverage_ridge_dim}, ridge_lambda={args.leverage_ridge_lambda}, "
             f"ridge_lambda_mode={args.leverage_ridge_lambda_mode}, "
             f"ridge_chunk={args.leverage_ridge_score_chunk_size}, ridge_jitter={args.leverage_ridge_jitter}, "
+            f"rls_refresh_interval={args.rls_refresh_interval}, "
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
@@ -428,6 +439,13 @@ def get_args_parser():
     parser.add_argument("--size", type=int, default="224")
     parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
     parser.add_argument("--kf_every", type=int, default=1, help="take one frame every N frames")
+    parser.add_argument(
+        "--stream_chunk_size",
+        "--stream-chunk-size",
+        type=int,
+        default=1,
+        help="Number of consecutive stream frames to process in one chunk-causal forward",
+    )
     parser.add_argument("--use_proj", action="store_true")
     parser.add_argument("--eviction_policy", type=str, default="mean", help="Cache eviction policy: mean, baseline_mean, svd_leverage, or dpp")
     parser.add_argument(
@@ -527,6 +545,13 @@ def get_args_parser():
         type=int,
         default=None,
         help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge",
+    )
+    parser.add_argument(
+        "--rls_refresh_interval",
+        "--rls-refresh-interval",
+        type=int,
+        default=1,
+        help="Refresh interval for ridge leverage K^T K and Cholesky factorization; 1 refreshes every frame",
     )
     parser.add_argument(
         "--leverage_diag",
@@ -766,6 +791,18 @@ def get_args_parser():
     parser.add_argument("--coverage_threshold", "--coverage-threshold", type=float, default=0.2)
     parser.add_argument("--camera_motion_threshold", "--camera-motion-threshold", type=float, default=0.2)
     parser.add_argument("--anchor_keep_ratio", "--anchor-keep-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--eviction_debug",
+        "--eviction-debug",
+        action="store_true",
+        help="Print verbose eviction summaries without enabling latency profiling",
+    )
+    parser.add_argument(
+        "--profile_eviction",
+        "--profile-eviction",
+        action="store_true",
+        help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior",
+    )
     parser.add_argument(
         "--enable_svd_eviction_merge",
         "--enable-svd-eviction-merge",
@@ -1147,6 +1184,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         output = model.inference(
                             frames,
                             total_budget=args.budget,
+                            stream_chunk_size=args.stream_chunk_size,
                             budget_frame_multiplier=args.budget_frame_multiplier,
                             eviction_policy=args.eviction_policy,
                             leverage_sketch_dim=args.leverage_sketch_dim,
@@ -1163,6 +1201,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                             leverage_ridge_jitter=args.leverage_ridge_jitter,
                             leverage_ridge_dim=args.leverage_ridge_dim,
+                            rls_refresh_interval=args.rls_refresh_interval,
                             leverage_diag=args.leverage_diag,
                             leverage_diag_interval=args.leverage_diag_interval,
                             leverage_random_seed=args.leverage_random_seed,
@@ -1212,6 +1251,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             coverage_threshold=args.coverage_threshold,
                             camera_motion_threshold=args.camera_motion_threshold,
                             anchor_keep_ratio=args.anchor_keep_ratio,
+                            profile_eviction=args.profile_eviction,
+                            eviction_debug=args.eviction_debug,
                             leverage_score_histogram_config=leverage_score_histogram_config,
                             recent_merge_config=recent_merge_config,
                             svd_eviction_merge_config=svd_eviction_merge_config,

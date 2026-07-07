@@ -161,6 +161,13 @@ def get_args_parser():
     parser.add_argument("--revisit", type=int, default=1, help="revisit times")
     parser.add_argument("--freeze", action="store_true")
     parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
+    parser.add_argument(
+        "--stream_chunk_size",
+        "--stream-chunk-size",
+        type=int,
+        default=1,
+        help="Number of consecutive stream frames to process in one chunk-causal forward",
+    )
     parser.add_argument("--use_proj", action="store_true")
     parser.add_argument("--eviction_policy", type=str, default="svd_leverage", help="Cache eviction policy: mean, baseline_mean, svd_leverage, or dpp")
     parser.add_argument(
@@ -274,6 +281,13 @@ def get_args_parser():
         type=int,
         default=None,
         help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge",
+    )
+    parser.add_argument(
+        "--rls_refresh_interval",
+        "--rls-refresh-interval",
+        type=int,
+        default=1,
+        help="Refresh interval for ridge leverage K^T K and Cholesky factorization; 1 refreshes every frame",
     )
     parser.add_argument(
         "--leverage_diag",
@@ -514,7 +528,7 @@ def get_args_parser():
         "--eviction_debug",
         "--eviction-debug",
         action="store_true",
-        help="Print eviction summaries and svd_leverage timing/profile fields",
+        help="Print verbose eviction summaries without enabling latency profiling",
     )
     parser.add_argument(
         "--history_anchor_strategy",
@@ -770,6 +784,11 @@ def main(args):
         raise SystemExit(f"Error: {exc}") from exc
     if global_attn_idx_ranges is not None:
         print(f"Global attention index ranges enabled: {global_attn_idx_ranges}")
+    if args.stream_chunk_size < 1:
+        raise SystemExit(
+            "Error: --stream_chunk_size must be >= 1, "
+            f"got {args.stream_chunk_size}."
+        )
     if args.eviction_protect_recent_frames < 0:
         raise SystemExit(
             "Error: --eviction_protect_recent_frames must be >= 0, "
@@ -978,6 +997,11 @@ def main(args):
             "Error: --leverage_ridge_dim must be >= 1 when provided, "
             f"got {args.leverage_ridge_dim}."
         )
+    if args.rls_refresh_interval <= 0:
+        raise SystemExit(
+            "Error: --rls_refresh_interval must be >= 1, "
+            f"got {args.rls_refresh_interval}."
+        )
     if args.leverage_approx_method == "right_sketch_ridge" and args.leverage_ridge_dim is None:
         raise SystemExit(
             "Error: --leverage_approx_method right_sketch_ridge requires "
@@ -1055,6 +1079,7 @@ def main(args):
             f"ridge_dim={args.leverage_ridge_dim}, ridge_lambda={args.leverage_ridge_lambda}, "
             f"ridge_lambda_mode={args.leverage_ridge_lambda_mode}, "
             f"ridge_chunk={args.leverage_ridge_score_chunk_size}, ridge_jitter={args.leverage_ridge_jitter}, "
+            f"rls_refresh_interval={args.rls_refresh_interval}, "
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
@@ -1465,6 +1490,7 @@ def main(args):
                                 results = model.inference(
                                     batch,
                                     eviction_policy=args.eviction_policy,
+                                    stream_chunk_size=args.stream_chunk_size,
                                     budget_frame_multiplier=args.budget_frame_multiplier,
                                     eviction_policy_layers=eviction_policy_layers,
                                     leverage_sketch_dim=args.leverage_sketch_dim,
@@ -1482,6 +1508,7 @@ def main(args):
                                     leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                                     leverage_ridge_jitter=args.leverage_ridge_jitter,
                                     leverage_ridge_dim=args.leverage_ridge_dim,
+                                    rls_refresh_interval=args.rls_refresh_interval,
                                     leverage_diag=args.leverage_diag,
                                     leverage_diag_interval=args.leverage_diag_interval,
                                     leverage_random_seed=args.leverage_random_seed,
@@ -1532,7 +1559,8 @@ def main(args):
                                     coverage_threshold=args.coverage_threshold,
                                     camera_motion_threshold=args.camera_motion_threshold,
                                     anchor_keep_ratio=args.anchor_keep_ratio,
-                                    eviction_debug=args.eviction_debug or args.profile_eviction,
+                                    profile_eviction=args.profile_eviction,
+                                    eviction_debug=args.eviction_debug,
                                     eviction_nn_analysis_config=eviction_nn_analysis_config,
                                     leverage_score_histogram_config=leverage_score_histogram_config,
                                     projected_norm_histogram_config=projected_norm_histogram_config,

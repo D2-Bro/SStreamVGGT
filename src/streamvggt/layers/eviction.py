@@ -422,6 +422,7 @@ class EvictionManager:
     def __init__(
         self,
         policy: str = "mean",
+        profile: bool = False,
         debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -438,6 +439,7 @@ class EvictionManager:
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        rls_refresh_interval: int = 1,
         leverage_diag: bool = False,
         leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
@@ -641,6 +643,8 @@ class EvictionManager:
             raise ValueError(f"leverage_ridge_jitter must be > 0, got {leverage_ridge_jitter}")
         if leverage_ridge_dim is not None and leverage_ridge_dim < 1:
             raise ValueError(f"leverage_ridge_dim must be >= 1 or None, got {leverage_ridge_dim}")
+        if rls_refresh_interval <= 0:
+            raise ValueError(f"rls_refresh_interval must be >= 1, got {rls_refresh_interval}")
         if leverage_diag_interval < 0:
             raise ValueError(f"leverage_diag_interval must be >= 0, got {leverage_diag_interval}")
         if leverage_approx_method == "right_sketch_ridge" and leverage_ridge_dim is None:
@@ -697,7 +701,8 @@ class EvictionManager:
                     "leverage_projected_key_cache only supports shared layer keep-set selectors"
                 )
         self.policy = policy
-        self.debug = debug
+        self.profile = bool(profile)
+        self.debug = bool(debug)
         self.leverage_sketch_dim = leverage_sketch_dim
         self.leverage_granularity = leverage_granularity
         self.leverage_feature = leverage_feature
@@ -713,6 +718,7 @@ class EvictionManager:
         self.leverage_ridge_score_chunk_size = int(leverage_ridge_score_chunk_size)
         self.leverage_ridge_jitter = float(leverage_ridge_jitter)
         self.leverage_ridge_dim = leverage_ridge_dim
+        self.rls_refresh_interval = int(rls_refresh_interval)
         self.leverage_diag = bool(leverage_diag)
         self.leverage_diag_interval = int(leverage_diag_interval)
         self.leverage_random_seed = int(leverage_random_seed)
@@ -747,6 +753,8 @@ class EvictionManager:
         self._leverage_right_sketch_cache = {}
         self._leverage_left_srht_cache = {}
         self._last_leverage_profile: Dict[str, float] = {}
+        self._profile_totals: Dict[str, float] = {}
+        self._profile_count = 0
         self._last_layer_feature_shape: Optional[tuple[int, int]] = None
         self._last_layer_covariance_pr: Optional[torch.Tensor] = None
         self._last_dpp_recency_debug: Dict[str, float] = {}
@@ -762,6 +770,32 @@ class EvictionManager:
         self._last_projected_key_head_features: Optional[torch.Tensor] = None
         self._last_projected_key_pre_norms: Optional[torch.Tensor] = None
         self._last_projected_key_cache_meta: Optional[Dict[str, object]] = None
+        self.reset_rls_cache()
+
+    def reset_profile_stats(self) -> None:
+        self._profile_totals = {}
+        self._profile_count = 0
+
+    def reset_rls_cache(self) -> None:
+        self.cached_ktk: Optional[torch.Tensor] = None
+        self.cached_rls_chol: Optional[torch.Tensor] = None
+        self.cached_rls_inv: Optional[torch.Tensor] = None
+        self.cached_rls_lam: Optional[torch.Tensor] = None
+        self.cached_rls_meta: Optional[Dict[str, object]] = None
+        self.last_rls_refresh_frame: Optional[int] = None
+        self.rls_refresh_count = 0
+        self.rls_cache_hit_count = 0
+
+    def _record_profile_event(self, profile: Dict[str, float]) -> None:
+        if not profile:
+            return
+        self._profile_count += 1
+        for name, value in profile.items():
+            if isinstance(value, (int, float)):
+                self._profile_totals[name] = self._profile_totals.get(name, 0.0) + float(value)
+
+    def get_profile_stats(self) -> Dict[str, object]:
+        return {"count": self._profile_count, "totals": dict(self._profile_totals)}
 
     def select(
         self,
@@ -817,6 +851,7 @@ class EvictionManager:
         self._set_leverage_diag_context(
             layer_id=layer_id,
             step_idx=step_idx,
+            current_frame_idx=current_frame_idx,
             granularity=self.leverage_granularity,
             batch_size=B,
             num_heads=H,
@@ -1044,6 +1079,10 @@ class EvictionManager:
                     f"leverage_ridge_score_chunk_size={self.leverage_ridge_score_chunk_size} "
                     f"leverage_ridge_jitter={self.leverage_ridge_jitter} "
                     f"leverage_ridge_dim={self.leverage_ridge_dim} "
+                    f"rls_refresh_interval={self.rls_refresh_interval} "
+                    f"last_rls_refresh_frame={self.last_rls_refresh_frame} "
+                    f"rls_refresh_count={self.rls_refresh_count} "
+                    f"rls_cache_hit_count={self.rls_cache_hit_count} "
                     f"leverage_random_seed={self.leverage_random_seed} "
                     f"leverage_granularity={self.leverage_granularity} leverage_feature={self.leverage_feature} "
                     f"leverage_projection={self.leverage_projection} "
@@ -1092,6 +1131,8 @@ class EvictionManager:
             elif self.policy == "dpp" and self.leverage_granularity == "layer":
                 print(f"[EvictionManager] layer-wise DPP features: X shape={self._last_layer_feature_shape}")
             if self.policy == "svd_leverage" and self._last_leverage_profile:
+                if "scoring" in self._last_leverage_profile and "score_calc" not in self._last_leverage_profile:
+                    self._last_leverage_profile["score_calc"] = self._last_leverage_profile["scoring"]
                 profile_items = []
                 time_fields = {
                     "candidate_matrix_preparation",
@@ -1099,6 +1140,10 @@ class EvictionManager:
                     "sketch",
                     "sketch_matrix_retrieval",
                     "projection_matmul",
+                    "normalization",
+                    "pre_projection_normalization",
+                    "post_projection_normalization",
+                    "pre_score_normalization",
                     "qr",
                     "small_qr",
                     "left_sketch",
@@ -1108,9 +1153,10 @@ class EvictionManager:
                     "cholesky",
                     "score_solve",
                     "scoring",
+                    "score_calc",
                     "total",
                 }
-                int_fields = {"fallback", "N", "D", "sketch_dim", "cholesky_retries"}
+                int_fields = {"fallback", "N", "D", "sketch_dim", "cholesky_retries", "rls_refresh_interval", "rls_frame_idx", "rls_cache_refreshed", "rls_refresh_frame", "rls_refresh_count", "rls_cache_hit_count"}
                 for name, value in self._last_leverage_profile.items():
                     if isinstance(value, str):
                         profile_items.append(f"{name}={value}")
@@ -1121,7 +1167,45 @@ class EvictionManager:
                     else:
                         profile_items.append(f"{name}={float(value):.6g}")
                 profile = " ".join(profile_items)
-                print(f"[EvictionManager] svd_leverage_profile {profile}")
+                self._record_profile_event(self._last_leverage_profile)
+        if self.profile and not self.debug and self.policy == "svd_leverage" and self._last_leverage_profile:
+            if "scoring" in self._last_leverage_profile and "score_calc" not in self._last_leverage_profile:
+                self._last_leverage_profile["score_calc"] = self._last_leverage_profile["scoring"]
+            profile_items = []
+            time_fields = {
+                "candidate_matrix_preparation",
+                "feature",
+                "sketch",
+                "sketch_matrix_retrieval",
+                "projection_matmul",
+                "normalization",
+                "pre_projection_normalization",
+                "post_projection_normalization",
+                "pre_score_normalization",
+                "qr",
+                "small_qr",
+                "left_sketch",
+                "right_jl_solve",
+                "omega_gemm",
+                "gram",
+                "cholesky",
+                "score_solve",
+                "scoring",
+                "score_calc",
+                "total",
+            }
+            int_fields = {"fallback", "N", "D", "sketch_dim", "cholesky_retries", "rls_refresh_interval", "rls_frame_idx", "rls_cache_refreshed", "rls_refresh_frame", "rls_refresh_count", "rls_cache_hit_count"}
+            for name, value in self._last_leverage_profile.items():
+                if isinstance(value, str):
+                    profile_items.append(f"{name}={value}")
+                elif name in int_fields:
+                    profile_items.append(f"{name}={int(value)}")
+                elif name in time_fields:
+                    profile_items.append(f"{name}={value * 1000.0:.3f}ms")
+                else:
+                    profile_items.append(f"{name}={float(value):.6g}")
+            profile = " ".join(profile_items)
+            self._record_profile_event(self._last_leverage_profile)
         if self.leverage_dpp_recency_debug and self._last_dpp_recency_debug.get("count", 0.0) > 0.0:
             print(
                 self._format_dpp_recency_debug(
@@ -2538,7 +2622,6 @@ class EvictionManager:
         local_evicted = torch.topk(eviction_scores, k=int(num_to_evict), dim=0).indices
         return pool.index_select(0, local_evicted)
 
-
     @staticmethod
     def _dpp_similarity_sq_to_selected(features: torch.Tensor, selected_local: torch.Tensor) -> torch.Tensor:
         selected_features = features.index_select(0, selected_local.reshape(-1))
@@ -2574,7 +2657,6 @@ class EvictionManager:
                 features = torch.cat([features, value_features], dim=-1)
         self._last_layer_feature_shape = tuple(features.shape)
         return features
-
 
     def _combine_history_anchor_patch_topk_mask(
         self,
@@ -2915,6 +2997,46 @@ class EvictionManager:
         if tensor.is_cuda and torch.cuda.is_available():
             torch.cuda.synchronize(tensor.device)
 
+    @staticmethod
+    def _profile_add(profile: Dict[str, float], name: str, elapsed: float) -> None:
+        profile[name] = profile.get(name, 0.0) + elapsed
+
+    def _profile_normalize_rows(
+        self,
+        x: torch.Tensor,
+        profile: Optional[Dict[str, float]],
+        name: str,
+    ) -> torch.Tensor:
+        if not self.leverage_normalize_rows:
+            return x
+        do_profile = profile is not None and self.profile
+        start = time.perf_counter() if do_profile else 0.0
+        normalized = F.normalize(x, p=2, dim=-1, eps=1e-12)
+        if do_profile:
+            self._sync_for_timing(normalized)
+            elapsed = time.perf_counter() - start
+            self._profile_add(profile, name, elapsed)
+            if name != "normalization":
+                self._profile_add(profile, "normalization", elapsed)
+        return normalized
+
+    def _profile_normalize_layer_key_before_projection(
+        self,
+        mat_k: torch.Tensor,
+        profile: Optional[Dict[str, float]],
+    ) -> torch.Tensor:
+        if not self.leverage_normalize_before_projection:
+            return mat_k
+        do_profile = profile is not None and self.profile
+        start = time.perf_counter() if do_profile else 0.0
+        normalized = self._normalize_layer_key_before_projection(mat_k)
+        if do_profile:
+            self._sync_for_timing(normalized)
+            elapsed = time.perf_counter() - start
+            self._profile_add(profile, "pre_projection_normalization", elapsed)
+            self._profile_add(profile, "normalization", elapsed)
+        return normalized
+
     def _maybe_normalize_rows(self, x: torch.Tensor) -> torch.Tensor:
         if not self.leverage_normalize_rows:
             return x
@@ -2926,6 +3048,56 @@ class EvictionManager:
 
     def _needs_layer_covariance_pr(self) -> bool:
         return self.layer_budget_strategy in COVARIANCE_LAYER_BUDGET_STRATEGIES
+
+    def _resolve_rls_frame_idx(self) -> int:
+        for key in ("current_frame_idx", "step_idx"):
+            value = self._leverage_diag_context.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    def _rls_cache_meta_for(
+        self,
+        mat: torch.Tensor,
+        work: torch.Tensor,
+        *,
+        granularity: str,
+        basis_kind: str,
+        sketch_dim: Optional[int],
+    ) -> Dict[str, object]:
+        device = work.device
+        return {
+            "leading_shape": tuple(int(x) for x in work.shape[:-2]),
+            "feature_dim": int(work.shape[-1]),
+            "device_type": device.type,
+            "device_index": device.index,
+            "source_dtype": str(mat.dtype),
+            "work_dtype": str(work.dtype),
+            "granularity": granularity,
+            "basis_kind": basis_kind,
+            "sketch_dim": None if sketch_dim is None else int(sketch_dim),
+            "ridge_lambda": float(self.leverage_ridge_lambda),
+            "ridge_lambda_mode": self.leverage_ridge_lambda_mode,
+            "ridge_jitter": float(self.leverage_ridge_jitter),
+        }
+
+    def _should_refresh_rls_cache(self, frame_idx: int, meta: Dict[str, object]) -> bool:
+        if self.cached_rls_meta != meta:
+            return True
+        if self.cached_ktk is None or self.cached_rls_lam is None:
+            return True
+        if self.cached_rls_chol is None and self.cached_rls_inv is None:
+            return True
+        interval = int(self.rls_refresh_interval)
+        if int(frame_idx) % interval == 0:
+            return True
+        if self.last_rls_refresh_frame is None:
+            return True
+        return int(frame_idx) - int(self.last_rls_refresh_frame) >= interval
 
     def _set_last_layer_covariance_pr_from_gram(self, gram: torch.Tensor) -> None:
         if self._needs_layer_covariance_pr():
@@ -2941,6 +3113,7 @@ class EvictionManager:
         *,
         layer_id: Optional[int],
         step_idx: Optional[int],
+        current_frame_idx: Optional[int],
         granularity: str,
         batch_size: int,
         num_heads: int,
@@ -2948,6 +3121,7 @@ class EvictionManager:
         self._leverage_diag_context = {
             "layer_id": layer_id,
             "step_idx": step_idx,
+            "current_frame_idx": current_frame_idx,
             "granularity": granularity,
             "batch_size": int(batch_size),
             "num_heads": int(num_heads),
@@ -3103,9 +3277,12 @@ class EvictionManager:
     ) -> torch.Tensor | tuple[torch.Tensor, SvdLeverageBasis]:
         num_tokens = int(mat.shape[-2])
         feature_dim = int(mat.shape[-1])
+        frame_idx = self._resolve_rls_frame_idx()
         profile["method"] = basis_kind
         profile["N"] = float(num_tokens)
         profile.setdefault("D", float(feature_dim))
+        profile["rls_refresh_interval"] = float(self.rls_refresh_interval)
+        profile["rls_frame_idx"] = float(frame_idx)
         if sketch_dim is not None:
             profile["sketch_dim"] = float(sketch_dim)
 
@@ -3113,47 +3290,111 @@ class EvictionManager:
             work = torch.nan_to_num(mat.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
             eye = torch.eye(feature_dim, device=work.device, dtype=torch.float32)
             eye = eye.view(*((1,) * (work.ndim - 2)), feature_dim, feature_dim)
+            meta = self._rls_cache_meta_for(
+                mat,
+                work,
+                granularity=granularity,
+                basis_kind=basis_kind,
+                sketch_dim=sketch_dim,
+            )
+            refresh = self._should_refresh_rls_cache(frame_idx, meta)
 
-            gram_start = time.perf_counter() if do_profile else 0.0
-            gram = work.transpose(-2, -1) @ work
-            self._set_last_layer_covariance_pr_from_gram(gram)
-            if do_profile:
-                self._sync_for_timing(gram)
-                profile["gram"] = time.perf_counter() - gram_start
-
-            trace = torch.diagonal(gram, dim1=-2, dim2=-1).sum(dim=-1)
-            scale = trace / float(max(feature_dim, 1))
-            eps = torch.finfo(torch.float32).eps
-            if self.leverage_ridge_lambda_mode == "absolute":
-                lam = torch.full_like(scale, float(self.leverage_ridge_lambda))
-            else:
-                lam = float(self.leverage_ridge_lambda) * scale.clamp_min(eps)
-            jitter_scale = torch.maximum(scale, torch.ones_like(scale))
-
-            chol_start = time.perf_counter() if do_profile else 0.0
+            # rls_refresh_interval controls how often the key covariance inverse used for ridge leverage
+            # score estimation is refreshed. When set to 1, the covariance inverse is recomputed every
+            # frame. When set to r > 1, the inverse from the last refresh frame is reused for the
+            # intermediate frames, reducing the cost of repeated K^T K and inverse computations at the
+            # expense of using a slightly stale RLS estimator. The current stream API carries one
+            # current_frame_idx per call, so mixed video streams in one batch share this refresh cadence.
+            gram = None
+            lam = None
             chol = None
-            last_a = None
+            inv_a = None
+            fallback_state = 0.0
             retries = 0
-            for retry_idx, jitter_multiplier in enumerate((1.0, 10.0, 100.0, 1000.0)):
-                diag_add = lam + float(self.leverage_ridge_jitter) * float(jitter_multiplier) * jitter_scale
-                last_a = gram + diag_add.unsqueeze(-1).unsqueeze(-1) * eye
-                chol, info = torch.linalg.cholesky_ex(last_a)
-                if not bool((info != 0).any().item()):
-                    retries = retry_idx
-                    break
-                chol = None
-                retries = retry_idx + 1
-            if do_profile:
-                if chol is not None:
-                    self._sync_for_timing(chol)
-                elif last_a is not None:
-                    self._sync_for_timing(last_a)
-                profile["cholesky"] = time.perf_counter() - chol_start
-                profile["lambda_value"] = float(torch.nan_to_num(lam.detach().float()).mean().item())
-                profile["cholesky_retries"] = float(retries)
+            if refresh:
+                gram_start = time.perf_counter() if do_profile else 0.0
+                gram = work.transpose(-2, -1) @ work
+                self._set_last_layer_covariance_pr_from_gram(gram)
+                if do_profile:
+                    self._sync_for_timing(gram)
+                    profile["gram"] = time.perf_counter() - gram_start
+
+                trace = torch.diagonal(gram, dim1=-2, dim2=-1).sum(dim=-1)
+                scale = trace / float(max(feature_dim, 1))
+                eps = torch.finfo(torch.float32).eps
+                if self.leverage_ridge_lambda_mode == "absolute":
+                    lam = torch.full_like(scale, float(self.leverage_ridge_lambda))
+                else:
+                    lam = float(self.leverage_ridge_lambda) * scale.clamp_min(eps)
+                jitter_scale = torch.maximum(scale, torch.ones_like(scale))
+
+                chol_start = time.perf_counter() if do_profile else 0.0
+                last_a = None
+                for retry_idx, jitter_multiplier in enumerate((1.0, 10.0, 100.0, 1000.0)):
+                    diag_add = lam + float(self.leverage_ridge_jitter) * float(jitter_multiplier) * jitter_scale
+                    last_a = gram + diag_add.unsqueeze(-1).unsqueeze(-1) * eye
+                    chol, info = torch.linalg.cholesky_ex(last_a)
+                    if not bool((info != 0).any().item()):
+                        retries = retry_idx
+                        break
+                    chol = None
+                    retries = retry_idx + 1
+                if chol is None and last_a is not None:
+                    try:
+                        inv_a = torch.linalg.pinv(last_a)
+                        fallback_state = 1.0
+                    except RuntimeError:
+                        inv_a = None
+                        fallback_state = 2.0
+                if do_profile:
+                    if chol is not None:
+                        self._sync_for_timing(chol)
+                    elif inv_a is not None:
+                        self._sync_for_timing(inv_a)
+                    elif last_a is not None:
+                        self._sync_for_timing(last_a)
+                    profile["cholesky"] = time.perf_counter() - chol_start
+                    profile["lambda_value"] = float(torch.nan_to_num(lam.detach().float()).mean().item())
+                    profile["cholesky_retries"] = float(retries)
+
+                if chol is not None or inv_a is not None:
+                    self.cached_ktk = gram.detach()
+                    self.cached_rls_chol = chol.detach() if chol is not None else None
+                    self.cached_rls_inv = inv_a.detach() if inv_a is not None else None
+                    self.cached_rls_lam = lam.detach()
+                    self.cached_rls_meta = dict(meta)
+                    self.last_rls_refresh_frame = int(frame_idx)
+                else:
+                    self.cached_ktk = None
+                    self.cached_rls_chol = None
+                    self.cached_rls_inv = None
+                    self.cached_rls_lam = None
+                    self.cached_rls_meta = None
+                    self.last_rls_refresh_frame = None
+                self.rls_refresh_count += 1
+            else:
+                gram = self.cached_ktk
+                lam = self.cached_rls_lam
+                chol = self.cached_rls_chol
+                inv_a = self.cached_rls_inv
+                self.rls_cache_hit_count += 1
+                if gram is None or lam is None or (chol is None and inv_a is None):
+                    raise RuntimeError("RLS cache was selected for reuse but no valid cached factorization exists")
+                self._set_last_layer_covariance_pr_from_gram(gram)
+                if chol is None:
+                    fallback_state = 1.0
+                if do_profile:
+                    profile["gram"] = 0.0
+                    profile["cholesky"] = 0.0
+                    profile["lambda_value"] = float(torch.nan_to_num(lam.detach().float()).mean().item())
+                    profile["cholesky_retries"] = 0.0
+
+            profile["rls_cache_refreshed"] = 1.0 if refresh else 0.0
+            profile["rls_refresh_frame"] = float(-1 if self.last_rls_refresh_frame is None else self.last_rls_refresh_frame)
+            profile["rls_refresh_count"] = float(self.rls_refresh_count)
+            profile["rls_cache_hit_count"] = float(self.rls_cache_hit_count)
 
             score_start = time.perf_counter() if do_profile else 0.0
-            fallback = 0.0
             if chol is not None:
                 chunks = []
                 chunk_size = int(self.leverage_ridge_score_chunk_size)
@@ -3163,16 +3404,14 @@ class EvictionManager:
                     solved = torch.cholesky_solve(rhs, chol)
                     chunks.append((rhs * solved).sum(dim=-2))
                 scores = torch.cat(chunks, dim=-1) if chunks else torch.empty(*work.shape[:-1], device=work.device, dtype=torch.float32)
+                fallback = 0.0
+            elif inv_a is not None:
+                transformed = work @ inv_a
+                scores = (transformed * work).sum(dim=-1)
+                fallback = 1.0
             else:
-                try:
-                    assert last_a is not None
-                    inv_a = torch.linalg.pinv(last_a)
-                    transformed = work @ inv_a
-                    scores = (transformed * work).sum(dim=-1)
-                    fallback = 1.0
-                except RuntimeError:
-                    scores = work.square().sum(dim=-1)
-                    fallback = 2.0
+                scores = work.square().sum(dim=-1)
+                fallback = max(fallback_state, 2.0)
             scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
             self._maybe_print_leverage_diag(
                 scores=scores,
@@ -3225,12 +3464,13 @@ class EvictionManager:
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
             projection_start = time.perf_counter() if do_profile else 0.0
             projected = mat @ omega
-            self._capture_projected_pre_normalization_norms(projected)
-            projected = self._maybe_normalize_rows(projected)
-            self._store_projected_similarity_features(projected, granularity)
             if do_profile:
                 self._sync_for_timing(projected)
                 profile["projection_matmul"] = time.perf_counter() - projection_start
+            self._capture_projected_pre_normalization_norms(projected)
+            projected = self._profile_normalize_rows(projected, profile if do_profile else None, "post_projection_normalization")
+            self._store_projected_similarity_features(projected, granularity)
+            if do_profile:
                 profile["sketch"] = profile["sketch_matrix_retrieval"] + profile["projection_matmul"]
         return self._ridge_leverage_scores_from_matrix(
             projected,
@@ -3299,12 +3539,13 @@ class EvictionManager:
                     profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
                 projection_start = time.perf_counter() if do_profile else 0.0
                 leverage_matrix = mat @ omega
-                self._capture_projected_pre_normalization_norms(leverage_matrix)
-                leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
-                self._store_projected_similarity_features(leverage_matrix, granularity)
                 if do_profile:
                     self._sync_for_timing(leverage_matrix)
                     profile["projection_matmul"] = time.perf_counter() - projection_start
+                self._capture_projected_pre_normalization_norms(leverage_matrix)
+                leverage_matrix = self._profile_normalize_rows(leverage_matrix, profile if do_profile else None, "post_projection_normalization")
+                self._store_projected_similarity_features(leverage_matrix, granularity)
+                if do_profile:
                     profile["sketch"] = profile["sketch_matrix_retrieval"] + profile["projection_matmul"]
 
             self._set_last_layer_covariance_pr_from_matrix(leverage_matrix)
@@ -3368,7 +3609,7 @@ class EvictionManager:
 
         active_sketch_dim = self.leverage_sketch_dim if sketch_dim is None else sketch_dim
         profile: Dict[str, float] = {}
-        do_profile = self.debug
+        do_profile = self.profile
 
         if do_profile:
             self._sync_for_timing(x)
@@ -3378,7 +3619,7 @@ class EvictionManager:
             mat = torch.nan_to_num(x.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
             method = self._resolve_leverage_approx_method(active_sketch_dim)
             if self._normalizes_before_projection(method):
-                mat = self._maybe_normalize_rows(mat)
+                mat = self._profile_normalize_rows(mat, profile if do_profile else None, "pre_score_normalization")
         if do_profile:
             self._sync_for_timing(mat)
             profile["candidate_matrix_preparation"] = time.perf_counter() - prep_start
@@ -3412,7 +3653,7 @@ class EvictionManager:
             return scores
 
         profile: Dict[str, float] = {}
-        do_profile = self.debug
+        do_profile = self.profile
         if do_profile:
             self._sync_for_timing(candidate_k)
         total_start = time.perf_counter() if do_profile else 0.0
@@ -3421,7 +3662,7 @@ class EvictionManager:
             mat = torch.nan_to_num(candidate_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
             method = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
             if self._normalizes_before_projection(method):
-                mat = self._maybe_normalize_rows(mat)
+                mat = self._profile_normalize_rows(mat, profile if do_profile else None, "pre_score_normalization")
         if do_profile:
             self._sync_for_timing(mat)
             profile["candidate_matrix_preparation"] = time.perf_counter() - prep_start
@@ -3495,12 +3736,13 @@ class EvictionManager:
             "fallback": 0.0,
         }
         if self.leverage_normalize_before_projection:
-            candidate_k = self._normalize_layer_key_before_projection(
-                torch.nan_to_num(candidate_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            candidate_k = self._profile_normalize_layer_key_before_projection(
+                torch.nan_to_num(candidate_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0),
+                aggregate_profile,
             )
 
         for batch_idx in range(B):
-            feature_start = time.perf_counter() if self.debug else 0.0
+            feature_start = time.perf_counter() if self.profile else 0.0
             x_key = candidate_k[batch_idx].transpose(0, 1).reshape(N, H * D)
             if self.leverage_feature in KV_LEVERAGE_FEATURES:
                 assert candidate_v is not None
@@ -3508,9 +3750,9 @@ class EvictionManager:
                 x_layer = torch.cat([x_key, x_value], dim=-1)
             else:
                 x_layer = x_key
-            if self.debug:
+            if self.profile:
                 self._sync_for_timing(x_layer)
-            feature_time = time.perf_counter() - feature_start if self.debug else 0.0
+            feature_time = time.perf_counter() - feature_start if self.profile else 0.0
             if return_basis:
                 score, basis = self.compute_svd_leverage_scores(
                     x_layer,
@@ -3525,14 +3767,14 @@ class EvictionManager:
             scores.append(score)
             if self._needs_layer_covariance_pr() and self._last_layer_covariance_pr is not None:
                 covariance_prs.append(self._last_layer_covariance_pr.reshape(()))
-            if self.debug:
+            if self.profile:
                 aggregate_profile["feature"] += feature_time
                 for name, value in self._last_leverage_profile.items():
                     if isinstance(value, (int, float)):
                         aggregate_profile[name] = aggregate_profile.get(name, 0.0) + value
                     else:
                         aggregate_profile[name] = value
-        if self.debug:
+        if self.profile:
             self._last_leverage_profile = aggregate_profile
         if covariance_prs:
             self._last_layer_covariance_pr = torch.stack(covariance_prs, dim=0).detach()
@@ -3563,7 +3805,7 @@ class EvictionManager:
         self._last_layer_feature_shape = (int(N), int(feature_dim))
 
         profile: Dict[str, float] = {}
-        do_profile = self.debug
+        do_profile = self.profile
         if do_profile:
             self._sync_for_timing(candidate_k)
         total_start = time.perf_counter() if do_profile else 0.0
@@ -3576,7 +3818,7 @@ class EvictionManager:
             leverage_matrix = head_features.permute(0, 2, 1, 3).reshape(B, N, feature_dim).contiguous()
             method = self._resolve_leverage_approx_method(self.leverage_sketch_dim)
             if self._normalizes_before_projection(method):
-                leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
+                leverage_matrix = self._profile_normalize_rows(leverage_matrix, profile if do_profile else None, "pre_score_normalization")
             if do_profile:
                 self._sync_for_timing(leverage_matrix)
                 profile["feature"] = time.perf_counter() - feature_start
@@ -3665,7 +3907,7 @@ class EvictionManager:
             return scores
 
         profile: Dict[str, float] = {}
-        do_profile = self.debug
+        do_profile = self.profile
         if do_profile:
             self._sync_for_timing(candidate_k)
         total_start = time.perf_counter() if do_profile else 0.0
@@ -3704,17 +3946,21 @@ class EvictionManager:
                 sync_tensor = omega_value if omega_value is not None else omega
                 self._sync_for_timing(sync_tensor)
                 profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
-            projection_start = time.perf_counter() if do_profile else 0.0
             omega_key = omega[: H * D].view(H, D, sketch_dim)
             if self.leverage_projected_key_cache and not lowdim_concat and mat_v is None:
+                projection_start = time.perf_counter() if do_profile else 0.0
                 leverage_matrix, head_leverage_matrix = self._layer_key_projected_features(
                     mat_k,
                     omega_key,
                     sketch_dim,
                     profile,
                 )
+                if do_profile and "projection_matmul" not in profile:
+                    self._sync_for_timing(leverage_matrix)
+                    profile["projection_matmul"] = time.perf_counter() - projection_start
             else:
-                mat_k = self._normalize_layer_key_before_projection(mat_k)
+                mat_k = self._profile_normalize_layer_key_before_projection(mat_k, profile if do_profile else None)
+                projection_start = time.perf_counter() if do_profile else 0.0
                 head_key_matrix = torch.einsum("bhnd,hds->bhns", mat_k, omega_key)
                 if lowdim_concat:
                     if mat_v is None or omega_value is None:
@@ -3730,15 +3976,16 @@ class EvictionManager:
                         omega_value_view = omega[H * D :].view(H, D, sketch_dim)
                         head_leverage_matrix = head_leverage_matrix + torch.einsum("bhnd,hds->bhns", mat_v, omega_value_view)
                     leverage_matrix = head_leverage_matrix.sum(dim=1)
+                if do_profile:
+                    self._sync_for_timing(leverage_matrix)
+                    profile["projection_matmul"] = time.perf_counter() - projection_start
                 self._capture_projected_pre_normalization_norms(leverage_matrix)
-                leverage_matrix = self._maybe_normalize_rows(leverage_matrix)
-                head_leverage_matrix = self._maybe_normalize_rows(head_leverage_matrix)
+                leverage_matrix = self._profile_normalize_rows(leverage_matrix, profile if do_profile else None, "post_projection_normalization")
+                head_leverage_matrix = self._profile_normalize_rows(head_leverage_matrix, profile if do_profile else None, "post_projection_normalization")
             self._store_projected_similarity_features(leverage_matrix, "layer")
             self._store_projected_similarity_features(head_leverage_matrix, "head")
             if do_profile:
-                self._sync_for_timing(leverage_matrix)
                 profile["feature"] = 0.0
-                profile["projection_matmul"] = time.perf_counter() - projection_start
                 profile["sketch"] = profile["sketch_matrix_retrieval"] + profile["projection_matmul"]
 
             if method == "right_sketch_ridge":

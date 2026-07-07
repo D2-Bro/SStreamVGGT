@@ -146,6 +146,13 @@ def get_args_parser():
         help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge",
     )
     parser.add_argument(
+        "--rls_refresh_interval",
+        "--rls-refresh-interval",
+        type=int,
+        default=1,
+        help="Refresh interval for ridge leverage K^T K and Cholesky factorization; 1 refreshes every frame",
+    )
+    parser.add_argument(
         "--leverage_diag",
         "--leverage-diag",
         action="store_true",
@@ -605,6 +612,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                         leverage_ridge_jitter=args.leverage_ridge_jitter,
                         leverage_ridge_dim=args.leverage_ridge_dim,
+                        rls_refresh_interval=args.rls_refresh_interval,
                         leverage_diag=args.leverage_diag,
                         leverage_diag_interval=args.leverage_diag_interval,
                         leverage_random_seed=args.leverage_random_seed,
@@ -839,6 +847,11 @@ if __name__ == "__main__":
             "Error: --leverage_ridge_dim must be >= 1 when provided, "
             f"got {args.leverage_ridge_dim}."
         )
+    if args.rls_refresh_interval <= 0:
+        raise SystemExit(
+            "Error: --rls_refresh_interval must be >= 1, "
+            f"got {args.rls_refresh_interval}."
+        )
     if args.leverage_approx_method == "right_sketch_ridge" and args.leverage_ridge_dim is None:
         raise SystemExit(
             "Error: --leverage_approx_method right_sketch_ridge requires "
@@ -919,6 +932,7 @@ if __name__ == "__main__":
             f"ridge_dim={args.leverage_ridge_dim}, ridge_lambda={args.leverage_ridge_lambda}, "
             f"ridge_lambda_mode={args.leverage_ridge_lambda_mode}, "
             f"ridge_chunk={args.leverage_ridge_score_chunk_size}, ridge_jitter={args.leverage_ridge_jitter}, "
+            f"rls_refresh_interval={args.rls_refresh_interval}, "
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
