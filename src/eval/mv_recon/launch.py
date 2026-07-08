@@ -773,6 +773,12 @@ def get_args_parser():
         help="Reconstruction eval implementation: original SStreamVGGT inline eval or STAC-style eval_scene",
     )
     parser.add_argument(
+        "--eval_gpu",
+        "--eval-gpu",
+        action="store_true",
+        help="Use cupoch GPU point cloud/ICP for --eval_backend stac",
+    )
+    parser.add_argument(
         "--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)"
     )
     parser.add_argument(
@@ -1286,6 +1292,7 @@ def main(args):
                                     icp_voxel_size=args.icp_voxel_size,
                                     point_map_by_unprojection=point_map_by_unprojection if args.use_proj else None,
                                     depth_conf=depth_conf if args.use_proj else None,
+                                    use_gpu=args.eval_gpu,
                                 )
                                 if args.eval_frame_stride > 1:
                                     eval_stride_msg = (

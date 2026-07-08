@@ -66,6 +66,7 @@ def eval_scene_stac(
     icp_voxel_size=0.0,
     point_map_by_unprojection=None,
     depth_conf=None,
+    use_gpu=False,
 ):
     """STAC-style reconstruction eval for SStreamVGGT prediction payloads.
 
@@ -145,46 +146,85 @@ def eval_scene_stac(
     if pts_all_masked.shape[0] == 0 or pts_gt_all_masked.shape[0] == 0:
         raise ValueError("No valid finite points available for reconstruction eval")
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts_all_masked)
-    pcd.colors = o3d.utility.Vector3dVector(images_all_masked)
-
-    pcd_gt = o3d.geometry.PointCloud()
-    pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_all_masked)
-    pcd_gt.colors = o3d.utility.Vector3dVector(images_all_masked)
-
     threshold = 100 if "DTU" in dataset_name else 0.1
-    icp_source = pcd
-    icp_target = pcd_gt
-    if icp_voxel_size > 0:
-        icp_source = pcd.voxel_down_sample(icp_voxel_size)
-        icp_target = pcd_gt.voxel_down_sample(icp_voxel_size)
-        if len(icp_source.points) == 0 or len(icp_target.points) == 0:
-            icp_source = pcd
-            icp_target = pcd_gt
+    if use_gpu:
+        try:
+            import cupoch as cph
+        except ImportError as exc:
+            raise ImportError(
+                "--eval_gpu requires cupoch, but cupoch is not importable in this environment"
+            ) from exc
 
-    reg_p2p = o3d.pipelines.registration.registration_icp(
-        icp_source,
-        icp_target,
-        threshold,
-        np.eye(4),
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-    )
-    pcd = pcd.transform(reg_p2p.transformation)
-    pcd.estimate_normals()
-    pcd_gt.estimate_normals()
+        pcd = cph.geometry.PointCloud()
+        pcd.points = cph.utility.Vector3fVector(pts_all_masked.astype(np.float32))
+        pcd.colors = cph.utility.Vector3fVector(images_all_masked.astype(np.float32))
 
-    gt_normal = np.asarray(pcd_gt.normals)
-    pred_normal = np.asarray(pcd.normals)
+        pcd_gt = cph.geometry.PointCloud()
+        pcd_gt.points = cph.utility.Vector3fVector(pts_gt_all_masked.astype(np.float32))
+        pcd_gt.colors = cph.utility.Vector3fVector(images_all_masked.astype(np.float32))
+
+        trans_init = np.eye(4, dtype=np.float32)
+        pcd.estimate_normals()
+        pcd_gt.estimate_normals()
+        reg_p2p = cph.registration.registration_icp(
+            pcd,
+            pcd_gt,
+            threshold,
+            trans_init,
+            cph.registration.TransformationEstimationPointToPlane(),
+            cph.registration.ICPConvergenceCriteria(max_iteration=50),
+        )
+        pcd.transform(reg_p2p.transformation)
+        pcd.estimate_normals()
+        pcd_gt.estimate_normals()
+
+        gt_points = np.asarray(pcd_gt.points.cpu())
+        rec_points = np.asarray(pcd.points.cpu())
+        gt_normal = np.asarray(pcd_gt.normals.cpu())
+        pred_normal = np.asarray(pcd.normals.cpu())
+    else:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts_all_masked)
+        pcd.colors = o3d.utility.Vector3dVector(images_all_masked)
+
+        pcd_gt = o3d.geometry.PointCloud()
+        pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_all_masked)
+        pcd_gt.colors = o3d.utility.Vector3dVector(images_all_masked)
+
+        icp_source = pcd
+        icp_target = pcd_gt
+        if icp_voxel_size > 0:
+            icp_source = pcd.voxel_down_sample(icp_voxel_size)
+            icp_target = pcd_gt.voxel_down_sample(icp_voxel_size)
+            if len(icp_source.points) == 0 or len(icp_target.points) == 0:
+                icp_source = pcd
+                icp_target = pcd_gt
+
+        reg_p2p = o3d.pipelines.registration.registration_icp(
+            icp_source,
+            icp_target,
+            threshold,
+            np.eye(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        )
+        pcd = pcd.transform(reg_p2p.transformation)
+        pcd.estimate_normals()
+        pcd_gt.estimate_normals()
+
+        gt_points = np.asarray(pcd_gt.points)
+        rec_points = np.asarray(pcd.points)
+        gt_normal = np.asarray(pcd_gt.normals)
+        pred_normal = np.asarray(pcd.normals)
+
     acc, acc_med, nc1, nc1_med = accuracy(
-        pcd_gt.points,
-        pcd.points,
+        gt_points,
+        rec_points,
         gt_normal,
         pred_normal,
     )
     comp, comp_med, nc2, nc2_med = completion(
-        pcd_gt.points,
-        pcd.points,
+        gt_points,
+        rec_points,
         gt_normal,
         pred_normal,
     )
@@ -200,4 +240,5 @@ def eval_scene_stac(
         "nc1_med": float(nc1_med),
         "nc2_med": float(nc2_med),
         "eval_frame_count": eval_frame_count,
+        "use_gpu": bool(use_gpu),
     }
