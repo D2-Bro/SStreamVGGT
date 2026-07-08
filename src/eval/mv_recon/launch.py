@@ -765,6 +765,14 @@ def get_args_parser():
         help="Use every Nth frame only when building eval point clouds; inference still uses all frames",
     )
     parser.add_argument(
+        "--eval_backend",
+        "--eval-backend",
+        type=str,
+        default="sstream",
+        choices=("sstream", "stac"),
+        help="Reconstruction eval implementation: original SStreamVGGT inline eval or STAC-style eval_scene",
+    )
+    parser.add_argument(
         "--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)"
     )
     parser.add_argument(
@@ -778,296 +786,6 @@ def get_args_parser():
 
 
 def main(args):
-    try:
-        global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
-    except ValueError as exc:
-        raise SystemExit(f"Error: {exc}") from exc
-    if global_attn_idx_ranges is not None:
-        print(f"Global attention index ranges enabled: {global_attn_idx_ranges}")
-    if args.stream_chunk_size < 1:
-        raise SystemExit(
-            "Error: --stream_chunk_size must be >= 1, "
-            f"got {args.stream_chunk_size}."
-        )
-    if args.eviction_protect_recent_frames < 0:
-        raise SystemExit(
-            "Error: --eviction_protect_recent_frames must be >= 0, "
-            f"got {args.eviction_protect_recent_frames}."
-        )
-    if args.eviction_protect_special_token_interval < 1:
-        raise SystemExit(
-            "Error: --eviction_protect_special_token_interval must be >= 1, "
-            f"got {args.eviction_protect_special_token_interval}."
-        )
-    if args.kf_interval < 1:
-        raise SystemExit(f"Error: --kf_interval must be >= 1, got {args.kf_interval}.")
-    if args.evict_interval < 1:
-        raise SystemExit(f"Error: --evict_interval must be >= 1, got {args.evict_interval}.")
-    if args.anchor_interval < 1:
-        raise SystemExit(f"Error: --anchor_interval must be >= 1, got {args.anchor_interval}.")
-    if args.min_anchor_interval is not None and args.min_anchor_interval < 0:
-        raise SystemExit(
-            "Error: --min_anchor_interval must be >= 0, "
-            f"got {args.min_anchor_interval}."
-        )
-    if args.window_protect_frames < 0:
-        raise SystemExit(
-            "Error: --window_protect_frames must be >= 0, "
-            f"got {args.window_protect_frames}."
-        )
-    if args.max_anchors < 0:
-        raise SystemExit(f"Error: --max_anchors must be >= 0, got {args.max_anchors}.")
-    if not (0.0 <= args.coverage_threshold <= 1.0):
-        raise SystemExit(
-            "Error: --coverage_threshold must be in [0, 1], "
-            f"got {args.coverage_threshold}."
-        )
-    if args.camera_motion_threshold < 0.0:
-        raise SystemExit(
-            "Error: --camera_motion_threshold must be >= 0, "
-            f"got {args.camera_motion_threshold}."
-        )
-    if not (0.0 <= args.anchor_keep_ratio <= 1.0):
-        raise SystemExit(
-            "Error: --anchor_keep_ratio must be in [0, 1], "
-            f"got {args.anchor_keep_ratio}."
-        )
-    if args.leverage_head_mean_dim < 1:
-        raise SystemExit(
-            "Error: --leverage_head_mean_dim must be >= 1, "
-            f"got {args.leverage_head_mean_dim}."
-        )
-    if args.leverage_high_outlier_z < 0:
-        raise SystemExit(
-            "Error: --leverage_high_outlier_z must be >= 0, "
-            f"got {args.leverage_high_outlier_z}."
-        )
-    if args.leverage_score_histogram_bins < 1:
-        raise SystemExit(
-            "Error: --leverage_score_histogram_bins must be >= 1, "
-            f"got {args.leverage_score_histogram_bins}."
-        )
-    if args.leverage_score_histogram_max <= args.leverage_score_histogram_min:
-        raise SystemExit(
-            "Error: --leverage_score_histogram_max must be greater than --leverage_score_histogram_min, "
-            f"got min={args.leverage_score_histogram_min}, max={args.leverage_score_histogram_max}."
-        )
-    if args.projected_norm_histogram_bins < 1:
-        raise SystemExit(
-            "Error: --projected_norm_histogram_bins must be >= 1, "
-            f"got {args.projected_norm_histogram_bins}."
-        )
-    if args.projected_norm_histogram_max <= args.projected_norm_histogram_min:
-        raise SystemExit(
-            "Error: --projected_norm_histogram_max must be greater than --projected_norm_histogram_min, "
-            f"got min={args.projected_norm_histogram_min}, max={args.projected_norm_histogram_max}."
-        )
-
-    if args.leverage_dpp_candidate_multiplier < 1:
-        raise SystemExit(
-            "Error: --leverage_dpp_candidate_multiplier must be >= 1, "
-            f"got {args.leverage_dpp_candidate_multiplier}."
-        )
-    if args.leverage_dpp_greedy_block_size < 1:
-        raise SystemExit(
-            "Error: --leverage_dpp_greedy_block_size must be >= 1, "
-            f"got {args.leverage_dpp_greedy_block_size}."
-        )
-    if args.leverage_dpp_quality_beta < 0:
-        raise SystemExit(
-            "Error: --leverage_dpp_quality_beta must be >= 0, "
-            f"got {args.leverage_dpp_quality_beta}."
-        )
-    if args.leverage_dpp_diversity_beta < 0:
-        raise SystemExit(
-            "Error: --leverage_dpp_diversity_beta must be >= 0, "
-            f"got {args.leverage_dpp_diversity_beta}."
-        )
-    if args.leverage_dpp_feature_projection == "random" and args.leverage_ridge_dim is None:
-        raise SystemExit(
-            "Error: --leverage_dpp_feature_projection random requires "
-            "--leverage_ridge_dim >= 1."
-        )
-    if args.leverage_dpp_recency_lambda < 0:
-        raise SystemExit(
-            "Error: --leverage_dpp_recency_lambda must be >= 0, "
-            f"got {args.leverage_dpp_recency_lambda}."
-        )
-    if args.icp_voxel_size < 0:
-        raise SystemExit(
-            "Error: --icp_voxel_size must be >= 0, "
-            f"got {args.icp_voxel_size}."
-        )
-    if args.eval_frame_stride < 1:
-        raise SystemExit(
-            "Error: --eval_frame_stride must be >= 1, "
-            f"got {args.eval_frame_stride}."
-        )
-    if args.leverage_dpp_recency_window < 1:
-        raise SystemExit(
-            "Error: --leverage_dpp_recency_window must be >= 1, "
-            f"got {args.leverage_dpp_recency_window}."
-        )
-    if args.leverage_dpp_recency_gate_power < 0:
-        raise SystemExit(
-            "Error: --leverage_dpp_recency_gate_power must be >= 0, "
-            f"got {args.leverage_dpp_recency_gate_power}."
-        )
-    if not (0.0 <= args.leverage_conf_gate_floor <= 1.0):
-        raise SystemExit(
-            "Error: --leverage_conf_gate_floor must be in [0, 1], "
-            f"got {args.leverage_conf_gate_floor}."
-        )
-    if args.leverage_conf_gate_depth_alpha < 0:
-        raise SystemExit(
-            "Error: --leverage_conf_gate_depth_alpha must be >= 0, "
-            f"got {args.leverage_conf_gate_depth_alpha}."
-        )
-    if args.leverage_conf_gate_point_beta < 0:
-        raise SystemExit(
-            "Error: --leverage_conf_gate_point_beta must be >= 0, "
-            f"got {args.leverage_conf_gate_point_beta}."
-        )
-    if args.leverage_conf_gate_k <= 0:
-        raise SystemExit(
-            "Error: --leverage_conf_gate_k must be > 0, "
-            f"got {args.leverage_conf_gate_k}."
-        )
-    try:
-        parse_confidence_gate_init(args.leverage_conf_gate_init)
-    except ValueError as exc:
-        raise SystemExit(f"Error: --leverage_conf_gate_init {exc}.") from exc
-    if args.layer_budget_alpha < 0:
-        raise SystemExit(
-            "Error: --layer_budget_alpha must be >= 0, "
-            f"got {args.layer_budget_alpha}."
-        )
-    if args.layer_budget_min_tokens < 0:
-        raise SystemExit(
-            "Error: --layer_budget_min_tokens must be >= 0, "
-            f"got {args.layer_budget_min_tokens}."
-        )
-    if args.layer_budget_eps <= 0:
-        raise SystemExit(
-            "Error: --layer_budget_eps must be > 0, "
-            f"got {args.layer_budget_eps}."
-        )
-    if not (0.0 <= args.layer_budget_depth_mu <= 1.0):
-        raise SystemExit(
-            "Error: --layer_budget_depth_mu must be in [0, 1], "
-            f"got {args.layer_budget_depth_mu}."
-        )
-    if args.layer_budget_depth_sigma <= 0:
-        raise SystemExit(
-            "Error: --layer_budget_depth_sigma must be > 0, "
-            f"got {args.layer_budget_depth_sigma}."
-        )
-    if not (0.0 <= args.layer_budget_depth_floor <= 1.0):
-        raise SystemExit(
-            "Error: --layer_budget_depth_floor must be in [0, 1], "
-            f"got {args.layer_budget_depth_floor}."
-        )
-    if args.layer_budget_value_gamma < 0:
-        raise SystemExit(
-            "Error: --layer_budget_value_gamma must be >= 0, "
-            f"got {args.layer_budget_value_gamma}."
-        )
-    if args.leverage_ridge_lambda < 0:
-        raise SystemExit(
-            "Error: --leverage_ridge_lambda must be >= 0, "
-            f"got {args.leverage_ridge_lambda}."
-        )
-    if args.leverage_diag_interval < 0:
-        raise SystemExit(
-            "Error: --leverage_diag_interval must be >= 0, "
-            f"got {args.leverage_diag_interval}."
-        )
-    if args.leverage_ridge_jitter <= 0:
-        raise SystemExit(
-            "Error: --leverage_ridge_jitter must be > 0, "
-            f"got {args.leverage_ridge_jitter}."
-        )
-    if args.leverage_ridge_score_chunk_size < 1:
-        raise SystemExit(
-            "Error: --leverage_ridge_score_chunk_size must be >= 1, "
-            f"got {args.leverage_ridge_score_chunk_size}."
-        )
-    if args.leverage_ridge_dim is not None and args.leverage_ridge_dim < 1:
-        raise SystemExit(
-            "Error: --leverage_ridge_dim must be >= 1 when provided, "
-            f"got {args.leverage_ridge_dim}."
-        )
-    if args.rls_refresh_interval <= 0:
-        raise SystemExit(
-            "Error: --rls_refresh_interval must be >= 1, "
-            f"got {args.rls_refresh_interval}."
-        )
-    if args.leverage_approx_method == "right_sketch_ridge" and args.leverage_ridge_dim is None:
-        raise SystemExit(
-            "Error: --leverage_approx_method right_sketch_ridge requires "
-            "--leverage_ridge_dim >= 1."
-        )
-    if args.leverage_normalize_before_projection_headwise and not args.leverage_normalize_before_projection:
-        raise SystemExit(
-            "Error: --leverage_normalize_before_projection_headwise requires "
-            "--leverage_normalize_before_projection."
-        )
-    if args.leverage_normalize_before_projection:
-        if args.eviction_policy != "svd_leverage":
-            raise SystemExit("Error: --leverage_normalize_before_projection requires --eviction_policy svd_leverage.")
-        if args.leverage_granularity != "layer":
-            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_granularity layer.")
-        if args.leverage_feature != "key":
-            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_feature key.")
-        if args.leverage_projection != "random":
-            raise SystemExit("Error: --leverage_normalize_before_projection requires --leverage_projection random.")
-        if args.leverage_approx_method not in ("exact_qr", "right_sketch", "right_sketch_ridge"):
-            raise SystemExit(
-                "Error: --leverage_normalize_before_projection requires --leverage_approx_method "
-                "exact_qr, right_sketch, or right_sketch_ridge."
-            )
-    if args.leverage_projected_key_cache:
-        if args.eviction_policy != "svd_leverage":
-            raise SystemExit("Error: --leverage_projected_key_cache requires --eviction_policy svd_leverage.")
-        if args.leverage_granularity != "layer":
-            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_granularity layer.")
-        if args.leverage_feature != "key":
-            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_feature key.")
-        if args.leverage_projection != "random":
-            raise SystemExit("Error: --leverage_projected_key_cache requires --leverage_projection random.")
-        if args.leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
-            raise SystemExit(
-                "Error: --leverage_projected_key_cache requires --leverage_approx_method "
-                "right_sketch or right_sketch_ridge."
-            )
-        if args.leverage_eviction_selector == "layer_head_fast_dpp" or (
-            args.leverage_eviction_selector == "similarity_topk"
-            and args.leverage_similarity_granularity == "head"
-        ):
-            raise SystemExit(
-                "Error: --leverage_projected_key_cache only supports shared layer keep-set selectors."
-            )
-    if args.layer_budget_strategy not in ("uniform", "cosine_precomputed") and (
-        args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
-    ):
-        raise SystemExit(
-            "Error: leverage/covariance-based --layer_budget_strategy requires "
-            "--eviction_policy svd_leverage and --leverage_granularity layer."
-        )
-    if args.layer_budget_strategy == "cosine_precomputed" and not args.layer_budget_proportions_path:
-        raise SystemExit(
-            "Error: --layer_budget_strategy cosine_precomputed requires "
-            "--layer_budget_proportions_path."
-        )
-    try:
-        eviction_nn_config_from_args(args, output_dir=args.eviction_nn_analysis_dir)
-    except ValueError as exc:
-        raise SystemExit(f"Error: {exc}") from exc
-    if args.budget_frame_multiplier is not None and args.budget_frame_multiplier < 0.0:
-        raise SystemExit(
-            "Error: --budget_frame_multiplier must be >= 0 when provided, "
-            f"got {args.budget_frame_multiplier}."
-        )
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
         print(
@@ -1127,68 +845,9 @@ def main(args):
             f"dpp_feature_projection={args.leverage_dpp_feature_projection}, "
             f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
-    if args.svd_eviction_merge_candidate_axes < 1:
-        raise SystemExit("Error: --svd_eviction_merge_candidate_axes must be >= 1.")
-    if args.svd_eviction_merge_reps_per_axis < 1:
-        raise SystemExit("Error: --svd_eviction_merge_reps_per_axis must be >= 1.")
-    if not (0.0 <= args.svd_eviction_merge_similarity_threshold <= 1.0):
-        raise SystemExit("Error: --svd_eviction_merge_similarity_threshold must be in [0, 1].")
-    if args.svd_eviction_merge_voxel_neighbor_radius < 0:
-        raise SystemExit("Error: --svd_eviction_merge_voxel_neighbor_radius must be >= 0.")
-    if not (0.0 <= args.svd_eviction_merge_ema_decay <= 1.0):
-        raise SystemExit("Error: --svd_eviction_merge_ema_decay must be in [0, 1].")
-    if args.svd_eviction_merge_max_candidates_per_token < 1:
-        raise SystemExit("Error: --svd_eviction_merge_max_candidates_per_token must be >= 1.")
-    if args.svd_eviction_merge_chunk_size < 1:
-        raise SystemExit("Error: --svd_eviction_merge_chunk_size must be >= 1.")
-    if args.merge_window < 1:
-        raise SystemExit(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
-    if not (0.0 <= args.merge_similarity_threshold <= 1.0):
-        raise SystemExit(
-            "Error: --merge_similarity_threshold must be in [0, 1], "
-            f"got {args.merge_similarity_threshold}."
-        )
-    if args.merge_voxel_size <= 0:
-        raise SystemExit(f"Error: --merge_voxel_size must be > 0, got {args.merge_voxel_size}.")
-    if args.merge_chunk_size < 1:
-        raise SystemExit(f"Error: --merge_chunk_size must be >= 1, got {args.merge_chunk_size}.")
-    if args.merge_patch_radius < 0:
-        raise SystemExit(f"Error: --merge_patch_radius must be >= 0, got {args.merge_patch_radius}.")
-    if args.merge_voxel_neighbor_radius < 0:
-        raise SystemExit(
-            "Error: --merge_voxel_neighbor_radius must be >= 0, "
-            f"got {args.merge_voxel_neighbor_radius}."
-        )
-    if args.merge_max_candidates_per_token < 1:
-        raise SystemExit(
-            "Error: --merge_max_candidates_per_token must be >= 1, "
-            f"got {args.merge_max_candidates_per_token}."
-        )
-    if args.merge_recall_debug_max_tokens < 1:
-        raise SystemExit(
-            "Error: --merge_recall_debug_max_tokens must be >= 1, "
-            f"got {args.merge_recall_debug_max_tokens}."
-        )
-    if args.voxel_size <= 0:
-        raise SystemExit(f"Error: --voxel_size must be > 0, got {args.voxel_size}.")
-    if args.covis_min_shared_voxels < 0:
-        raise SystemExit(
-            "Error: --covis_min_shared_voxels must be >= 0, "
-            f"got {args.covis_min_shared_voxels}."
-        )
-    if not (0.0 <= args.covis_min_overlap <= 1.0):
-        raise SystemExit(
-            "Error: --covis_min_overlap must be in [0, 1], "
-            f"got {args.covis_min_overlap}."
-        )
-    if args.covis_fallback_recent < 0:
-        raise SystemExit(
-            "Error: --covis_fallback_recent must be >= 0, "
-            f"got {args.covis_fallback_recent}."
-        )
-
     add_path_to_dust3r(args.weights)
     from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D, Replica
+    from eval.mv_recon.eval_scene_stac import eval_scene_stac
     from eval.mv_recon.utils import accuracy, completion
 
     if args.size == 512:
@@ -1211,8 +870,6 @@ def main(args):
             kf_every=2,
             max_frames=args.max_frames,
         ),
-        # "ETH3D": ETH3D
-            # 20),
         # "NRGBD": NRGBD(
         #     split="test",
         #     ROOT="/home/dongjae/data/neural_rgbd_data",
@@ -1618,6 +1275,50 @@ def main(args):
                                 f"Time: {infer_time:.6f}, FPS: {fps:.3f}"
                             )
                             print(timing_msg)
+
+                            if args.eval_backend == "stac":
+                                scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
+                                metrics_data = eval_scene_stac(
+                                    batch,
+                                    preds,
+                                    name_data,
+                                    eval_frame_stride=args.eval_frame_stride,
+                                    icp_voxel_size=args.icp_voxel_size,
+                                    point_map_by_unprojection=point_map_by_unprojection if args.use_proj else None,
+                                    depth_conf=depth_conf if args.use_proj else None,
+                                )
+                                if args.eval_frame_stride > 1:
+                                    eval_stride_msg = (
+                                        f"Eval frame stride: stride={args.eval_frame_stride}, "
+                                        f"using {metrics_data['eval_frame_count']}/{len(batch)} frames for {scene_id}"
+                                    )
+                                    print(eval_stride_msg)
+                                    with open(log_file, "a") as f_log:
+                                        print(eval_stride_msg, file=f_log)
+
+                                metric_line = (
+                                    f"Idx: {scene_id}, Acc: {metrics_data['acc']}, "
+                                    f"Comp: {metrics_data['comp']}, NC1: {metrics_data['nc1']}, "
+                                    f"NC2: {metrics_data['nc2']} - Acc_med: {metrics_data['acc_med']}, "
+                                    f"Compc_med: {metrics_data['comp_med']}, "
+                                    f"NC1c_med: {metrics_data['nc1_med']}, "
+                                    f"NC2c_med: {metrics_data['nc2_med']}, Time: {infer_time}, FPS: {fps}"
+                                )
+                                print(metric_line)
+                                with open(log_file, "a") as f_log:
+                                    print(metric_line, file=f_log)
+
+                                acc_all += metrics_data["acc"]
+                                comp_all += metrics_data["comp"]
+                                nc1_all += metrics_data["nc1"]
+                                nc2_all += metrics_data["nc2"]
+                                acc_all_med += metrics_data["acc_med"]
+                                comp_all_med += metrics_data["comp_med"]
+                                nc1_all_med += metrics_data["nc1_med"]
+                                nc2_all_med += metrics_data["nc2_med"]
+
+                                torch.cuda.empty_cache()
+                                continue
                                 
 
                         # Evaluation

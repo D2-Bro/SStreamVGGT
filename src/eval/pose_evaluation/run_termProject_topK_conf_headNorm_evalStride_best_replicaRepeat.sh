@@ -11,14 +11,14 @@ model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # pose_evaluation metadata without creating duplicated files on disk.
 export SSTREAMVGGT_REPLICA_ROOT="${SSTREAMVGGT_REPLICA_ROOT:-/home/dongjae/data/replica/Replica}"
 
-eval_dataset="replica"
+eval_dataset="sintel"
 # To run only one scene, uncomment for example:
 # seq_args=(--seq_list Apart-1)
 seq_args=()
 
 size="518"
 max_frames="full_seq"
-kf_every="20"
+kf_every="1"
 pose_eval_stride="1"
 empty_cache_interval="1"
 eviction_policy="svd_leverage"
@@ -75,7 +75,7 @@ leverage_conf_gate_point_beta="0.0"
 leverage_conf_gate_k="1.0"
 leverage_conf_gate_special_mode="mean"
 leverage_conf_gate_init="mean"
-leverage_projected_key_cache=false
+leverage_projected_key_cache="true"
 
 budget_args=(--budget "$total_budget")
 budget_suffix="budget${total_budget}"
@@ -156,7 +156,6 @@ accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evalua
     --stream_chunk_size 1 \
     --empty_cache_interval "$empty_cache_interval" \
     --rls_refresh_interval 8 \
-    --profile_eviction \
     "${projected_key_cache_args[@]}" \
     "${first_frame_special_args[@]}"
 

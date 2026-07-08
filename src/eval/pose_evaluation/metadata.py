@@ -485,7 +485,7 @@ dataset_metadata = {
         "process_func": lambda args, img_path: process_scannet(args, img_path),
     },
     "tum": {
-        "img_path": "data/tum",
+        "img_path": "/home/dongjae/data/tum",
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "rgb_90"),
         "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
@@ -499,8 +499,8 @@ dataset_metadata = {
         "process_func": None,
     },
     "sintel": {
-        "img_path": "/home/ma-user/work/dataset/3D_Reconstruction/sintel/training/final",
-        "anno_path": "/home/ma-user/work/dataset/3D_Reconstruction/sintel/training/camdata_left",
+        "img_path": "/home/dongjae/data/sintel/training/final",
+        "anno_path": "/home/dongjae/data/sintel/training/camdata_left",
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
         "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq),
