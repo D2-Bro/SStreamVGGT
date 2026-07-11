@@ -299,9 +299,11 @@ def make_token_confidence_gate(
         if normalizer_k <= 0.0:
             raise ValueError(f"normalizer_k must be > 0, got {normalizer_k}")
         if token_depth_confidence is not None:
-            depth_conf = depth_conf / (depth_conf + normalizer_k)
+            # depth_conf = depth_conf / (depth_conf + normalizer_k)
+            depth_conf = (depth_conf - 1.0) / (depth_conf)
         if token_point_confidence is not None:
-            point_conf = point_conf / (point_conf + normalizer_k)
+            # point_conf = point_conf / (point_conf + normalizer_k)
+            point_conf = (point_conf - 1.0) / (point_conf)
 
     if float(depth_alpha) != 1.0:
         depth_conf = depth_conf.pow(float(depth_alpha))

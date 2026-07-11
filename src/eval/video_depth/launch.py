@@ -136,7 +136,7 @@ def get_args_parser():
         "--leverage-ridge-jitter",
         type=float,
         default=1e-6,
-        help="Relative diagonal jitter added to ridge systems before Cholesky",
+        help="Absolute diagonal jitter added to ridge systems before Cholesky",
     )
     parser.add_argument(
         "--leverage_ridge_dim",
@@ -258,7 +258,7 @@ def get_args_parser():
         "--layer-budget-strategy",
         type=str,
         default="uniform",
-        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "depth_weighted_leverage_pr", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
+        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "spectral_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "key_norm", "depth_weighted_leverage_pr", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_spectral_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
         help="Layer-wise KV budget allocation strategy",
     )
     parser.add_argument(

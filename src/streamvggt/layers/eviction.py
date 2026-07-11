@@ -16,12 +16,15 @@ VALID_LAYER_BUDGET_STRATEGIES = (
     "cosine_precomputed",
     "leverage_pr",
     "covariance_pr",
+    "spectral_pr",
     "hybrid_cap",
     "hybrid_geom",
     "leverage_entropy",
+    "key_norm",
     "depth_weighted_leverage_pr",
     "value_weighted_leverage_pr",
     "value_weighted_covariance_pr",
+    "value_weighted_spectral_pr",
     "value_weighted_hybrid_cap",
     "value_weighted_hybrid_geom",
 )
@@ -30,12 +33,15 @@ VALID_LAYER_BUDGET_STRATEGIES = (
 LAYER_BUDGET_SCORE_STRATEGIES = (
     "leverage_pr",
     "covariance_pr",
+    "spectral_pr",
     "hybrid_cap",
     "hybrid_geom",
     "leverage_entropy",
+    "key_norm",
     "depth_weighted_leverage_pr",
     "value_weighted_leverage_pr",
     "value_weighted_covariance_pr",
+    "value_weighted_spectral_pr",
     "value_weighted_hybrid_cap",
     "value_weighted_hybrid_geom",
 )
@@ -44,6 +50,7 @@ LAYER_BUDGET_SCORE_STRATEGIES = (
 VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES = (
     "value_weighted_leverage_pr",
     "value_weighted_covariance_pr",
+    "value_weighted_spectral_pr",
     "value_weighted_hybrid_cap",
     "value_weighted_hybrid_geom",
 )
@@ -56,9 +63,11 @@ DEPTH_WEIGHTED_LAYER_BUDGET_STRATEGIES = (
 
 COVARIANCE_LAYER_BUDGET_STRATEGIES = (
     "covariance_pr",
+    "spectral_pr",
     "hybrid_cap",
     "hybrid_geom",
     "value_weighted_covariance_pr",
+    "value_weighted_spectral_pr",
     "value_weighted_hybrid_cap",
     "value_weighted_hybrid_geom",
 )
@@ -109,6 +118,8 @@ def _combine_layer_budget_pr_base(
     if covariance_pr is None:
         raise ValueError(f"{strategy} requires covariance participation ratio from layer features")
     covariance_pr = torch.as_tensor(covariance_pr, device=leverage_pr.device, dtype=leverage_pr.dtype)
+    if strategy in ("spectral_pr", "value_weighted_spectral_pr"):
+        return covariance_pr.clamp_min(0.0)
     direction_base = covariance_pr.clamp_min(0.0) * float(slots_per_direction)
     if strategy in ("covariance_pr", "value_weighted_covariance_pr"):
         return direction_base
@@ -283,8 +294,6 @@ def _allocate_layer_budgets_from_scores(
         raise ValueError(f"layer budget alpha must be >= 0, got {alpha}")
     if min_tokens < 0:
         raise ValueError(f"layer budget min_tokens must be >= 0, got {min_tokens}")
-    if eps <= 0:
-        raise ValueError(f"layer budget eps must be > 0, got {eps}")
 
     capacities = {int(layer): max(int(cap), 0) for layer, cap in capacities.items()}
     active_layers = [layer for layer, cap in capacities.items() if cap > 0]
@@ -621,8 +630,6 @@ class EvictionManager:
                 "layer_budget_norm_source must be 'value' or 'key', got "
                 f"{layer_budget_norm_source!r}"
             )
-        if layer_budget_eps <= 0:
-            raise ValueError(f"layer_budget_eps must be > 0, got {layer_budget_eps}")
         if not math.isfinite(float(slots_per_direction)) or float(slots_per_direction) <= 0.0:
             raise ValueError(f"slots_per_direction must be finite and > 0, got {slots_per_direction}")
         if not math.isfinite(float(hybrid_beta)) or not (0.0 <= float(hybrid_beta) <= 1.0):
@@ -639,8 +646,8 @@ class EvictionManager:
                 "leverage_ridge_score_chunk_size must be >= 1, got "
                 f"{leverage_ridge_score_chunk_size}"
             )
-        if leverage_ridge_jitter <= 0:
-            raise ValueError(f"leverage_ridge_jitter must be > 0, got {leverage_ridge_jitter}")
+        # if leverage_ridge_jitter <= 0:
+        #     raise ValueError(f"leverage_ridge_jitter must be > 0, got {leverage_ridge_jitter}")
         if leverage_ridge_dim is not None and leverage_ridge_dim < 1:
             raise ValueError(f"leverage_ridge_dim must be >= 1 or None, got {leverage_ridge_dim}")
         if rls_refresh_interval <= 0:
@@ -1255,6 +1262,30 @@ class EvictionManager:
             for batch_idx, batch_scores in enumerate(score_input):
                 if self.layer_budget_strategy == "leverage_entropy":
                     layer_scores.append(_layer_score_leverage_entropy(batch_scores, self.layer_budget_eps))
+                elif self.layer_budget_strategy == "key_norm":
+                    if candidate_k is None:
+                        layer_scores.append(
+                            torch.zeros((), device=policy_scores.device, dtype=torch.float32)
+                        )
+                    else:
+                        if candidate_k.ndim != 4:
+                            raise ValueError(
+                                "Layer budget key_norm requires candidate_k shaped [B, H, N, D], "
+                                f"got {tuple(candidate_k.shape)}"
+                            )
+                        _, num_heads, num_tokens, head_dim = candidate_k.shape
+                        key_rows = (
+                            candidate_k[batch_idx]
+                            .transpose(0, 1)
+                            .reshape(num_tokens, num_heads * head_dim)
+                        )
+                        layer_scores.append(
+                            _layer_value_norm_score(
+                                key_rows,
+                                norm_type="mean",
+                                eps=self.layer_budget_eps,
+                            )
+                        )
                 elif self.layer_budget_strategy in LAYER_BUDGET_SCORE_STRATEGIES:
                     leverage_pr = _layer_score_leverage_pr(batch_scores, self.layer_budget_eps)
                     batch_covariance_pr = None
@@ -3378,7 +3409,7 @@ class EvictionManager:
                     lam = torch.full_like(scale, float(self.leverage_ridge_lambda))
                 else:
                     lam = float(self.leverage_ridge_lambda) * scale.clamp_min(eps)
-                jitter_scale = torch.maximum(scale, torch.ones_like(scale))
+                jitter_scale = torch.ones_like(scale)
 
                 chol_start = time.perf_counter() if do_profile else 0.0
                 last_a = None
@@ -3389,15 +3420,38 @@ class EvictionManager:
                     if not bool((info != 0).any().item()):
                         retries = retry_idx
                         break
+                    try:
+                        info_max = int(info.detach().max().item())
+                        diag_mean = float(torch.nan_to_num(diag_add.detach().float()).mean().item())
+                    except RuntimeError:
+                        info_max = -1
+                        diag_mean = float("nan")
+                    print(
+                        "[RLS][cholesky_retry] "
+                        f"method={basis_kind} granularity={granularity} frame={frame_idx} "
+                        f"N={num_tokens} D={feature_dim} retry={retry_idx} "
+                        f"jitter_multiplier={jitter_multiplier:g} diag_add_mean={diag_mean:.6g} "
+                        f"info_max={info_max}"
+                    )
                     chol = None
                     retries = retry_idx + 1
                 if chol is None and last_a is not None:
+                    print(
+                        "[RLS][pinv_fallback] "
+                        f"method={basis_kind} granularity={granularity} frame={frame_idx} "
+                        f"N={num_tokens} D={feature_dim} retries={retries}"
+                    )
                     try:
                         inv_a = torch.linalg.pinv(last_a)
                         fallback_state = 1.0
-                    except RuntimeError:
+                    except RuntimeError as exc:
                         inv_a = None
                         fallback_state = 2.0
+                        print(
+                            "[RLS][pinv_failed] "
+                            f"method={basis_kind} granularity={granularity} frame={frame_idx} "
+                            f"N={num_tokens} D={feature_dim} error={exc}"
+                        )
                 if do_profile:
                     if chol is not None:
                         self._sync_for_timing(chol)

@@ -160,7 +160,7 @@ def get_args_parser():
     parser.add_argument("--size", type=int, default=518)
     parser.add_argument("--revisit", type=int, default=1, help="revisit times")
     parser.add_argument("--freeze", action="store_true")
-    parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
+    parser.add_argument("--max_frames", default=None, help="max frames limit")
     parser.add_argument(
         "--stream_chunk_size",
         "--stream-chunk-size",
@@ -273,7 +273,7 @@ def get_args_parser():
         "--leverage-ridge-jitter",
         type=float,
         default=1e-6,
-        help="Relative diagonal jitter added to ridge systems before Cholesky",
+        help="Absolute diagonal jitter added to ridge systems before Cholesky",
     )
     parser.add_argument(
         "--leverage_ridge_dim",
@@ -415,7 +415,7 @@ def get_args_parser():
         "--layer-budget-strategy",
         type=str,
         default="uniform",
-        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "depth_weighted_leverage_pr", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
+        choices=("uniform", "cosine_precomputed", "leverage_pr", "covariance_pr", "spectral_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "key_norm", "depth_weighted_leverage_pr", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_spectral_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
         help="Layer-wise KV budget allocation strategy",
     )
     parser.add_argument(
@@ -868,23 +868,22 @@ def main(args):
     datasets_all = {
         "7scenes": SevenScenes(
             split="test",
-            ROOT="/home/dongjae/data/7scenes_sfm",
+            ROOT="/home/dongjae/data/7scenes",
             # ROOT="/data2/dongjae/datasets/7scenes_sfm",
             resolution=resolution,
             num_seq=1,
             full_video=True,
             kf_every=2,
-            max_frames=args.max_frames,
         ),
-        # "NRGBD": NRGBD(
-        #     split="test",
-        #     ROOT="/home/dongjae/data/neural_rgbd_data",
-        #     resolution=resolution,
-        #     num_seq=1,
-        #     full_video=True,
-        #     kf_every=2,
-        #     max_frames=args.max_frames,
-        # ),
+        "NRGBD": NRGBD(
+            split="test",
+            ROOT="/home/dongjae/data/neural_rgbd_data",
+            resolution=resolution,
+            num_seq=1,
+            full_video=True,
+            kf_every=2,
+            # test_id=[ "kitchen", "grey_white_room", "green_room"]
+        ),
         # "Replica": Replica(
         #     split="test",
         #     ROOT=os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica"),
@@ -1009,8 +1008,6 @@ def main(args):
                     pts_all = []
                     pts_gt_all = []
                     images_all = []
-                    masks_all = []
-                    conf_all = []
                     in_camera1 = None  
 
                     if model_name == "stream3r" or "VGGT":
@@ -1232,21 +1229,13 @@ def main(args):
                                     svd_eviction_merge_config=svd_eviction_merge_config,
                                     voxel_covis_config=voxel_covis_config,
                                     covis_log_fn=covis_log_fn,
-                                    global_attn_idx_ranges=global_attn_idx_ranges,
-                                    global_attn_debug=args.global_attn_debug,
                                     kf_interval=args.kf_interval,
                                     evict_interval=args.evict_interval,
                                     global_cache_history_anchor_special_tokens_only=args.global_cache_history_anchor_special_tokens_only,
-
                                     first_frame_special_tokens_only=args.first_frame_special_tokens_only,
                                     camera_cache_history_anchors_only=args.camera_cache_history_anchors_only,
                                     camera_cache_keep_dropped_anchors=args.camera_cache_keep_dropped_anchors,
                                 )
-                                if leverage_score_histogram_config is not None:
-                                    leverage_score_histogram_config.flush()
-                                if projected_norm_histogram_config is not None:
-                                    projected_norm_histogram_config.flush()
-                                summarize_layer_budget_log(layer_budget_log_path)
                                 if torch.cuda.is_available():
                                     torch.cuda.synchronize(device)
                                 infer_time = time.perf_counter() - infer_start
@@ -1282,52 +1271,6 @@ def main(args):
                             )
                             print(timing_msg)
 
-                            if args.eval_backend == "stac":
-                                scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
-                                metrics_data = eval_scene_stac(
-                                    batch,
-                                    preds,
-                                    name_data,
-                                    eval_frame_stride=args.eval_frame_stride,
-                                    icp_voxel_size=args.icp_voxel_size,
-                                    point_map_by_unprojection=point_map_by_unprojection if args.use_proj else None,
-                                    depth_conf=depth_conf if args.use_proj else None,
-                                    use_gpu=args.eval_gpu,
-                                )
-                                if args.eval_frame_stride > 1:
-                                    eval_stride_msg = (
-                                        f"Eval frame stride: stride={args.eval_frame_stride}, "
-                                        f"using {metrics_data['eval_frame_count']}/{len(batch)} frames for {scene_id}"
-                                    )
-                                    print(eval_stride_msg)
-                                    with open(log_file, "a") as f_log:
-                                        print(eval_stride_msg, file=f_log)
-
-                                metric_line = (
-                                    f"Idx: {scene_id}, Acc: {metrics_data['acc']}, "
-                                    f"Comp: {metrics_data['comp']}, NC1: {metrics_data['nc1']}, "
-                                    f"NC2: {metrics_data['nc2']} - Acc_med: {metrics_data['acc_med']}, "
-                                    f"Compc_med: {metrics_data['comp_med']}, "
-                                    f"NC1c_med: {metrics_data['nc1_med']}, "
-                                    f"NC2c_med: {metrics_data['nc2_med']}, Time: {infer_time}, FPS: {fps}"
-                                )
-                                print(metric_line)
-                                with open(log_file, "a") as f_log:
-                                    print(metric_line, file=f_log)
-
-                                acc_all += metrics_data["acc"]
-                                comp_all += metrics_data["comp"]
-                                nc1_all += metrics_data["nc1"]
-                                nc2_all += metrics_data["nc2"]
-                                acc_all_med += metrics_data["acc_med"]
-                                comp_all_med += metrics_data["comp_med"]
-                                nc1_all_med += metrics_data["nc1_med"]
-                                nc2_all_med += metrics_data["nc2_med"]
-
-                                torch.cuda.empty_cache()
-                                continue
-                                
-
                         # Evaluation
                         print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
                         gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = (
@@ -1338,8 +1281,6 @@ def main(args):
                         pts_all = []
                         pts_gt_all = []
                         images_all = []
-                        masks_all = []
-                        conf_all = []
                         eval_frame_count = 0
 
                         for j, view in enumerate(batch):
@@ -1374,15 +1315,64 @@ def main(args):
                             # pts = pts[t:b, l:r]
                             # pts_gt = pts_gt[t:b, l:r]
 
+                            # Per-frame 224x224 stratified sampling for 518x392 evaluation.
+                            # A fixed seed gives every frame the same spatial random
+                            # priorities; each non-empty bin keeps one GT-valid pixel.
+                            H, W = image.shape[:2]
+                            if (H, W) == (392, 518):
+                                num_bins_y = num_bins_x = 224
+                                sampling_rng = np.random.default_rng(seed=42)
+
+                                y_edges = np.linspace(
+                                    0, H, num_bins_y + 1, dtype=np.int64
+                                )
+                                x_edges = np.linspace(
+                                    0, W, num_bins_x + 1, dtype=np.int64
+                                )
+                                y_bin = np.searchsorted(
+                                    y_edges[1:], np.arange(H), side="right"
+                                )
+                                x_bin = np.searchsorted(
+                                    x_edges[1:], np.arange(W), side="right"
+                                )
+                                bin_ids = (
+                                    y_bin[:, None] * num_bins_x + x_bin[None, :]
+                                )
+
+                                valid_mask = mask.astype(bool, copy=False)
+                                invalid_priority = H * W
+                                random_priorities = sampling_rng.permutation(
+                                    invalid_priority
+                                ).reshape(H, W)
+                                random_priorities[~valid_mask] = invalid_priority
+                                min_priority_per_bin = np.full(
+                                    num_bins_y * num_bins_x,
+                                    invalid_priority,
+                                    dtype=random_priorities.dtype,
+                                )
+                                np.minimum.at(
+                                    min_priority_per_bin,
+                                    bin_ids.ravel(),
+                                    random_priorities.ravel(),
+                                )
+                                sampling_mask = valid_mask & (
+                                    random_priorities
+                                    == min_priority_per_bin[bin_ids]
+                                )
+                                mask = sampling_mask
+
                             # Align predicted 3D points to the ground truth
                             # pts = geotrf(in_camera1, pts)
                             # pts_gt = geotrf(in_camera1, pts_gt)
 
-                            images_all.append(image[None, ...])
-                            pts_all.append(pts[None, ...])
-                            pts_gt_all.append(pts_gt[None, ...])
-                            masks_all.append(mask[None, ...])
-                            conf_all.append(conf[None, ...])
+                            selected_mask = mask.astype(bool, copy=False)
+                            images_all.append(
+                                image[selected_mask].reshape(-1, 3)
+                            )
+                            pts_all.append(pts[selected_mask].reshape(-1, 3))
+                            pts_gt_all.append(
+                                pts_gt[selected_mask].reshape(-1, 3)
+                            )
 
                     scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
                     if args.eval_frame_stride > 1:
@@ -1396,14 +1386,12 @@ def main(args):
                     images_all = np.concatenate(images_all, axis=0)
                     pts_all = np.concatenate(pts_all, axis=0)
                     pts_gt_all = np.concatenate(pts_gt_all, axis=0)
-                    masks_all = np.concatenate(masks_all, axis=0)
 
                     save_params = {}
 
                     save_params["images_all"] = images_all
                     save_params["pts_all"] = pts_all
                     save_params["pts_gt_all"] = pts_gt_all
-                    save_params["masks_all"] = masks_all
 
                     # np.save(
                     #     os.path.join(save_path, f"{scene_id.replace('/', '_')}.npy"),
@@ -1415,15 +1403,12 @@ def main(args):
                     else:
                         threshold = 0.1
 
-                    pts_all_masked = pts_all[masks_all > 0]
-                    pts_gt_all_masked = pts_gt_all[masks_all > 0]
-                    images_all_masked = images_all[masks_all > 0]
-
-                    mask = np.isfinite(pts_all_masked)  
-                    pts_all_masked = pts_all_masked[mask]
-
-                    mask_gt = np.isfinite(pts_gt_all_masked)
-                    pts_gt_all_masked = pts_gt_all_masked[mask]
+                    finite_mask = np.isfinite(pts_all).all(axis=-1) & np.isfinite(
+                        pts_gt_all
+                    ).all(axis=-1)
+                    pts_all = pts_all[finite_mask]
+                    pts_gt_all = pts_gt_all[finite_mask]
+                    images_all = images_all[finite_mask]
 
                     if args.use_proj:
                         def umeyama_alignment(src: np.ndarray, dst: np.ndarray, with_scale: bool = True):
@@ -1455,19 +1440,14 @@ def main(args):
 
                             return s, R, t
 
-                        pts_all_masked = pts_all_masked.reshape(-1, 3)
-                        pts_gt_all_masked = pts_gt_all_masked.reshape(-1, 3)
-                        s, R, t = umeyama_alignment(pts_all_masked, pts_gt_all_masked, with_scale=True)
-                        pts_all_aligned = (s * (R @ pts_all_masked.T)).T + t  # (N,3)
-                        pts_all_masked = pts_all_aligned
+                        s, R, t = umeyama_alignment(
+                            pts_all, pts_gt_all, with_scale=True
+                        )
+                        pts_all = (s * (R @ pts_all.T)).T + t  # (N,3)
 
                     pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(
-                        pts_all_masked.reshape(-1, 3)
-                    )
-                    pcd.colors = o3d.utility.Vector3dVector(
-                        images_all_masked.reshape(-1, 3)
-                    )
+                    pcd.points = o3d.utility.Vector3dVector(pts_all)
+                    pcd.colors = o3d.utility.Vector3dVector(images_all)
                     # o3d.io.write_point_cloud(
                     #     os.path.join(
                     #         save_path, f"{scene_id.replace('/', '_')}-mask.ply"
@@ -1476,12 +1456,8 @@ def main(args):
                     # )
 
                     pcd_gt = o3d.geometry.PointCloud()
-                    pcd_gt.points = o3d.utility.Vector3dVector(
-                        pts_gt_all_masked.reshape(-1, 3)
-                    )
-                    pcd_gt.colors = o3d.utility.Vector3dVector(
-                        images_all_masked.reshape(-1, 3)
-                    )
+                    pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_all)
+                    pcd_gt.colors = o3d.utility.Vector3dVector(images_all)
                     # o3d.io.write_point_cloud(
                     #     os.path.join(save_path, f"{scene_id.replace('/', '_')}-gt.ply"),
                     #     pcd_gt,
@@ -1491,22 +1467,6 @@ def main(args):
 
                     icp_source = pcd
                     icp_target = pcd_gt
-                    if args.icp_voxel_size > 0:
-                        icp_source = pcd.voxel_down_sample(args.icp_voxel_size)
-                        icp_target = pcd_gt.voxel_down_sample(args.icp_voxel_size)
-                        if len(icp_source.points) == 0 or len(icp_target.points) == 0:
-                            print(
-                                f"Warning: ICP voxel downsample produced an empty cloud "
-                                f"at voxel_size={args.icp_voxel_size}; using full point clouds"
-                            )
-                            icp_source = pcd
-                            icp_target = pcd_gt
-                        else:
-                            print(
-                                f"ICP downsample: voxel_size={args.icp_voxel_size}, "
-                                f"pred {len(pcd.points)}->{len(icp_source.points)}, "
-                                f"gt {len(pcd_gt.points)}->{len(icp_target.points)}"
-                            )
 
                     reg_p2p = o3d.pipelines.registration.registration_icp(
                         icp_source,

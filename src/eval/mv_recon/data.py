@@ -117,6 +117,8 @@ class SevenScenes(BaseStereoViewDataset):
                     # seq is string, take the int part and make it 01, 02, 03
                     # seq_id = 'seq-{:2d}'.format(int(seq_id))
                     num_part = "".join(filter(str.isdigit, seq_id))
+                    # if num_part != "6":
+                    #     continue  # Only use seq-06 for evaluation, as in SimpleRecon
                     seq_id = f"seq-{num_part.zfill(2)}"
                     if self.seq_id is not None and seq_id != self.seq_id:
                         continue
@@ -769,7 +771,10 @@ class NRGBD(BaseStereoViewDataset):
         ]
 
         if self.test_id is not None:
-            self.scene_list = [self.test_id]
+            if isinstance(self.test_id, list):
+                self.scene_list = self.test_id
+            else:
+                self.scene_list = [self.test_id]
 
         else:
             self.scene_list = scenes

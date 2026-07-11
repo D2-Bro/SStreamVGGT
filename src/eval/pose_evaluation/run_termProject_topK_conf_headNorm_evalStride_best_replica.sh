@@ -18,18 +18,18 @@ seq_args=()
 
 size="518"
 max_frames="full_seq"
-kf_every="2"
+kf_every="5"
 pose_eval_stride="1"
 empty_cache_interval="1"
 eviction_policy="svd_leverage"
-layer_budget_strategy="key_norm"
+layer_budget_strategy="value_weighted_leverage_pr"
 layer_budget_alpha="0.7"
 layer_budget_min_tokens="0"
-layer_budget_eps="0"
+layer_budget_eps="1e-12"
 layer_budget_depth_mu="0.6"
 layer_budget_depth_sigma="0.2"
 layer_budget_depth_floor="0.1"
-layer_budget_value_gamma="1.0"
+layer_budget_value_gamma="0.7"
 layer_budget_value_norm_type="mean"
 layer_budget_norm_source="key"
 total_budget="200000"
@@ -50,7 +50,7 @@ leverage_dpp_feature_projection="random"
 leverage_approx_method="right_sketch_ridge"
 leverage_ridge_lambda="0"
 leverage_ridge_lambda_mode="absolute"
-leverage_ridge_score_chunk_size="32768"
+leverage_ridge_score_chunk_size="8192"
 leverage_ridge_jitter="1e-6"
 leverage_ridge_dim="256"
 leverage_random_seed="42"
@@ -87,7 +87,7 @@ projected_key_cache_args=()
 if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
-output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_confDepth_spe${leverage_conf_gate_special_mode}_init${leverage_conf_gate_init}_headNorm_poseStride${pose_eval_stride}_${layer_budget_strategy}${layer_budget_depth_mu}${layer_budget_depth_sigma}f${layer_budget_depth_floor}_${budget_suffix}_seed${leverage_random_seed}_stride${kf_every}_chunk1_cacheRLS8_jit1e-6"
+output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_S${model_name}_${max_frames}_termProject${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_lambda}_confDepth_spe${leverage_conf_gate_special_mode}_init${leverage_conf_gate_init}_headNorm_poseStride${pose_eval_stride}_${layer_budget_strategy}${layer_budget_depth_mu}${layer_budget_depth_sigma}f${layer_budget_depth_floor}_${budget_suffix}_seed${leverage_random_seed}_stride${kf_every}_chunk1_cacheRLS8"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -156,7 +156,6 @@ accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evalua
     --stream_chunk_size 1 \
     --empty_cache_interval "$empty_cache_interval" \
     --rls_refresh_interval 8 \
-    --profile_eviction \
     "${projected_key_cache_args[@]}" \
     "${first_frame_special_args[@]}"
 

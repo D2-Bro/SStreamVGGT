@@ -139,6 +139,70 @@ def test_covariance_pr_rank_and_scale_properties():
     assert torch.isfinite(zero_pr)
     assert zero_pr.item() == 0.0
 
+    nonfinite = torch.diag(torch.tensor([float("nan"), float("inf"), 3.0]))
+    nonfinite_pr = _covariance_participation_ratio(nonfinite)
+    assert torch.isfinite(nonfinite_pr)
+    assert torch.allclose(nonfinite_pr, torch.tensor(1.0))
+
+
+def test_spectral_pr_uses_raw_participation_ratio():
+    leverage_pr = torch.tensor(100.0)
+    covariance_pr = torch.tensor(3.5)
+    kwargs = {
+        "slots_per_direction": 4.0,
+        "hybrid_beta": 0.5,
+        "eps": 1e-12,
+    }
+    covariance_score = _combine_layer_budget_pr_base(
+        leverage_pr,
+        covariance_pr,
+        "covariance_pr",
+        **kwargs,
+    )
+    spectral_score = _combine_layer_budget_pr_base(
+        leverage_pr,
+        covariance_pr,
+        "spectral_pr",
+        **kwargs,
+    )
+    value_weighted_spectral_score = _combine_layer_budget_pr_base(
+        leverage_pr,
+        covariance_pr,
+        "value_weighted_spectral_pr",
+        **kwargs,
+    )
+    assert torch.allclose(spectral_score, covariance_pr)
+    assert torch.allclose(value_weighted_spectral_score, covariance_pr)
+    assert torch.allclose(covariance_score, covariance_pr * kwargs["slots_per_direction"])
+
+    other_pr = torch.tensor(1.0)
+    covariance_other_score = _combine_layer_budget_pr_base(
+        leverage_pr,
+        other_pr,
+        "covariance_pr",
+        **kwargs,
+    )
+    spectral_other_score = _combine_layer_budget_pr_base(
+        leverage_pr,
+        other_pr,
+        "spectral_pr",
+        **kwargs,
+    )
+    capacities = {0: 100, 1: 100}
+    covariance_budgets = _allocate_layer_budgets_from_scores(
+        {0: covariance_score, 1: covariance_other_score},
+        capacities,
+        total_budget=81,
+        alpha=0.7,
+    )
+    spectral_budgets = _allocate_layer_budgets_from_scores(
+        {0: spectral_score, 1: spectral_other_score},
+        capacities,
+        total_budget=81,
+        alpha=0.7,
+    )
+    assert spectral_budgets == covariance_budgets
+
 
 def test_hybrid_budget_pr_base_helpers():
     leverage_pr = torch.tensor(100.0)
@@ -182,12 +246,58 @@ def test_ridge_layer_budget_reuses_raw_gram_for_covariance_pr():
     assert torch.allclose(payload, torch.tensor(16.0), atol=1e-5)
 
 
+def test_spectral_pr_reuses_ridge_gram_cache():
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=4,
+        rls_refresh_interval=8,
+        layer_budget_strategy="spectral_pr",
+        slots_per_direction=4.0,
+    )
+    candidate_k = torch.zeros(1, 1, 4, 4)
+    candidate_k[0, 0, :, :] = torch.eye(4)
+
+    manager._set_leverage_diag_context(
+        layer_id=0,
+        step_idx=0,
+        current_frame_idx=0,
+        granularity="layer",
+        batch_size=1,
+        num_heads=1,
+    )
+    first_scores = manager._layer_svd_leverage_scores(candidate_k)
+    first_gram = manager.cached_ktk.clone()
+    first_pr = manager._last_layer_covariance_pr.clone()
+    first_payload = manager._compute_layer_budget_score(first_scores, candidate_k=candidate_k)
+
+    manager._set_leverage_diag_context(
+        layer_id=0,
+        step_idx=1,
+        current_frame_idx=1,
+        granularity="layer",
+        batch_size=1,
+        num_heads=1,
+    )
+    second_scores = manager._layer_svd_leverage_scores(torch.ones_like(candidate_k))
+    second_payload = manager._compute_layer_budget_score(second_scores, candidate_k=candidate_k)
+
+    assert manager.rls_refresh_count == 1
+    assert manager.rls_cache_hit_count == 1
+    assert torch.allclose(manager.cached_ktk, first_gram)
+    assert torch.allclose(manager._last_layer_covariance_pr, first_pr)
+    assert torch.allclose(second_payload, first_payload)
+
+
 def test_new_layer_budget_strategies_are_validated():
     strategies = (
         "covariance_pr",
+        "spectral_pr",
         "hybrid_cap",
         "hybrid_geom",
         "value_weighted_covariance_pr",
+        "value_weighted_spectral_pr",
         "value_weighted_hybrid_cap",
         "value_weighted_hybrid_geom",
     )
@@ -250,6 +360,28 @@ def test_value_weighted_manager_returns_base_pr_and_value_norm_payload():
     assert payload[1] > 0
 
 
+def test_value_weighted_spectral_pr_manager_payload_uses_raw_pr_and_selected_norm():
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        layer_budget_strategy="value_weighted_spectral_pr",
+        layer_budget_value_norm_type="mean",
+        layer_budget_norm_source="key",
+        slots_per_direction=17.0,
+    )
+    manager._last_layer_covariance_pr = torch.tensor([3.5])
+    policy_scores = torch.ones(1, 4)
+    candidate_k = torch.full((1, 2, 4, 3), 3.0)
+    expected_rows = candidate_k[0].transpose(0, 1).reshape(4, 6)
+    expected_norm = _layer_value_norm_score(expected_rows, "mean")
+
+    payload = manager._compute_layer_budget_score(policy_scores, candidate_k=candidate_k)
+
+    assert payload.shape == (2,)
+    assert torch.allclose(payload[0], torch.tensor(3.5))
+    assert torch.allclose(payload[1], expected_norm)
+
+
 def test_value_weighted_manager_key_norm_source_uses_candidate_k():
     manager = EvictionManager(
         policy="svd_leverage",
@@ -280,6 +412,26 @@ def test_value_weighted_manager_key_norm_source_uses_candidate_k():
     )
     assert payload[1] > 0
     assert payload[1] > value_payload[1]
+
+
+def test_key_norm_layer_budget_uses_candidate_key_norm_only():
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        layer_budget_strategy="key_norm",
+        layer_budget_value_norm_type="mean",
+    )
+    low_pr_scores = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    high_pr_scores = torch.ones(1, 4)
+    candidate_k = torch.full((1, 2, 4, 3), 3.0)
+    expected_rows = candidate_k[0].transpose(0, 1).reshape(4, 6)
+    expected = _layer_value_norm_score(expected_rows, "mean")
+
+    low_payload = manager._compute_layer_budget_score(low_pr_scores, candidate_k=candidate_k)
+    high_payload = manager._compute_layer_budget_score(high_pr_scores, candidate_k=candidate_k)
+
+    assert torch.allclose(low_payload, expected)
+    assert torch.allclose(high_payload, expected)
 
 
 def test_invalid_layer_budget_norm_source_rejected():
@@ -381,8 +533,10 @@ if __name__ == "__main__":
     test_cosine_precomputed_capacity_aware_allocation()
     test_cosine_helpers()
     test_covariance_pr_rank_and_scale_properties()
+    test_spectral_pr_uses_raw_participation_ratio()
     test_hybrid_budget_pr_base_helpers()
     test_ridge_layer_budget_reuses_raw_gram_for_covariance_pr()
+    test_spectral_pr_reuses_ridge_gram_cache()
     test_new_layer_budget_strategies_are_validated()
     test_value_norm_helper_mean_and_rms()
     test_value_norm_helper_empty_and_nonfinite_are_safe()
@@ -391,7 +545,9 @@ if __name__ == "__main__":
     test_value_weighted_higher_value_norm_increases_equal_pr_score()
     test_value_weighted_zero_values_fall_back_to_pr()
     test_value_weighted_manager_returns_base_pr_and_value_norm_payload()
+    test_value_weighted_spectral_pr_manager_payload_uses_raw_pr_and_selected_norm()
     test_value_weighted_manager_key_norm_source_uses_candidate_k()
+    test_key_norm_layer_budget_uses_candidate_key_norm_only()
     test_invalid_layer_budget_norm_source_rejected()
     test_value_weighted_allocation_invariants()
     test_equal_distributions_are_uniform()
