@@ -207,17 +207,17 @@ def check_low_precision_inputs() -> None:
 
 def check_confidence_state_sidecar() -> None:
     default_state = KVConfidenceState.for_current_frame(1, 2, 3, frame_id=-1, device=torch.device("cpu"))
-    if not torch.allclose(default_state.confidence_gate, torch.ones(1, 3)):
+    if not torch.allclose(default_state.confidence_gate.float(), torch.ones(1, 3), atol=1e-3, rtol=1e-3):
         raise AssertionError("default confidence gate should initialize to 1.0")
     init_state = KVConfidenceState.for_current_frame(2, 2, 3, frame_id=-1, device=torch.device("cpu"), initial_gate=torch.tensor([0.4, 0.8]))
-    if not torch.allclose(init_state.confidence_gate, torch.tensor([[0.4, 0.4, 0.4], [0.8, 0.8, 0.8]])):
+    if not torch.allclose(init_state.confidence_gate.float(), torch.tensor([[0.4, 0.4, 0.4], [0.8, 0.8, 0.8]]), atol=1e-3, rtol=1e-3):
         raise AssertionError(f"initial gate [B] did not broadcast: {init_state.confidence_gate}")
 
     state0 = KVConfidenceState.for_current_frame(1, 2, 4, frame_id=0, device=torch.device("cpu"), initial_gate=0.5)
     state1 = KVConfidenceState.for_current_frame(1, 2, 4, frame_id=1, device=torch.device("cpu"), initial_gate=0.5)
     combined = state0.concat(state1)
     depth_tokens = torch.tensor([[10.0, 11.0, 12.0, 13.0]])
-    point_tokens = torch.tensor([[1.0, 0.5, 0.25, 0.125]])
+    point_tokens = torch.tensor([[2.0, 3.0, 4.0, 5.0]])
     gate_tokens = make_token_confidence_gate(
         depth_tokens,
         point_tokens,
@@ -226,33 +226,60 @@ def check_confidence_state_sidecar() -> None:
         point_beta=1.0,
         preserve_prefix_tokens=1,
     )
-    expected_depth = depth_tokens / (depth_tokens + 1.0)
-    expected_point = point_tokens / (point_tokens + 1.0)
+    expected_depth = (depth_tokens - 1.0) / depth_tokens
+    expected_point = (point_tokens - 1.0) / point_tokens
     expected_gate = 0.2 + 0.8 * expected_depth * expected_point
     expected_gate[:, 0] = expected_gate[:, 1:].mean(dim=1)
     if not torch.allclose(gate_tokens, expected_gate):
         raise AssertionError(f"normalized confidence gate mismatch: {gate_tokens} vs {expected_gate}")
-    gate_tokens_k2 = make_token_confidence_gate(
+    gate_tokens_sigmoid = make_token_confidence_gate(
         depth_tokens,
         point_tokens,
         floor=0.2,
         depth_alpha=1.0,
         point_beta=1.0,
-        normalizer_k=2.0,
+        confidence_transform="sigmoid",
         preserve_prefix_tokens=1,
     )
-    expected_depth_k2 = depth_tokens / (depth_tokens + 2.0)
-    expected_point_k2 = point_tokens / (point_tokens + 2.0)
-    expected_gate_k2 = 0.2 + 0.8 * expected_depth_k2 * expected_point_k2
-    expected_gate_k2[:, 0] = expected_gate_k2[:, 1:].mean(dim=1)
-    if not torch.allclose(gate_tokens_k2, expected_gate_k2):
-        raise AssertionError(f"k=2 confidence gate mismatch: {gate_tokens_k2} vs {expected_gate_k2}")
+    expected_sigmoid_gate = 0.2 + 0.8 * torch.sigmoid(depth_tokens) * torch.sigmoid(point_tokens)
+    expected_sigmoid_gate[:, 0] = expected_sigmoid_gate[:, 1:].mean(dim=1)
+    if not torch.allclose(gate_tokens_sigmoid, expected_sigmoid_gate):
+        raise AssertionError(
+            f"sigmoid confidence gate mismatch: {gate_tokens_sigmoid} vs {expected_sigmoid_gate}"
+        )
+    depth_only_sigmoid = make_token_confidence_gate(
+        depth_tokens,
+        None,
+        floor=0.2,
+        depth_alpha=2.0,
+        point_beta=0.0,
+        confidence_transform="sigmoid",
+    )
+    expected_depth_only_sigmoid = 0.2 + 0.8 * torch.sigmoid(depth_tokens).pow(2.0)
+    if not torch.allclose(depth_only_sigmoid, expected_depth_only_sigmoid):
+        raise AssertionError(
+            f"depth-only sigmoid confidence gate mismatch: "
+            f"{depth_only_sigmoid} vs {expected_depth_only_sigmoid}"
+        )
     try:
         make_token_confidence_gate(depth_tokens, point_tokens, floor=0.2, depth_alpha=1.0, point_beta=1.0, normalizer_k=0.0)
     except ValueError:
         pass
     else:
         raise AssertionError("normalizer_k <= 0 should be rejected")
+    try:
+        make_token_confidence_gate(
+            depth_tokens,
+            point_tokens,
+            floor=0.2,
+            depth_alpha=1.0,
+            point_beta=1.0,
+            confidence_transform="invalid",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid confidence_transform should be rejected")
     if not torch.isclose(gate_tokens[0, 0], gate_tokens[0, 1:].mean()):
         raise AssertionError("prefix token gate should use patch gate mean")
     gate_tokens_prefix_one = make_token_confidence_gate(
@@ -267,9 +294,9 @@ def check_confidence_state_sidecar() -> None:
     if not torch.isclose(gate_tokens_prefix_one[0, 0], torch.tensor(1.0)):
         raise AssertionError("prefix_token_mode='one' should set prefix gate to 1.0")
     combined.update_frame_gate(1, gate_tokens)
-    if not torch.isclose(combined.confidence_gate[0, 6], gate_tokens[0, 2]):
+    if not torch.isclose(combined.confidence_gate[0, 6].float(), gate_tokens[0, 2], atol=1e-3, rtol=1e-3):
         raise AssertionError("confidence gate update did not use frame/token provenance")
-    if not torch.isclose(combined.confidence_gate[0, 7], gate_tokens[0, 3]):
+    if not torch.isclose(combined.confidence_gate[0, 7].float(), gate_tokens[0, 3], atol=1e-3, rtol=1e-3):
         raise AssertionError("confidence gate update did not broadcast across heads")
 
     indices = torch.tensor([[[0, 5, 7], [1, 4, 6]]], dtype=torch.long)
@@ -337,7 +364,7 @@ def check_confidence_state_sidecar() -> None:
         step_idx=1,
         leverage_conf_gate=True,
     )
-    if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.full((1, 4), 0.5)):
+    if not torch.allclose(kv1[3].confidence_gate[:, -4:].float(), torch.full((1, 4), 0.5), atol=1e-3, rtol=1e-3):
         raise AssertionError(f"default new frame temporary gate should use cached mean: {kv1[3].confidence_gate}")
     for init_value, expected_value in (("1", 1.0), ("1.0", 1.0), ("0.5", 0.5)):
         _, kv_const, _ = attention2(
@@ -353,7 +380,7 @@ def check_confidence_state_sidecar() -> None:
             leverage_conf_gate_init=init_value,
         )
         expected = torch.full((1, 4), expected_value)
-        if not torch.allclose(kv_const[3].confidence_gate[:, -4:], expected):
+        if not torch.allclose(kv_const[3].confidence_gate[:, -4:].float(), expected, atol=1e-3, rtol=1e-3):
             raise AssertionError(
                 f"new frame temporary gate init {init_value!r} mismatch: {kv_const[3].confidence_gate}"
             )
@@ -365,7 +392,7 @@ def check_confidence_state_sidecar() -> None:
         else:
             raise AssertionError(f"invalid confidence gate init was accepted: {invalid_init}")
     kv1[3].update_frame_gate(1, torch.tensor([[0.9, 0.8, 0.7, 0.6]]))
-    if not torch.allclose(kv1[3].confidence_gate[:, -4:], torch.tensor([[0.9, 0.8, 0.7, 0.6]])):
+    if not torch.allclose(kv1[3].confidence_gate[:, -4:].float(), torch.tensor([[0.9, 0.8, 0.7, 0.6]]), atol=1e-3, rtol=1e-3):
         raise AssertionError("post-head update did not replace temporary current-frame gate")
 
     agg = object.__new__(Aggregator)

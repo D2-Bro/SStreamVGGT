@@ -31,6 +31,9 @@ class KVConfidenceState:
     confidence_gate: torch.Tensor
     gate_sum: torch.Tensor
     gate_count: torch.Tensor
+    attention_accum: Optional[torch.Tensor] = None
+    attention_normalizer: Optional[torch.Tensor] = None
+    attention_count: Optional[torch.Tensor] = None
 
     @staticmethod
     def _store_confidence_gate(confidence_gate: torch.Tensor) -> torch.Tensor:
@@ -60,6 +63,7 @@ class KVConfidenceState:
         frame_id: int,
         device: torch.device,
         initial_gate: Optional[torch.Tensor | float] = None,
+        initialize_attention: bool = False,
     ) -> "KVConfidenceState":
         del num_heads  # Confidence is shared across heads; keep the arg for call-site compatibility.
         shape = (int(batch_size), int(num_tokens))
@@ -89,6 +93,9 @@ class KVConfidenceState:
             confidence_gate=confidence_gate,
             gate_sum=gate_sum,
             gate_count=gate_count,
+            attention_accum=torch.zeros(shape, device=device, dtype=torch.float32) if initialize_attention else None,
+            attention_normalizer=torch.zeros(shape, device=device, dtype=torch.float32) if initialize_attention else None,
+            attention_count=torch.zeros(shape, device=device, dtype=torch.uint8) if initialize_attention else None,
         )
 
     @classmethod
@@ -100,6 +107,7 @@ class KVConfidenceState:
         frame_ids,
         device: torch.device,
         initial_gate: Optional[torch.Tensor | float] = None,
+        initialize_attention: bool = False,
     ) -> "KVConfidenceState":
         del num_heads
         frame_ids = torch.as_tensor(frame_ids, device=device, dtype=torch.int32).reshape(-1)
@@ -141,11 +149,65 @@ class KVConfidenceState:
             confidence_gate=confidence_gate,
             gate_sum=gate_sum,
             gate_count=gate_count,
+            attention_accum=torch.zeros(shape, device=device, dtype=torch.float32) if initialize_attention else None,
+            attention_normalizer=torch.zeros(shape, device=device, dtype=torch.float32) if initialize_attention else None,
+            attention_count=torch.zeros(shape, device=device, dtype=torch.uint8) if initialize_attention else None,
         )
+
+    @property
+    def has_attention_utility(self) -> bool:
+        fields = (self.attention_accum, self.attention_normalizer, self.attention_count)
+        if any(field is not None for field in fields) and not all(field is not None for field in fields):
+            raise RuntimeError("Attention utility state is partially initialized")
+        return all(field is not None for field in fields)
+
+    def ensure_attention_utility(self) -> None:
+        if self.has_attention_utility:
+            return
+        shape = self.frame_ids.shape
+        self.attention_accum = torch.zeros(shape, device=self.frame_ids.device, dtype=torch.float32)
+        self.attention_normalizer = torch.zeros(shape, device=self.frame_ids.device, dtype=torch.float32)
+        self.attention_count = torch.zeros(shape, device=self.frame_ids.device, dtype=torch.uint8)
+
+    def attention_utility(self, eps: float = 1e-12) -> torch.Tensor:
+        if not self.has_attention_utility:
+            raise RuntimeError("Attention utility state is not initialized")
+        assert self.attention_accum is not None and self.attention_normalizer is not None
+        return self.attention_accum / self.attention_normalizer.clamp_min(float(eps))
+
+    def update_attention_utility(
+        self,
+        attention_score: torch.Tensor,
+        *,
+        ema_decay: float,
+        freeze_updates: int,
+    ) -> None:
+        self.ensure_attention_utility()
+        assert self.attention_accum is not None
+        assert self.attention_normalizer is not None
+        assert self.attention_count is not None
+        score = attention_score.to(device=self.frame_ids.device, dtype=torch.float32)
+        if tuple(score.shape) != tuple(self.frame_ids.shape):
+            raise ValueError(
+                f"attention_score must have shape {tuple(self.frame_ids.shape)}, got {tuple(score.shape)}"
+            )
+        if not 0.0 <= float(ema_decay) <= 1.0:
+            raise ValueError(f"ema_decay must be in [0, 1], got {ema_decay}")
+        if not 1 <= int(freeze_updates) <= 255:
+            raise ValueError(f"freeze_updates must be in [1, 255], got {freeze_updates}")
+        active = self.attention_count < int(freeze_updates)
+        clean_score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
+        decay = float(ema_decay)
+        self.attention_accum[active] = decay * self.attention_accum[active] + clean_score[active]
+        self.attention_normalizer[active] = decay * self.attention_normalizer[active] + 1.0
+        self.attention_count[active] += 1
 
     def concat(self, other: "KVConfidenceState") -> "KVConfidenceState":
         other_gate_sum = other.gate_sum.to(device=self.gate_sum.device, dtype=self.gate_sum.dtype)
         other_gate_count = other.gate_count.to(device=self.gate_count.device, dtype=self.gate_count.dtype)
+        if self.has_attention_utility or other.has_attention_utility:
+            self.ensure_attention_utility()
+            other.ensure_attention_utility()
         return KVConfidenceState(
             frame_ids=torch.cat([self.frame_ids, other.frame_ids.to(device=self.frame_ids.device, dtype=self.frame_ids.dtype)], dim=1),
             token_indices=torch.cat([self.token_indices, other.token_indices.to(device=self.token_indices.device, dtype=self.token_indices.dtype)], dim=1),
@@ -155,6 +217,18 @@ class KVConfidenceState:
             ),
             gate_sum=self.gate_sum + other_gate_sum,
             gate_count=self.gate_count + other_gate_count,
+            attention_accum=(
+                torch.cat([self.attention_accum, other.attention_accum.to(self.attention_accum.device)], dim=1)
+                if self.attention_accum is not None and other.attention_accum is not None else None
+            ),
+            attention_normalizer=(
+                torch.cat([self.attention_normalizer, other.attention_normalizer.to(self.attention_normalizer.device)], dim=1)
+                if self.attention_normalizer is not None and other.attention_normalizer is not None else None
+            ),
+            attention_count=(
+                torch.cat([self.attention_count, other.attention_count.to(self.attention_count.device)], dim=1)
+                if self.attention_count is not None and other.attention_count is not None else None
+            ),
         )
 
     def _head_shared_indices(self, indices: torch.Tensor) -> torch.Tensor:
@@ -175,6 +249,11 @@ class KVConfidenceState:
             confidence_gate=confidence_gate,
             gate_sum=gate_sum,
             gate_count=gate_count,
+            attention_accum=(torch.gather(self.attention_accum, 1, indices) if self.attention_accum is not None else None),
+            attention_normalizer=(
+                torch.gather(self.attention_normalizer, 1, indices) if self.attention_normalizer is not None else None
+            ),
+            attention_count=(torch.gather(self.attention_count, 1, indices) if self.attention_count is not None else None),
         )
 
     def slice(self, start: int, end: int) -> "KVConfidenceState":
@@ -267,12 +346,18 @@ def make_token_confidence_gate(
     depth_alpha: float,
     point_beta: float,
     normalizer_k: float = 1.0,
+    confidence_transform: str = "ratio",
     normalize_confidence: bool = True,
     preserve_prefix_tokens: int = 0,
     prefix_token_mode: str = "mean",
 ) -> torch.Tensor:
     if prefix_token_mode not in ("mean", "one"):
         raise ValueError(f"prefix_token_mode must be 'mean' or 'one', got {prefix_token_mode!r}")
+    if confidence_transform not in ("ratio", "sigmoid"):
+        raise ValueError(
+            "confidence_transform must be 'ratio' or 'sigmoid', "
+            f"got {confidence_transform!r}"
+        )
 
     if token_depth_confidence is None and token_point_confidence is None:
         raise ValueError("At least one confidence tensor is required to infer gate shape")
@@ -299,11 +384,16 @@ def make_token_confidence_gate(
         if normalizer_k <= 0.0:
             raise ValueError(f"normalizer_k must be > 0, got {normalizer_k}")
         if token_depth_confidence is not None:
-            # depth_conf = depth_conf / (depth_conf + normalizer_k)
-            depth_conf = (depth_conf - 1.0) / (depth_conf)
+            if confidence_transform == "ratio":
+                depth_conf = depth_conf / (depth_conf + 1.0)
+                # depth_conf = (depth_conf - 1.0) / depth_conf
+            else:
+                depth_conf = torch.sigmoid(depth_conf)
         if token_point_confidence is not None:
-            # point_conf = point_conf / (point_conf + normalizer_k)
-            point_conf = (point_conf - 1.0) / (point_conf)
+            if confidence_transform == "ratio":
+                point_conf = (point_conf - 1.0) / point_conf
+            else:
+                point_conf = torch.sigmoid(point_conf)
 
     if float(depth_alpha) != 1.0:
         depth_conf = depth_conf.pow(float(depth_alpha))

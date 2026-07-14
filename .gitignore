@@ -1,4 +1,5 @@
 **/__pycache__
+attn-cuda/attn_cuda/_ext*.so
 cache_*/
 .vscode/
 pre_*/

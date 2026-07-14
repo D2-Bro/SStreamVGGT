@@ -17,6 +17,7 @@ import time
 import subprocess
 from pathlib import Path
 from tqdm import tqdm
+from streamvggt.layers.confidence_state import parse_confidence_gate_init
 from streamvggt.utils.cache_analysis import (
     add_eviction_nn_analysis_args,
     add_leverage_score_histogram_args,
@@ -100,6 +101,27 @@ def get_args_parser():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="L2-normalize token feature rows before svd_leverage QR/leverage scoring",
+    )
+    parser.add_argument(
+        "--leverage_normalize_before_projection",
+        "--leverage-normalize-before-projection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="L2-normalize layer-wise key rows before random leverage projection",
+    )
+    parser.add_argument(
+        "--leverage_normalize_before_projection_headwise",
+        "--leverage-normalize-before-projection-headwise",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When normalizing before projection, normalize each head key row independently",
+    )
+    parser.add_argument(
+        "--leverage_projected_key_cache",
+        "--leverage-projected-key-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reuse cached layer-wise random projected key features for surviving tokens",
     )
     parser.add_argument(
         "--leverage_approx_method",
@@ -253,6 +275,33 @@ def get_args_parser():
     parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=10, help="Frame window for linear eviction-score freshness")
     parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for eviction-score recency")
     parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print eviction-score recency bonus summary statistics")
+    parser.add_argument("--leverage_conf_gate", "--leverage-conf-gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
+    parser.add_argument("--leverage_conf_gate_floor", "--leverage-conf-gate-floor", type=float, default=0.2, help="Minimum multiplicative confidence gate value")
+    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to transformed depth confidence")
+    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to transformed world-points confidence")
+    parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive scale used by the ratio confidence transform")
+    parser.add_argument(
+        "--leverage_conf_gate_transform",
+        "--leverage-conf-gate-transform",
+        type=str,
+        default="ratio",
+        choices=("ratio", "sigmoid"),
+        help="Confidence gate transform: ratio preserves the baseline mapping; sigmoid uses torch.sigmoid(c)",
+    )
+    parser.add_argument("--leverage_conf_gate_init", "--leverage-conf-gate-init", type=str, default="mean", help="Initial current-frame confidence gate: mean or finite non-negative float")
+    parser.add_argument(
+        "--leverage_conf_gate_special_mode",
+        "--leverage-conf-gate-special-mode",
+        type=str,
+        default="mean",
+        choices=("mean", "one"),
+        help="Gate mode for special/prefix tokens",
+    )
+    parser.add_argument("--leverage_attention_utility", "--leverage-attention-utility", action="store_true", help="Collect frozen early-attention utility with STAC CUDA after pre-attention eviction")
+    parser.add_argument("--leverage_attention_beta", "--leverage-attention-beta", type=float, default=0.2, help="Weight of normalized frozen attention utility in the keep score")
+    parser.add_argument("--leverage_attention_ema_decay", "--leverage-attention-ema-decay", type=float, default=0.9, help="EMA decay used during each token attention observation horizon")
+    parser.add_argument("--leverage_attention_freeze_updates", "--leverage-attention-freeze-updates", type=int, default=5, help="Number of attention observations accumulated before freezing token utility")
+    parser.add_argument("--leverage_attention_colsum_subsample_ratio", "--leverage-attention-colsum-subsample-ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument(
         "--layer_budget_strategy",
         "--layer-budget-strategy",
@@ -404,6 +453,16 @@ def get_args_parser():
         default=200000,
         help="Total token budget for StreamVGGT inference",
     )
+
+    parser.add_argument(
+        "--budget_frame_multiplier",
+        "--budget-frame-multiplier",
+        type=float,
+        default=None,
+        help="Set the token budget from the per-frame token count times this multiplier",
+    )
+    parser.add_argument("--stream_chunk_size", "--stream-chunk-size", type=int, default=1)
+    parser.add_argument("--empty_cache_interval", "--empty-cache-interval", type=int, default=1)
 
     parser.add_argument(
         "--pose_eval_stride", default=1, type=int, help="stride for pose evaluation"
@@ -599,6 +658,10 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         views,
                         frame_writer=frame_writer,
                         cache_results=not args.stream_depth_save,
+                        total_budget=args.budget,
+                        budget_frame_multiplier=args.budget_frame_multiplier,
+                        stream_chunk_size=args.stream_chunk_size,
+                        empty_cache_interval=args.empty_cache_interval,
                         eviction_policy=args.eviction_policy,
                         leverage_sketch_dim=args.leverage_sketch_dim,
                         leverage_granularity=args.leverage_granularity,
@@ -606,8 +669,11 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_projection=args.leverage_projection,
                         leverage_head_mean_dim=args.leverage_head_mean_dim,
                         leverage_normalize_rows=args.leverage_normalize_rows,
+                        leverage_normalize_before_projection=args.leverage_normalize_before_projection,
+                        leverage_normalize_before_projection_headwise=args.leverage_normalize_before_projection_headwise,
+                        leverage_projected_key_cache=args.leverage_projected_key_cache,
                         leverage_approx_method=args.leverage_approx_method,
-                                    leverage_ridge_lambda=args.leverage_ridge_lambda,
+                        leverage_ridge_lambda=args.leverage_ridge_lambda,
                         leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
                         leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
                         leverage_ridge_jitter=args.leverage_ridge_jitter,
@@ -632,6 +698,19 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_dpp_recency_window=args.leverage_dpp_recency_window,
                         leverage_dpp_recency_gate_power=args.leverage_dpp_recency_gate_power,
                         leverage_dpp_recency_debug=args.leverage_dpp_recency_debug,
+                        leverage_conf_gate=args.leverage_conf_gate,
+                        leverage_conf_gate_floor=args.leverage_conf_gate_floor,
+                        leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
+                        leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
+                        leverage_conf_gate_k=args.leverage_conf_gate_k,
+                        leverage_conf_gate_transform=args.leverage_conf_gate_transform,
+                        leverage_conf_gate_init=args.leverage_conf_gate_init,
+                        leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
+                        leverage_attention_utility=args.leverage_attention_utility,
+                        leverage_attention_beta=args.leverage_attention_beta,
+                        leverage_attention_ema_decay=args.leverage_attention_ema_decay,
+                        leverage_attention_freeze_updates=args.leverage_attention_freeze_updates,
+                        leverage_attention_colsum_subsample_ratio=args.leverage_attention_colsum_subsample_ratio,
                         layer_budget_strategy=args.layer_budget_strategy,
                         layer_budget_value_gamma=args.layer_budget_value_gamma,
                         layer_budget_value_norm_type=args.layer_budget_value_norm_type,
@@ -787,6 +866,35 @@ if __name__ == "__main__":
             "Error: --leverage_dpp_recency_gate_power must be >= 0, "
             f"got {args.leverage_dpp_recency_gate_power}."
         )
+    if not (0.0 <= args.leverage_conf_gate_floor <= 1.0):
+        raise SystemExit("Error: --leverage_conf_gate_floor must be in [0, 1].")
+    if args.leverage_conf_gate_depth_alpha < 0:
+        raise SystemExit("Error: --leverage_conf_gate_depth_alpha must be >= 0.")
+    if args.leverage_conf_gate_point_beta < 0:
+        raise SystemExit("Error: --leverage_conf_gate_point_beta must be >= 0.")
+    if args.leverage_conf_gate_k <= 0:
+        raise SystemExit("Error: --leverage_conf_gate_k must be > 0.")
+    try:
+        parse_confidence_gate_init(args.leverage_conf_gate_init)
+    except ValueError as exc:
+        raise SystemExit(f"Error: --leverage_conf_gate_init {exc}.") from exc
+    if args.leverage_attention_utility:
+        if not 0.0 <= args.leverage_attention_beta <= 1.0:
+            raise SystemExit("Error: --leverage_attention_beta must be in [0, 1].")
+        if not 0.0 <= args.leverage_attention_ema_decay <= 1.0:
+            raise SystemExit("Error: --leverage_attention_ema_decay must be in [0, 1].")
+        if not 1 <= args.leverage_attention_freeze_updates <= 255:
+            raise SystemExit("Error: --leverage_attention_freeze_updates must be in [1, 255].")
+        if not 0.0 < args.leverage_attention_colsum_subsample_ratio <= 1.0:
+            raise SystemExit("Error: --leverage_attention_colsum_subsample_ratio must be in (0, 1].")
+        if args.stream_chunk_size != 1:
+            raise SystemExit("Error: --leverage_attention_utility currently requires --stream_chunk_size 1.")
+        if args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_attention_utility requires layer-wise svd_leverage.")
+        if args.leverage_eviction_selector != "topk":
+            raise SystemExit("Error: --leverage_attention_utility currently requires --leverage_eviction_selector topk.")
+        if args.eviction_protect_recent_frames != 0 or args.leverage_dpp_recency_bonus:
+            raise SystemExit("Error: attention utility requires recency protection/bonus to be disabled.")
     if args.layer_budget_alpha < 0:
         raise SystemExit(
             "Error: --layer_budget_alpha must be >= 0, "
@@ -857,6 +965,36 @@ if __name__ == "__main__":
             "Error: --leverage_approx_method right_sketch_ridge requires "
             "--leverage_ridge_dim >= 1."
         )
+    if args.leverage_normalize_before_projection_headwise and not args.leverage_normalize_before_projection:
+        raise SystemExit(
+            "Error: --leverage_normalize_before_projection_headwise requires "
+            "--leverage_normalize_before_projection."
+        )
+    if args.leverage_normalize_before_projection:
+        if args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer":
+            raise SystemExit("Error: pre-projection normalization requires layer-wise svd_leverage.")
+        if args.leverage_feature != "key" or args.leverage_projection != "random":
+            raise SystemExit("Error: pre-projection normalization requires random-projected key features.")
+        if args.leverage_approx_method not in ("exact_qr", "right_sketch", "right_sketch_ridge"):
+            raise SystemExit("Error: unsupported approximation for pre-projection normalization.")
+    if args.leverage_projected_key_cache:
+        if args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_projected_key_cache requires layer-wise svd_leverage.")
+        if args.leverage_feature != "key" or args.leverage_projection != "random":
+            raise SystemExit("Error: --leverage_projected_key_cache requires random-projected key features.")
+        if args.leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+            raise SystemExit("Error: --leverage_projected_key_cache requires right_sketch or right_sketch_ridge.")
+        if args.leverage_eviction_selector == "layer_head_fast_dpp" or (
+            args.leverage_eviction_selector == "similarity_topk"
+            and args.leverage_similarity_granularity == "head"
+        ):
+            raise SystemExit("Error: --leverage_projected_key_cache requires a shared layer keep set.")
+    if args.budget_frame_multiplier is not None and args.budget_frame_multiplier < 0.0:
+        raise SystemExit("Error: --budget_frame_multiplier must be >= 0 when provided.")
+    if args.stream_chunk_size < 1:
+        raise SystemExit("Error: --stream_chunk_size must be >= 1.")
+    if args.empty_cache_interval < 0:
+        raise SystemExit("Error: --empty_cache_interval must be >= 0.")
     if args.layer_budget_strategy not in ("uniform", "cosine_precomputed") and (
         args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
     ):
@@ -936,6 +1074,9 @@ if __name__ == "__main__":
             f"projection={args.leverage_projection}, "
             f"head_mean_dim={args.leverage_head_mean_dim}, "
             f"normalize_rows={args.leverage_normalize_rows}, "
+            f"normalize_before_projection={args.leverage_normalize_before_projection}, "
+            f"normalize_before_projection_headwise={args.leverage_normalize_before_projection_headwise}, "
+            f"projected_key_cache={args.leverage_projected_key_cache}, "
             f"selector={args.leverage_eviction_selector}, "
             f"risk_mode={args.leverage_eviction_risk_mode}, "
             f"high_outlier_z={args.leverage_high_outlier_z}, "
@@ -944,6 +1085,15 @@ if __name__ == "__main__":
             f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
             f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
             f"dpp_feature_projection={args.leverage_dpp_feature_projection}, "
+            f"conf_gate={args.leverage_conf_gate}, "
+            f"conf_gate_transform={args.leverage_conf_gate_transform}, "
+            f"conf_gate_init={args.leverage_conf_gate_init}, "
+            f"conf_gate_special_mode={args.leverage_conf_gate_special_mode}, "
+            f"attention_utility={args.leverage_attention_utility}, "
+            f"attention_beta={args.leverage_attention_beta}, "
+            f"attention_ema_decay={args.leverage_attention_ema_decay}, "
+            f"attention_freeze_updates={args.leverage_attention_freeze_updates}, "
+            f"attention_colsum_subsample_ratio={args.leverage_attention_colsum_subsample_ratio}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "

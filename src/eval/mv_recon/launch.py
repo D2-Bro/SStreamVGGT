@@ -398,10 +398,23 @@ def get_args_parser():
     parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print eviction-score recency bonus summary statistics")
     parser.add_argument("--leverage_conf_gate", "--leverage-conf-gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
     parser.add_argument("--leverage_conf_gate_floor", "--leverage-conf-gate-floor", type=float, default=0.2, help="Minimum multiplicative confidence gate value")
-    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to normalized depth_conf / (depth_conf + k) in the confidence gate")
-    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + k) in the confidence gate")
-    parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive k for confidence normalization c / (c + k)")
+    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to transformed depth confidence in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to transformed world-point confidence in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Legacy positive normalization parameter retained for compatibility")
+    parser.add_argument(
+        "--leverage_conf_gate_transform",
+        "--leverage-conf-gate-transform",
+        type=str,
+        default="ratio",
+        choices=("ratio", "sigmoid"),
+        help="Confidence gate transform: ratio uses (c - 1) / c; sigmoid uses torch.sigmoid(c)",
+    )
     parser.add_argument("--leverage_conf_gate_init", "--leverage-conf-gate-init", type=str, default="mean", help="Initial current-frame confidence gate before head confidence update: mean or finite non-negative float")
+    parser.add_argument("--leverage_attention_utility", "--leverage-attention-utility", action="store_true", help="Use frozen early-attention utility with STAC CUDA post-attention eviction")
+    parser.add_argument("--leverage_attention_beta", "--leverage-attention-beta", type=float, default=0.2, help="Weight of normalized frozen attention utility in the keep score")
+    parser.add_argument("--leverage_attention_ema_decay", "--leverage-attention-ema-decay", type=float, default=0.9, help="EMA decay used during each token's finite attention observation horizon")
+    parser.add_argument("--leverage_attention_freeze_updates", "--leverage-attention-freeze-updates", type=int, default=5, help="Number of attention observations accumulated before freezing token utility")
+    parser.add_argument("--leverage_attention_colsum_subsample_ratio", "--leverage-attention-colsum-subsample-ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument(
         "--leverage_conf_gate_special_mode",
         "--leverage-conf-gate-special-mode",
@@ -792,6 +805,23 @@ def get_args_parser():
 
 
 def main(args):
+    if args.leverage_attention_utility:
+        if not 0.0 <= args.leverage_attention_beta <= 1.0:
+            raise SystemExit("Error: --leverage_attention_beta must be in [0, 1].")
+        if not 0.0 <= args.leverage_attention_ema_decay <= 1.0:
+            raise SystemExit("Error: --leverage_attention_ema_decay must be in [0, 1].")
+        if not 1 <= args.leverage_attention_freeze_updates <= 255:
+            raise SystemExit("Error: --leverage_attention_freeze_updates must be in [1, 255].")
+        if not 0.0 < args.leverage_attention_colsum_subsample_ratio <= 1.0:
+            raise SystemExit("Error: --leverage_attention_colsum_subsample_ratio must be in (0, 1].")
+        if args.stream_chunk_size != 1:
+            raise SystemExit("Error: --leverage_attention_utility currently requires --stream_chunk_size 1.")
+        if args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_attention_utility requires layer-wise svd_leverage.")
+        if args.leverage_eviction_selector != "topk":
+            raise SystemExit("Error: --leverage_attention_utility currently requires --leverage_eviction_selector topk.")
+        if args.eviction_protect_recent_frames != 0 or args.leverage_dpp_recency_bonus:
+            raise SystemExit("Error: attention utility requires recency protection/bonus to be disabled.")
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
         print(
@@ -823,8 +853,14 @@ def main(args):
             f"conf_gate_depth_alpha={args.leverage_conf_gate_depth_alpha}, "
             f"conf_gate_point_beta={args.leverage_conf_gate_point_beta}, "
             f"conf_gate_k={args.leverage_conf_gate_k}, "
+            f"conf_gate_transform={args.leverage_conf_gate_transform}, "
             f"conf_gate_init={args.leverage_conf_gate_init}, "
             f"conf_gate_special_mode={args.leverage_conf_gate_special_mode}, "
+            f"attention_utility={args.leverage_attention_utility}, "
+            f"attention_beta={args.leverage_attention_beta}, "
+            f"attention_ema_decay={args.leverage_attention_ema_decay}, "
+            f"attention_freeze_updates={args.leverage_attention_freeze_updates}, "
+            f"attention_colsum_subsample_ratio={args.leverage_attention_colsum_subsample_ratio}, "
             f"layer_budget_strategy={args.layer_budget_strategy}, "
             f"layer_budget_alpha={args.layer_budget_alpha}, "
             f"layer_budget_min_tokens={args.layer_budget_min_tokens}, "
@@ -837,19 +873,6 @@ def main(args):
             f"protect_recent_frames={args.eviction_protect_recent_frames}, "
             f"kf_interval={args.kf_interval}, "
             f"evict_interval={args.evict_interval}"
-        )
-    elif args.eviction_policy == "dpp":
-        print(
-            "Using DPP-only eviction: "
-            f"granularity={args.leverage_granularity}, "
-            f"feature={args.leverage_feature}, "
-            f"projection={args.leverage_projection}, "
-            f"head_mean_dim={args.leverage_head_mean_dim}, "
-            f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
-            f"dpp_quality_beta={args.leverage_dpp_quality_beta}, "
-            f"dpp_diversity_beta={args.leverage_dpp_diversity_beta}, "
-            f"dpp_feature_projection={args.leverage_dpp_feature_projection}, "
-            f"protect_recent_frames={args.eviction_protect_recent_frames}"
         )
     add_path_to_dust3r(args.weights)
     from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D, Replica
@@ -1193,7 +1216,13 @@ def main(args):
                                     leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
                                     leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
                                     leverage_conf_gate_k=args.leverage_conf_gate_k,
+                                    leverage_conf_gate_transform=args.leverage_conf_gate_transform,
                                     leverage_conf_gate_init=args.leverage_conf_gate_init,
+                                    leverage_attention_utility=args.leverage_attention_utility,
+                                    leverage_attention_beta=args.leverage_attention_beta,
+                                    leverage_attention_ema_decay=args.leverage_attention_ema_decay,
+                                    leverage_attention_freeze_updates=args.leverage_attention_freeze_updates,
+                                    leverage_attention_colsum_subsample_ratio=args.leverage_attention_colsum_subsample_ratio,
                                     leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
                                     layer_budget_strategy=args.layer_budget_strategy,
                                     layer_budget_value_gamma=args.layer_budget_value_gamma,

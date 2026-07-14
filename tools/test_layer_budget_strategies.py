@@ -345,6 +345,32 @@ def test_value_weighted_zero_values_fall_back_to_pr():
     assert torch.allclose(scores, base)
 
 
+def test_value_weighted_applies_alpha_only_to_base_and_gamma_only_to_norm():
+    base = torch.tensor([4.0, 9.0])
+    value_norms = torch.tensor([1.0, 3.0])
+    scores = _combine_value_weighted_leverage_pr_scores(
+        base,
+        value_norms,
+        gamma=2.0,
+        alpha=0.5,
+    )
+    normalized_norms = value_norms / value_norms.mean()
+    expected = base.pow(0.5) * normalized_norms.pow(2.0)
+    assert torch.allclose(scores, expected)
+
+
+def test_value_weighted_alpha_zero_keeps_norm_weighting():
+    base = torch.tensor([4.0, 9.0])
+    value_norms = torch.tensor([1.0, 3.0])
+    scores = _combine_value_weighted_leverage_pr_scores(
+        base,
+        value_norms,
+        gamma=1.0,
+        alpha=0.0,
+    )
+    assert torch.allclose(scores, value_norms / value_norms.mean())
+
+
 def test_value_weighted_manager_returns_base_pr_and_value_norm_payload():
     manager = EvictionManager(
         policy="svd_leverage",
@@ -544,6 +570,8 @@ if __name__ == "__main__":
     test_value_weighted_equal_values_preserve_pr()
     test_value_weighted_higher_value_norm_increases_equal_pr_score()
     test_value_weighted_zero_values_fall_back_to_pr()
+    test_value_weighted_applies_alpha_only_to_base_and_gamma_only_to_norm()
+    test_value_weighted_alpha_zero_keeps_norm_weighting()
     test_value_weighted_manager_returns_base_pr_and_value_norm_payload()
     test_value_weighted_spectral_pr_manager_payload_uses_raw_pr_and_selected_norm()
     test_value_weighted_manager_key_norm_source_uses_candidate_k()

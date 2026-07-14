@@ -29,6 +29,17 @@ from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig, SvdEvic
 XFORMERS_AVAILABLE = False
 
 
+def scale_stac_colsum(colsum: torch.Tensor, live_tokens: int, query_tokens: int) -> torch.Tensor:
+    """Convert STAC per-head column sums into a cache-length-stable token score."""
+    if colsum.ndim != 3:
+        raise ValueError(f"colsum must have shape [B, H, N], got {tuple(colsum.shape)}")
+    if int(live_tokens) != int(colsum.shape[-1]):
+        raise ValueError(f"live_tokens={live_tokens} does not match colsum keys={colsum.shape[-1]}")
+    if int(query_tokens) <= 0:
+        raise ValueError(f"query_tokens must be positive, got {query_tokens}")
+    return colsum.float().mean(dim=1) * (float(live_tokens) / float(query_tokens))
+
+
 def _materialize_kv_by_keep_indices(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -212,6 +223,7 @@ class Attention(nn.Module):
         leverage_conf_gate_floor: float = 0.2,
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
+        leverage_attention_beta: float = 0.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -505,6 +517,18 @@ class Attention(nn.Module):
             if select_confidence_state is not None
             else None
         )
+        candidate_attention_utility = (
+            select_confidence_state.attention_utility()[:, num_anchor_tokens:]
+            if select_confidence_state is not None and select_confidence_state.has_attention_utility
+            else None
+        )
+        candidate_attention_observed = (
+            select_confidence_state.attention_count[:, num_anchor_tokens:].gt(0)
+            if select_confidence_state is not None
+            and select_confidence_state.has_attention_utility
+            and select_confidence_state.attention_count is not None
+            else None
+        )
         candidate_depth_confidence = (
             select_metadata.accumulated_depth_confidence[:, :, num_anchor_tokens:]
             if select_confidence_state is None and select_metadata is not None
@@ -530,6 +554,9 @@ class Attention(nn.Module):
             candidate_depth_confidence=candidate_depth_confidence,
             candidate_point_confidence=candidate_point_confidence,
             candidate_conf_gate=candidate_conf_gate,
+            candidate_attention_utility=candidate_attention_utility,
+            candidate_attention_observed=candidate_attention_observed,
+            attention_utility_beta=leverage_attention_beta,
             candidate_evictable_mask=candidate_evictable_mask,
             history_anchor_frame_ids=history_anchor_frame_ids,
             history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
@@ -748,6 +775,11 @@ class Attention(nn.Module):
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
         leverage_conf_gate_init: str = "mean",
+        leverage_attention_utility: bool = False,
+        leverage_attention_beta: float = 0.2,
+        leverage_attention_ema_decay: float = 0.9,
+        leverage_attention_freeze_updates: int = 5,
+        leverage_attention_colsum_subsample_ratio: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -774,6 +806,34 @@ class Attention(nn.Module):
         history_anchor_max_frames: int = 0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
+        leverage_attention_utility = bool(leverage_attention_utility)
+        if leverage_attention_utility:
+            if self.training:
+                raise RuntimeError("Frozen early-attention utility is inference-only")
+            if not use_cache:
+                raise ValueError("Frozen early-attention utility requires use_cache=True")
+            if self.head_dim != 64:
+                raise ValueError(f"STAC CUDA attention requires head_dim=64, got {self.head_dim}")
+            if attn_mask is not None:
+                raise ValueError("Frozen early-attention utility does not support attention masks")
+            if eviction_policy != "svd_leverage" or leverage_granularity != "layer":
+                raise ValueError("Frozen early-attention utility requires layer-wise svd_leverage eviction")
+            if leverage_eviction_selector != "topk":
+                raise ValueError("Frozen early-attention utility initially supports only layer-shared Top-K")
+            if voxel_covis_enabled or global_cache_history_anchor_special_tokens_only:
+                raise ValueError("Frozen early-attention utility does not support voxel covisibility or special-token sidecars")
+            if not cache_write_current_frame or not cache_evict_current_frame:
+                raise ValueError("Frozen early-attention utility requires cache write and eviction on every current frame")
+            if int(eviction_protect_recent_frames) != 0 or bool(leverage_dpp_recency_bonus):
+                raise ValueError("Frozen early-attention utility requires recent protection and recency bonus to be disabled")
+            if not 0.0 <= float(leverage_attention_beta) <= 1.0:
+                raise ValueError("leverage_attention_beta must be in [0, 1]")
+            if not 0.0 <= float(leverage_attention_ema_decay) <= 1.0:
+                raise ValueError("leverage_attention_ema_decay must be in [0, 1]")
+            if not 1 <= int(leverage_attention_freeze_updates) <= 255:
+                raise ValueError("leverage_attention_freeze_updates must be in [1, 255]")
+            if not 0.0 < float(leverage_attention_colsum_subsample_ratio) <= 1.0:
+                raise ValueError("leverage_attention_colsum_subsample_ratio must be in (0, 1]")
         profile_forward = bool(profile_eviction)
         forward_start = self._profile_start(x, profile_forward)
         qkv_start = self._profile_start(x, profile_forward)
@@ -787,6 +847,15 @@ class Attention(nn.Module):
         if self.rope is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
+        attention_output_dtype = q.dtype
+        if leverage_attention_utility:
+            attention_compute_dtype = torch.bfloat16 if q.dtype == torch.bfloat16 else torch.float16
+            # Materialize only the current-frame Q/K/V in SStream's native BHND
+            # layout. The persistent K/V cache then stays BHND-contiguous, so
+            # the full live cache never needs a transpose-contiguous copy.
+            q = q.to(dtype=attention_compute_dtype).contiguous()
+            k = k.to(dtype=attention_compute_dtype).contiguous()
+            v = v.to(dtype=attention_compute_dtype).contiguous()
         self._record_forward_profile("qk_norm_rope", norm_rope_start, q, profile_forward)
 
         if use_cache and self.num_anchor_tokens == 0:
@@ -802,7 +871,7 @@ class Attention(nn.Module):
             current_special_kv = None
             metadata = None
             confidence_state = None
-            confidence_needed = bool(leverage_conf_gate)
+            confidence_needed = bool(leverage_conf_gate) or leverage_attention_utility
             metadata_needed = (
                 (recent_merge_config is not None and recent_merge_config.enabled)
                 or (svd_eviction_merge_config is not None and svd_eviction_merge_config.enabled and eviction_policy == "svd_leverage")
@@ -821,6 +890,11 @@ class Attention(nn.Module):
                 resolved_current_frame_ids = [int(frame_id) for frame_id in current_frame_ids]
             if len(resolved_current_frame_ids) <= 0:
                 resolved_current_frame_ids = [step_idx if step_idx is not None else 0]
+            if leverage_attention_utility and len(resolved_current_frame_ids) != 1:
+                raise ValueError(
+                    "Frozen early-attention utility initially supports stream_chunk_size=1 "
+                    f"(got {len(resolved_current_frame_ids)} frames)"
+                )
             resolved_current_frame_idx = (
                 int(current_frame_idx)
                 if current_frame_idx is not None
@@ -859,6 +933,7 @@ class Attention(nn.Module):
                         frame_ids=resolved_current_frame_ids,
                         device=current_k.device,
                         initial_gate=initial_gate_value,
+                        initialize_attention=leverage_attention_utility,
                     )
                 return KVConfidenceState.for_current_frame(
                     batch_size=B,
@@ -867,6 +942,7 @@ class Attention(nn.Module):
                     frame_id=resolved_current_frame_idx,
                     device=current_k.device,
                     initial_gate=initial_gate_value,
+                    initialize_attention=leverage_attention_utility,
                 )
 
             if metadata_needed:
@@ -947,7 +1023,10 @@ class Attention(nn.Module):
                         num_tokens=past_k.shape[2],
                         frame_id=-1,
                         device=past_k.device,
+                        initialize_attention=leverage_attention_utility,
                     )
+                if leverage_attention_utility and past_confidence_state is not None:
+                    past_confidence_state.ensure_attention_utility()
                 if cache_write_current_frame and write_metadata is not None and past_metadata is not None:
                     metadata = past_metadata.concat(write_metadata)
                 elif cache_write_current_frame and write_metadata is not None:
@@ -966,7 +1045,6 @@ class Attention(nn.Module):
                 metadata = write_metadata if cache_write_current_frame else metadata
                 confidence_state = write_confidence_state if cache_write_current_frame else confidence_state
             self._record_forward_profile("cache_concat_update", cache_concat_start, k, profile_forward)
-
             if (
                 cache_write_current_frame
                 and pre_eviction_snapshot_config is not None
@@ -1049,6 +1127,7 @@ class Attention(nn.Module):
                     "leverage_conf_gate_floor": leverage_conf_gate_floor,
                     "leverage_conf_gate_depth_alpha": leverage_conf_gate_depth_alpha,
                     "leverage_conf_gate_point_beta": leverage_conf_gate_point_beta,
+                    "leverage_attention_beta": leverage_attention_beta,
                     "layer_budget_strategy": layer_budget_strategy,
                     "layer_budget_value_gamma": layer_budget_value_gamma,
                     "layer_budget_value_norm_type": layer_budget_value_norm_type,
@@ -1090,8 +1169,10 @@ class Attention(nn.Module):
                     k, v, metadata, scores = eviction_result
 
             cache_read_start = self._profile_start(k, profile_forward)
-            if cache_write_current_frame:
+            if cache_write_current_frame and not leverage_attention_utility:
                 new_kv = pack_kv_cache(k, v, metadata, confidence_state)
+            elif leverage_attention_utility:
+                new_kv = None
             else:
                 new_kv = original_past_key_values
 
@@ -1145,7 +1226,34 @@ class Attention(nn.Module):
             v_for_attn = v
 
         attention_kernel_start = self._profile_start(q, profile_forward)
-        if self.fused_attn:
+        attention_colsum = None
+        if leverage_attention_utility:
+            if not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16):
+                raise RuntimeError(
+                    "STAC CUDA attention requires CUDA FP16/BF16 Q/K/V, "
+                    f"got device={q.device} dtype={q.dtype}"
+                )
+            try:
+                import attn_cuda
+            except (ImportError, OSError) as exc:
+                raise RuntimeError(
+                    "Frozen early-attention utility requires the local attn-cuda extension. "
+                    "Build it with 'pip install -e ./attn-cuda --no-build-isolation'."
+                ) from exc
+            if not attn_cuda.is_available():
+                raise RuntimeError("attn-cuda reports that the CUDA extension is unavailable")
+            if not q.is_contiguous() or not k_for_attn.is_contiguous() or not v_for_attn.is_contiguous():
+                raise RuntimeError("SStream STAC Q/K/V cache tensors must be contiguous in [B, H, N, D] layout")
+            x_stac, _, attention_colsum = attn_cuda.flash_attn_bias_colsum_bhnd(
+                q,
+                k_for_attn,
+                v_for_attn,
+                softmax_scale=self.scale,
+                return_colsum=True,
+                subsample_ratio=float(leverage_attention_colsum_subsample_ratio),
+            )
+            x = x_stac.to(dtype=attention_output_dtype)
+        elif self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q,
                 k_for_attn,
@@ -1168,6 +1276,26 @@ class Attention(nn.Module):
             attn = self.attn_drop(attn)
 
             x = attn @ v_for_attn
+
+        if leverage_attention_utility:
+            if confidence_state is None or attention_colsum is None:
+                raise RuntimeError("Attention utility state or CUDA column-sum is missing")
+            if k_for_attn.shape[2] != confidence_state.frame_ids.shape[1]:
+                raise RuntimeError(
+                    "Attention utility state must align with the live KV cache, "
+                    f"got keys={k_for_attn.shape[2]} state={confidence_state.frame_ids.shape[1]}"
+                )
+            attention_score = scale_stac_colsum(
+                attention_colsum,
+                live_tokens=k_for_attn.shape[2],
+                query_tokens=q.shape[2],
+            )
+            confidence_state.update_attention_utility(
+                attention_score,
+                ema_decay=float(leverage_attention_ema_decay),
+                freeze_updates=int(leverage_attention_freeze_updates),
+            )
+            new_kv = pack_kv_cache(k, v, metadata, confidence_state)
 
         self._record_forward_profile("attention_kernel", attention_kernel_start, x, profile_forward)
         output_projection_start = self._profile_start(x, profile_forward)

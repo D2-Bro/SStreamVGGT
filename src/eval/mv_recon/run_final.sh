@@ -8,14 +8,14 @@ model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
 max_frames='full_seq'
 eviction_policy='svd_leverage'
-layer_budget_strategy='value_weighted_spectral_pr' #[spectral_pr, leverage_pr, uniform, leverage_entropy, depth_weighted_leverage_pr, value_weighted_leverage_pr]
+layer_budget_strategy='value_weighted_leverage_pr' #[spectral_pr, leverage_pr, uniform, leverage_entropy, depth_weighted_leverage_pr, value_weighted_leverage_pr]
 layer_budget_alpha=0.7
 layer_budget_min_tokens=0
 layer_budget_eps=0
 layer_budget_depth_mu=0.6
 layer_budget_depth_sigma=0.2
 layer_budget_depth_floor=0.1
-layer_budget_value_gamma=1.0
+layer_budget_value_gamma=0.7
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
 total_budget=200000
@@ -60,11 +60,29 @@ leverage_conf_gate_floor=0.0
 leverage_conf_gate_depth_alpha=1.0
 leverage_conf_gate_point_beta=0.0
 leverage_conf_gate_k=1.0
+leverage_conf_gate_transform="sigmoid"  # [ratio, sigmoid]
 leverage_conf_gate_special_mode=mean    #[one, mean]
 leverage_conf_gate_init=mean
 leverage_projected_key_cache="true"
 
 eval_frame_stride=1
+
+attention_utility_args=()
+attention_utility_suffix=""
+if [ "${LEVERAGE_ATTENTION_UTILITY:-false}" = true ]; then
+    attention_beta="${LEVERAGE_ATTENTION_BETA:-0.5}"
+    attention_ema_decay="${LEVERAGE_ATTENTION_EMA_DECAY:-0.9}"
+    attention_freeze_updates="${LEVERAGE_ATTENTION_FREEZE_UPDATES:-5}"
+    attention_colsum_subsample_ratio="${LEVERAGE_ATTENTION_COLSUM_SUBSAMPLE_RATIO:-1.0}"
+    attention_utility_args=(
+        --leverage_attention_utility
+        --leverage_attention_beta "$attention_beta"
+        --leverage_attention_ema_decay "$attention_ema_decay"
+        --leverage_attention_freeze_updates "$attention_freeze_updates"
+        --leverage_attention_colsum_subsample_ratio "$attention_colsum_subsample_ratio"
+    )
+    attention_utility_suffix="_EarlyAttnK${attention_freeze_updates}_g${attention_ema_decay}_b${attention_beta}_sub${attention_colsum_subsample_ratio%.*}_PreEvict_MeanNorm"
+fi
 
 budget_args=(--budget "$total_budget")
 budget_suffix="budget${total_budget}"
@@ -77,7 +95,7 @@ if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
 
-output_dir="${workdir}/eval_results/mv_recon/Final_${max_frames}_dim${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_confDepth_headNorm_evalStride${eval_frame_stride}_${layer_budget_strategy}_${budget_suffix}_seed${leverage_random_seed}_chunk1_cacheRLS8_sigmoid"
+output_dir="${workdir}/eval_results/mv_recon/Final_${max_frames}_dim${leverage_ridge_dim}_a${layer_budget_alpha}_TopK_confDepth_headNorm_evalStride${eval_frame_stride}_${layer_budget_strategy}_${budget_suffix}_seed${leverage_random_seed}_chunk1_cacheRLS8_${leverage_conf_gate_transform}${attention_utility_suffix}"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -138,11 +156,13 @@ accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/la
     --leverage_conf_gate_depth_alpha "$leverage_conf_gate_depth_alpha" \
     --leverage_conf_gate_point_beta "$leverage_conf_gate_point_beta" \
     --leverage_conf_gate_k "$leverage_conf_gate_k" \
+    --leverage_conf_gate_transform "$leverage_conf_gate_transform" \
     --leverage_conf_gate_special_mode "$leverage_conf_gate_special_mode" \
     --leverage_conf_gate_init "$leverage_conf_gate_init" \
     --stream_chunk_size 1 \
     --rls_refresh_interval 8 \
-    "${projected_key_cache_args[@]}" 
+    "${projected_key_cache_args[@]}" \
+    "${attention_utility_args[@]}"
 # Add --profile_eviction to the launch command above when measuring eviction latency.
 
 # --layer_budget_log_scores \

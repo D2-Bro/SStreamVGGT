@@ -296,6 +296,11 @@ class Aggregator(nn.Module):
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
         leverage_conf_gate_init: str = "mean",
+        leverage_attention_utility: bool = False,
+        leverage_attention_beta: float = 0.2,
+        leverage_attention_ema_decay: float = 0.9,
+        leverage_attention_freeze_updates: int = 5,
+        leverage_attention_colsum_subsample_ratio: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -570,6 +575,11 @@ class Aggregator(nn.Module):
                             leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
                             leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                             leverage_conf_gate_init=leverage_conf_gate_init,
+                            leverage_attention_utility=leverage_attention_utility,
+                            leverage_attention_beta=leverage_attention_beta,
+                            leverage_attention_ema_decay=leverage_attention_ema_decay,
+                            leverage_attention_freeze_updates=leverage_attention_freeze_updates,
+                            leverage_attention_colsum_subsample_ratio=leverage_attention_colsum_subsample_ratio,
                             layer_budget_strategy=layer_budget_strategy,
                             layer_budget_value_gamma=layer_budget_value_gamma,
                             layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -655,6 +665,11 @@ class Aggregator(nn.Module):
                             leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
                             leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                             leverage_conf_gate_init=leverage_conf_gate_init,
+                            leverage_attention_utility=leverage_attention_utility,
+                            leverage_attention_beta=leverage_attention_beta,
+                            leverage_attention_ema_decay=leverage_attention_ema_decay,
+                            leverage_attention_freeze_updates=leverage_attention_freeze_updates,
+                            leverage_attention_colsum_subsample_ratio=leverage_attention_colsum_subsample_ratio,
                             layer_budget_strategy=layer_budget_strategy,
                             layer_budget_value_gamma=layer_budget_value_gamma,
                             layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -746,6 +761,7 @@ class Aggregator(nn.Module):
                     self.last_layer_budget_value_norms,
                     layer_budget_value_gamma,
                     layer_budget_eps,
+                    alpha=layer_budget_alpha,
                 ).to(device=self.last_layer_budget_scores.device, dtype=self.last_layer_budget_scores.dtype)
             else:
                 self.last_layer_budget_scores = updated_layer_budget_scores.to(
@@ -770,6 +786,7 @@ class Aggregator(nn.Module):
                     self.last_layer_budget_value_norms,
                     layer_budget_value_gamma,
                     layer_budget_eps,
+                    alpha=layer_budget_alpha,
                 ).to(device=self.last_layer_budget_scores.device, dtype=self.last_layer_budget_scores.dtype)
             else:
                 self.last_layer_budget_scores = torch.tensor(
@@ -900,6 +917,11 @@ class Aggregator(nn.Module):
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
         leverage_conf_gate_init: str = "mean",
+        leverage_attention_utility: bool = False,
+        leverage_attention_beta: float = 0.2,
+        leverage_attention_ema_decay: float = 0.9,
+        leverage_attention_freeze_updates: int = 5,
+        leverage_attention_colsum_subsample_ratio: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -1008,6 +1030,11 @@ class Aggregator(nn.Module):
                         leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
                         leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                         leverage_conf_gate_init=leverage_conf_gate_init,
+                        leverage_attention_utility=leverage_attention_utility,
+                        leverage_attention_beta=leverage_attention_beta,
+                        leverage_attention_ema_decay=leverage_attention_ema_decay,
+                        leverage_attention_freeze_updates=leverage_attention_freeze_updates,
+                        leverage_attention_colsum_subsample_ratio=leverage_attention_colsum_subsample_ratio,
                         layer_budget_strategy=layer_budget_strategy,
                         layer_budget_value_gamma=layer_budget_value_gamma,
                         layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -1180,6 +1207,11 @@ class Aggregator(nn.Module):
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
         leverage_conf_gate_init: str = "mean",
+        leverage_attention_utility: bool = False,
+        leverage_attention_beta: float = 0.2,
+        leverage_attention_ema_decay: float = 0.9,
+        leverage_attention_freeze_updates: int = 5,
+        leverage_attention_colsum_subsample_ratio: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -1298,6 +1330,11 @@ class Aggregator(nn.Module):
                     leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
                     leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                     leverage_conf_gate_init=leverage_conf_gate_init,
+                    leverage_attention_utility=leverage_attention_utility,
+                    leverage_attention_beta=leverage_attention_beta,
+                    leverage_attention_ema_decay=leverage_attention_ema_decay,
+                    leverage_attention_freeze_updates=leverage_attention_freeze_updates,
+                    leverage_attention_colsum_subsample_ratio=leverage_attention_colsum_subsample_ratio,
                     layer_budget_strategy=layer_budget_strategy,
                     layer_budget_value_gamma=layer_budget_value_gamma,
                     layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -1669,6 +1706,7 @@ class Aggregator(nn.Module):
         value_norms,
         gamma: float,
         eps: float,
+        alpha: float = 1.0,
         capacities: Optional[Dict[int, int]] = None,
     ):
         base = torch.as_tensor(base_scores).detach().float()
@@ -1685,6 +1723,7 @@ class Aggregator(nn.Module):
             gamma=gamma,
             eps=eps,
             active_mask=active,
+            alpha=alpha,
         )
 
     @staticmethod
@@ -1847,9 +1886,10 @@ class Aggregator(nn.Module):
                     self.last_layer_budget_value_norms,
                     layer_budget_value_gamma,
                     layer_budget_eps,
+                    alpha=layer_budget_alpha,
                     capacities=capacities,
                 )
-                allocation_alpha = layer_budget_alpha
+                allocation_alpha = 1.0
                 allocation_min_tokens = layer_budget_min_tokens
             else:
                 active_layer_scores = self.last_layer_budget_scores

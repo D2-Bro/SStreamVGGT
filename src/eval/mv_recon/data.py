@@ -177,19 +177,6 @@ class SevenScenes(BaseStereoViewDataset):
                 rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
                     rgb_image, depthmap, intrinsics_, resolution, rng=rng, info=impath
                 )
-            else:
-                rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
-                    rgb_image, depthmap, intrinsics_, (512, 384), rng=rng, info=impath
-                )
-                W, H = rgb_image.size
-                cx = W // 2
-                cy = H // 2
-                l, t = cx - 112, cy - 112
-                r, b = cx + 112, cy + 112
-                crop_bbox = (l, t, r, b)
-                rgb_image, depthmap, intrinsics = cropping.crop_image_depthmap(
-                    rgb_image, depthmap, intrinsics, crop_bbox
-                )
 
             views.append(
                 dict(

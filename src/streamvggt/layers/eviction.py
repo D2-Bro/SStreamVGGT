@@ -178,7 +178,10 @@ def _combine_value_weighted_leverage_pr_scores(
     gamma: float,
     eps: float = 1e-12,
     active_mask: Optional[torch.Tensor] = None,
+    alpha: float = 1.0,
 ) -> torch.Tensor:
+    if not math.isfinite(float(alpha)) or float(alpha) < 0.0:
+        raise ValueError(f"value-weighted base alpha must be finite and >= 0, got {alpha}")
     base = torch.nan_to_num(torch.as_tensor(base_scores).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
     base = torch.clamp(base, min=0.0)
     values = torch.nan_to_num(torch.as_tensor(value_norms).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -195,7 +198,7 @@ def _combine_value_weighted_leverage_pr_scores(
         if torch.isfinite(value_mean) and float(value_mean.item()) > eps:
             prior_active = (active_values / value_mean.clamp_min(eps)).clamp_min(0.0).pow(float(gamma))
             prior[active] = torch.nan_to_num(prior_active, nan=1.0, posinf=1.0, neginf=1.0)
-    return base * prior
+    return base.pow(float(alpha)) * prior
 
 
 def _as_nonnegative_float(value, eps: float) -> float:
@@ -821,6 +824,9 @@ class EvictionManager:
         candidate_depth_confidence: Optional[torch.Tensor] = None,
         candidate_point_confidence: Optional[torch.Tensor] = None,
         candidate_conf_gate: Optional[torch.Tensor] = None,
+        candidate_attention_utility: Optional[torch.Tensor] = None,
+        candidate_attention_observed: Optional[torch.Tensor] = None,
+        attention_utility_beta: float = 0.0,
         candidate_evictable_mask: Optional[torch.Tensor] = None,
         need_leverage_basis: bool = False,
         capture_projected_norms: bool = False,
@@ -912,6 +918,13 @@ class EvictionManager:
                     current_frame_idx,
                     shared_across_heads=False,
                 )
+                policy_scores = self._blend_attention_utility(
+                    policy_scores,
+                    candidate_attention_utility,
+                    attention_utility_beta,
+                    shared_across_heads=False,
+                    attention_observed=candidate_attention_observed,
+                )
                 policy_scores = self._apply_recency_score_bonus(
                     policy_scores,
                     candidate_frame_ids,
@@ -969,6 +982,13 @@ class EvictionManager:
                     candidate_frame_ids,
                     current_frame_idx,
                     shared_across_heads=True,
+                )
+                policy_scores = self._blend_attention_utility(
+                    policy_scores,
+                    candidate_attention_utility,
+                    attention_utility_beta,
+                    shared_across_heads=True,
+                    attention_observed=candidate_attention_observed,
                 )
                 policy_scores = self._apply_recency_score_bonus(
                     policy_scores,
@@ -1685,14 +1705,81 @@ class EvictionManager:
             floor = float(self.leverage_conf_gate_floor)
             gate = floor + (1.0 - floor) * depth_conf * point_conf
 
-        if candidate_frame_ids is not None and current_frame_id is not None:
-            if shared_across_heads:
-                frame_ids = self._layer_candidate_frame_ids(candidate_frame_ids, B, H, N, scores.device)
-            else:
-                frame_ids = self._expand_candidate_frame_ids(candidate_frame_ids, B, H, N, scores.device)
-            gate = torch.where(frame_ids == int(current_frame_id), torch.ones_like(gate), gate)
-
         return scores * gate.to(device=scores.device, dtype=scores.dtype)
+
+    @staticmethod
+    def _blend_attention_utility(
+        scores: torch.Tensor,
+        attention_utility: Optional[torch.Tensor],
+        beta: float,
+        *,
+        shared_across_heads: bool,
+        attention_observed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        beta = float(beta)
+        if attention_utility is None or beta == 0.0:
+            return scores
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError(f"attention_utility_beta must be in [0, 1], got {beta}")
+
+        utility = attention_utility.to(device=scores.device, dtype=torch.float32)
+        if shared_across_heads:
+            if scores.ndim != 2 or tuple(utility.shape) != tuple(scores.shape):
+                raise ValueError(
+                    "Layer-shared attention utility and scores must both have shape [B, N], "
+                    f"got scores={tuple(scores.shape)} utility={tuple(utility.shape)}"
+                )
+        else:
+            if scores.ndim != 3:
+                raise ValueError(f"Expected head-wise scores [B, H, N], got {tuple(scores.shape)}")
+            if utility.ndim == 2:
+                utility = utility.unsqueeze(1).expand_as(scores)
+            elif tuple(utility.shape) != tuple(scores.shape):
+                raise ValueError(
+                    "Head-wise attention utility must have shape [B, N] or [B, H, N], "
+                    f"got {tuple(utility.shape)}"
+                )
+
+        if attention_observed is None:
+            observed = torch.ones_like(utility, dtype=torch.bool)
+        else:
+            observed = attention_observed.to(device=scores.device, dtype=torch.bool)
+            if shared_across_heads:
+                if tuple(observed.shape) != tuple(scores.shape):
+                    raise ValueError(
+                        "Layer-shared attention observation mask and scores must have the same shape, "
+                        f"got scores={tuple(scores.shape)} observed={tuple(observed.shape)}"
+                    )
+            elif observed.ndim == 2:
+                observed = observed.unsqueeze(1).expand_as(scores)
+            elif tuple(observed.shape) != tuple(scores.shape):
+                raise ValueError(
+                    "Head-wise attention observation mask must have shape [B, N] or [B, H, N], "
+                    f"got {tuple(observed.shape)}"
+                )
+
+        def mean_normalize(
+            value: torch.Tensor,
+            mask: Optional[torch.Tensor] = None,
+        ) -> torch.Tensor:
+            clean = torch.nan_to_num(value.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            clean = clean.clamp_min(0.0)
+            if mask is None:
+                value_mean = clean.mean(dim=-1, keepdim=True)
+            else:
+                mask_float = mask.to(dtype=clean.dtype)
+                value_sum = (clean * mask_float).sum(dim=-1, keepdim=True)
+                value_count = mask_float.sum(dim=-1, keepdim=True)
+                value_mean = value_sum / value_count.clamp_min(1.0)
+            normalized = clean / value_mean.clamp_min(1e-12)
+            return torch.where(value_mean > 1e-12, normalized, torch.zeros_like(normalized))
+
+        normalized_scores = mean_normalize(scores)
+        normalized_utility = mean_normalize(utility, observed)
+        blended = (1.0 - beta) * normalized_scores + beta * normalized_utility
+        result = torch.where(observed, blended, normalized_scores)
+        any_observed = observed.any(dim=-1, keepdim=True)
+        return torch.where(any_observed, result, scores.float())
 
     @staticmethod
     def _confidence_gate_tensor(
