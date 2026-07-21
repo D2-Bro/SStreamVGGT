@@ -183,6 +183,26 @@ bonn_configs = {
 }
 dataset_metadata.update(bonn_configs)
 
+bonn_config = {
+    f"bonn_stride2": {
+        "img_path": "/home/dongjae/data/bonn/rgbd_bonn_dataset",
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(
+            img_path, f"rgbd_bonn_{seq}", f"rgb_stride2"
+        ),
+        "gt_traj_func": lambda img_path, anno_path, seq : os.path.join(
+            img_path, f"rgbd_bonn_{seq}", f"groundtruth_stride2.txt"
+        ),
+        "traj_format": "tum",
+        "seq_list": ["balloon2", "crowd2", "crowd3", "person_tracking2", "synchronous"],
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": lambda args, img_path: process_bonn(args, img_path),
+    }
+}
+dataset_metadata.update(bonn_config)
+
 # Define processing functions for each dataset
 def process_kitti(args, img_path):
     for dir in tqdm(sorted(glob.glob(f"{img_path}/*"))):

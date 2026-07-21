@@ -1,4 +1,5 @@
 **/__pycache__
+attn-cuda/attn_cuda/_ext*.so
 cache_*/
 .vscode/
 pre_*/
@@ -7,3 +8,4 @@ eval_results/
 headwise_subspace_experiment/
 normalized_svd_cause_analysis/
 demo_tmp/
+wandb/

@@ -13,6 +13,7 @@ from streamvggt.utils.cache_analysis import (
     CacheAnalysisConfig,
     EvictionNNAnalysisConfig,
     LeverageScoreHistogramConfig,
+    ProjectedNormHistogramConfig,
     PreEvictionSnapshotConfig,
     TokenOverlayDumpConfig,
     dump_eviction_nn_analysis,
@@ -22,11 +23,37 @@ from streamvggt.utils.cache_analysis import (
 )
 from streamvggt.layers.eviction import EvictionManager
 from streamvggt.layers.confidence_state import KVConfidenceState, pack_kv_cache, parse_confidence_gate_init, unpack_kv_cache
-from streamvggt.layers.recent_merge import KVCacheMetadata, RecentMergeConfig
-from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig, SvdEvictionMerger
 
 XFORMERS_AVAILABLE = False
 
+
+def scale_stac_colsum(colsum: torch.Tensor, live_tokens: int, query_tokens: int) -> torch.Tensor:
+    """Convert STAC per-head column sums into a cache-length-stable token score."""
+    if colsum.ndim != 3:
+        raise ValueError(f"colsum must have shape [B, H, N], got {tuple(colsum.shape)}")
+    if int(live_tokens) != int(colsum.shape[-1]):
+        raise ValueError(f"live_tokens={live_tokens} does not match colsum keys={colsum.shape[-1]}")
+    if int(query_tokens) <= 0:
+        raise ValueError(f"query_tokens must be positive, got {query_tokens}")
+    return colsum.float().mean(dim=1) * (float(live_tokens) / float(query_tokens))
+
+
+def _materialize_kv_by_keep_indices(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    keep_indices: torch.Tensor,
+    *,
+    head_shared: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    B, H, _, D = k.shape
+    final_cache_size = keep_indices.shape[2]
+    if head_shared and B == 1:
+        indices = keep_indices[0, 0].to(device=k.device, dtype=torch.long)
+        return k.index_select(2, indices), v.index_select(2, indices)
+
+    expanded_indices = keep_indices.to(device=k.device, dtype=torch.long).unsqueeze(-1)
+    expanded_indices = expanded_indices.expand(B, H, final_cache_size, D)
+    return torch.gather(k, 2, expanded_indices), torch.gather(v, 2, expanded_indices)
 
 
 class Attention(nn.Module):
@@ -59,15 +86,85 @@ class Attention(nn.Module):
         self.rope = rope
         self.num_anchor_tokens = 0
         self._eviction_managers = {}
+        self._eviction_profile_totals = {}
+        self._eviction_profile_count = 0
+        self._attention_forward_profile_totals = {}
+        self._attention_forward_profile_count = 0
 
     def _reset_cache_state(self):
         self.num_anchor_tokens = 0
+        self._eviction_profile_totals = {}
+        self._eviction_profile_count = 0
+        self._attention_forward_profile_totals = {}
+        self._attention_forward_profile_count = 0
+        for eviction in self._eviction_managers.values():
+            reset = getattr(eviction, "reset_projected_key_cache", None)
+            if reset is not None:
+                reset()
+            reset_rls = getattr(eviction, "reset_rls_cache", None)
+            if reset_rls is not None:
+                reset_rls()
+            reset_profile = getattr(eviction, "reset_profile_stats", None)
+            if reset_profile is not None:
+                reset_profile()
+
+    def reset_profile_stats(self):
+        self._eviction_profile_totals = {}
+        self._eviction_profile_count = 0
+        self._attention_forward_profile_totals = {}
+        self._attention_forward_profile_count = 0
+        for eviction in self._eviction_managers.values():
+            reset_profile = getattr(eviction, "reset_profile_stats", None)
+            if reset_profile is not None:
+                reset_profile()
+
+    def _profile_sync(self, tensor: Optional[torch.Tensor]) -> None:
+        if tensor is not None and tensor.is_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize(tensor.device)
+
+    def _profile_start(self, tensor: Optional[torch.Tensor], enabled: bool) -> float:
+        if not enabled:
+            return 0.0
+        self._profile_sync(tensor)
+        return time.perf_counter()
+
+    def _record_forward_profile(self, name: str, start: float, tensor: Optional[torch.Tensor], enabled: bool) -> None:
+        if not enabled:
+            return
+        self._profile_sync(tensor)
+        self._attention_forward_profile_totals[name] = (
+            self._attention_forward_profile_totals.get(name, 0.0) + (time.perf_counter() - start)
+        )
+
+    def _record_eviction_profile(self, **metrics):
+        self._eviction_profile_count += 1
+        for name, value in metrics.items():
+            self._eviction_profile_totals[name] = self._eviction_profile_totals.get(name, 0.0) + float(value)
+
+    def get_eviction_profile_stats(self):
+        leverage_totals = {}
+        leverage_count = 0
+        for eviction in self._eviction_managers.values():
+            get_stats = getattr(eviction, "get_profile_stats", None)
+            if get_stats is None:
+                continue
+            stats = get_stats()
+            leverage_count += int(stats.get("count", 0))
+            for name, value in stats.get("totals", {}).items():
+                leverage_totals[name] = leverage_totals.get(name, 0.0) + float(value)
+        return {
+            "attention_count": self._eviction_profile_count,
+            "attention_totals": dict(self._eviction_profile_totals),
+            "attention_forward_count": self._attention_forward_profile_count,
+            "attention_forward_totals": dict(self._attention_forward_profile_totals),
+            "leverage_count": leverage_count,
+            "leverage_totals": leverage_totals,
+        }
 
     def eviction(
-        self, 
-        k: torch.Tensor, 
-        v: torch.Tensor, 
-        metadata: Optional[KVCacheMetadata],
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
         cache_budget: int,
         num_anchor_tokens: int,
         confidence_state: Optional[KVConfidenceState] = None,
@@ -75,63 +172,42 @@ class Attention(nn.Module):
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        projected_norm_histogram_config: Optional[ProjectedNormHistogramConfig] = None,
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
+        current_frame_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
+        profile_eviction: bool = False,
         eviction_debug: bool = False,
-        leverage_sketch_dim: Optional[int] = 16,
-        leverage_granularity: str = "head",
+        leverage_granularity: str = "layer",
         leverage_feature: str = "key",
         leverage_projection: str = "random",
-        leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
-        leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
-        leverage_ridge_lambda_mode: str = "relative",
+        leverage_normalize_before_projection: bool = False,
+        leverage_normalize_before_projection_headwise: bool = False,
+        leverage_projected_key_cache: bool = False,
+        leverage_approx_method: str = "right_sketch_ridge",
+        leverage_ridge_lambda: float = 0,
+        leverage_ridge_lambda_mode: str = "absolute",
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
-        leverage_diag: bool = False,
-        leverage_diag_interval: int = 0,
+        rls_refresh_interval: int = 1,
         leverage_random_seed: int = 0,
         leverage_eviction_selector: str = "topk",
-        leverage_similarity_granularity: str = "layer",
-        leverage_similarity_feature_projection: str = "raw",
-        leverage_similarity_leverage_gamma: float = 1.0,
-        leverage_eviction_risk_mode: str = "low_leverage",
-        leverage_high_outlier_z: float = 3.0,
-        leverage_dpp_candidate_multiplier: int = 2,
-        leverage_dpp_greedy_block_size: int = 32,
-        leverage_dpp_quality_beta: float = 1.0,
-        leverage_dpp_diversity_beta: float = 1.0,
-        leverage_dpp_feature_projection: str = "raw",
-        leverage_dpp_recency_bonus: bool = False,
-        leverage_dpp_recency_lambda: float = 0.2,
-        leverage_dpp_recency_window: int = 5,
-        leverage_dpp_recency_gate_power: float = 1.0,
-        leverage_dpp_recency_debug: bool = False,
         leverage_conf_gate: bool = False,
-        leverage_conf_gate_floor: float = 0.2,
+        leverage_conf_gate_floor: float = 0.0,
         leverage_conf_gate_depth_alpha: float = 1.0,
-        leverage_conf_gate_point_beta: float = 1.0,
-        layer_budget_strategy: str = "uniform",
-        layer_budget_value_gamma: float = 0.5,
-        layer_budget_value_norm_type: str = "rms",
-        layer_budget_norm_source: str = "value",
-        layer_budget_eps: float = 1e-12,
-        slots_per_direction: float = 4.0,
-        hybrid_beta: float = 0.5,
-        eviction_protect_recent_frames: int = 0,
-        eviction_protect_special_tokens: bool = False,
-        eviction_protect_special_token_interval: int = 1,
-        special_token_count: int = 0,
-        window_token_count: int = 0,
-        svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
-        history_anchor_frame_ids: Optional[Sequence[int]] = None,
-        history_anchor_patch_topk_per_frame: int = 0,
-        history_anchor_max_frames: int = 0,
+        leverage_conf_gate_point_beta: float = 0.0,
+        leverage_attention_beta: float = 0.3,
+        layer_budget_strategy: str = "value_weighted_leverage_pr",
+        layer_budget_value_gamma: float = 0.7,
+        layer_budget_value_norm_type: str = "mean",
+        layer_budget_norm_source: str = "key",
+        layer_budget_eps: float = 0,
     ):
         """
         Evicts tokens from the key-value cache based on key cosine similarity.
@@ -147,152 +223,57 @@ class Attention(nn.Module):
         """
         B, H, N, D = k.shape
         num_anchor_tokens = max(0, min(int(num_anchor_tokens), N))
-        eviction_protect_special_tokens = bool(eviction_protect_special_tokens)
-        eviction_protect_special_token_interval = int(eviction_protect_special_token_interval)
-        if eviction_protect_special_token_interval < 1:
-            raise ValueError(
-                "eviction_protect_special_token_interval must be >= 1, "
-                f"got {eviction_protect_special_token_interval}"
-            )
-        special_token_count = max(int(special_token_count), 0)
 
         if N <= cache_budget or N <= num_anchor_tokens:
             if confidence_state is not None:
-                return k, v, metadata, confidence_state, 0.0
-            return k, v, metadata, 0.0
+                return k, v, confidence_state, 0.0
+            return k, v, 0.0
 
-        use_fifo_override = (
-            eviction_policy_layers is not None
-            and layer_id is not None
-            and int(layer_id) not in eviction_policy_layers
-        )
-        if use_fifo_override:
-            keep_candidate_count = max(int(cache_budget) - num_anchor_tokens, 0)
-            keep_candidate_count = min(keep_candidate_count, N - num_anchor_tokens)
-            anchor_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
-            anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
-            if keep_candidate_count > 0:
-                candidate_start = N - keep_candidate_count
-                candidate_indices = torch.arange(candidate_start, N, device=k.device, dtype=torch.long)
-                candidate_indices = candidate_indices.view(1, 1, keep_candidate_count).expand(B, H, keep_candidate_count)
-                keep_indices = torch.cat([anchor_indices, candidate_indices], dim=2)
-            else:
-                keep_indices = anchor_indices
-            final_cache_size = keep_indices.shape[2]
-            expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, final_cache_size, D)
-            final_metadata = (
-                metadata.gather(keep_indices.detach().cpu())
-                if metadata is not None
-                else None
+        if cache_budget <= num_anchor_tokens:
+            keep_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
+            keep_indices = keep_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
+            final_k, final_v = _materialize_kv_by_keep_indices(
+                k, v, keep_indices, head_shared=True
             )
             final_confidence_state = (
                 confidence_state.gather(keep_indices)
                 if confidence_state is not None
                 else None
             )
-            if eviction_debug:
-                print(
-                    f"[Attention] fifo_eviction layer={layer_id} step={step_idx} "
-                    f"cache={N} budget={cache_budget} anchors={num_anchor_tokens} "
-                    f"keep_candidates={keep_candidate_count}"
-                )
-            final_k = torch.gather(k, 2, expanded_indices)
-            final_v = torch.gather(v, 2, expanded_indices)
-            if confidence_state is not None:
-                return final_k, final_v, final_metadata, final_confidence_state, 0.0
-            return final_k, final_v, final_metadata, 0.0
+            if final_confidence_state is not None:
+                return final_k, final_v, final_confidence_state, 0.0
+            return final_k, final_v, 0.0
 
-        window_token_count = 0 if window_token_count is None else int(window_token_count)
-        window_token_count = max(window_token_count, 0)
-        max_tail = max(N - num_anchor_tokens, 0)
-        tail_count = min(window_token_count, max(cache_budget - num_anchor_tokens, 0), max_tail)
-        tail_start = N - tail_count if tail_count > 0 else N
-
-        if cache_budget <= num_anchor_tokens and not eviction_protect_special_tokens:
-            keep_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
-            keep_indices = keep_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
-            expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, num_anchor_tokens, D)
-            final_metadata = metadata.gather(keep_indices.detach().cpu()) if metadata is not None else None
-            final_confidence_state = confidence_state.gather(keep_indices) if confidence_state is not None else None
-            final_k = torch.gather(k, 2, expanded_indices)
-            final_v = torch.gather(v, 2, expanded_indices)
-            if confidence_state is not None:
-                return final_k, final_v, final_metadata, final_confidence_state, 0.0
-            return final_k, final_v, final_metadata, 0.0
-
-        select_k = k[:, :, :tail_start, :]
-        select_v = v[:, :, :tail_start, :]
-        select_metadata = metadata
+        select_k = k
+        select_v = v
         select_confidence_state = confidence_state
-        if metadata is not None and tail_count > 0:
-            prefix_indices = torch.arange(tail_start, dtype=torch.long).view(1, 1, tail_start)
-            prefix_indices = prefix_indices.expand(B, H, tail_start)
-            select_metadata = metadata.gather(prefix_indices)
-        if confidence_state is not None and tail_count > 0:
-            prefix_indices = torch.arange(tail_start, device=k.device, dtype=torch.long).view(1, tail_start)
-            prefix_indices = prefix_indices.expand(B, tail_start)
-            select_confidence_state = confidence_state.gather(prefix_indices)
-        select_budget = cache_budget - tail_count
-        selection_budget = max(select_budget, num_anchor_tokens) if eviction_protect_special_tokens else select_budget
-        if eviction_protect_special_tokens and select_metadata is None:
-            raise ValueError("Special-token protection requires KV cache metadata")
-        head_specific_keep_sets = (
-            leverage_eviction_selector == "layer_head_fast_dpp"
-            or (
-                leverage_eviction_selector == "similarity_topk"
-                and leverage_similarity_granularity == "head"
-                and leverage_granularity == "layer"
-            )
-        )
-        if (
-            head_specific_keep_sets
-            and svd_eviction_merge_config is not None
-            and svd_eviction_merge_config.enabled
-            and svd_eviction_merge_config.mode != "head"
-        ):
-            raise ValueError(
-                "Head-specific eviction keep sets are only compatible with "
-                "svd_eviction_merge_mode='head'"
-            )
+        selection_budget = cache_budget
 
-        profile_eviction = bool(eviction_debug)
+        profile_eviction = bool(profile_eviction)
         if profile_eviction and k.is_cuda and torch.cuda.is_available():
             torch.cuda.synchronize(k.device)
         eviction_total_start = time.perf_counter() if profile_eviction else 0.0
 
         manager_key = (
             eviction_policy,
+            profile_eviction,
             eviction_debug,
-            leverage_sketch_dim,
             leverage_granularity,
             leverage_feature,
             leverage_projection,
-            leverage_head_mean_dim,
             leverage_normalize_rows,
-            leverage_approx_method,            leverage_ridge_lambda,
+            leverage_normalize_before_projection,
+            leverage_normalize_before_projection_headwise,
+            leverage_projected_key_cache,
+            leverage_approx_method,
+            leverage_ridge_lambda,
             leverage_ridge_lambda_mode,
             leverage_ridge_score_chunk_size,
             leverage_ridge_jitter,
             leverage_ridge_dim,
-            leverage_diag,
-            leverage_diag_interval,
+            rls_refresh_interval,
             leverage_random_seed,
             leverage_eviction_selector,
-            leverage_similarity_granularity,
-            leverage_similarity_feature_projection,
-            leverage_similarity_leverage_gamma,
-            leverage_eviction_risk_mode,
-            leverage_high_outlier_z,
-            leverage_dpp_candidate_multiplier,
-            leverage_dpp_greedy_block_size,
-            leverage_dpp_quality_beta,
-            leverage_dpp_diversity_beta,
-            leverage_dpp_feature_projection,
-            leverage_dpp_recency_bonus,
-            leverage_dpp_recency_lambda,
-            leverage_dpp_recency_window,
-            leverage_dpp_recency_gate_power,
-            leverage_dpp_recency_debug,
             leverage_conf_gate,
             leverage_conf_gate_floor,
             leverage_conf_gate_depth_alpha,
@@ -302,44 +283,29 @@ class Attention(nn.Module):
             layer_budget_value_norm_type,
             layer_budget_norm_source,
             layer_budget_eps,
-            slots_per_direction,
-            hybrid_beta,
         )
         eviction = self._eviction_managers.get(manager_key)
         if eviction is None:
             eviction = EvictionManager(
                 policy=eviction_policy,
+                profile=profile_eviction,
                 debug=eviction_debug,
-                leverage_sketch_dim=leverage_sketch_dim,
                 leverage_granularity=leverage_granularity,
                 leverage_feature=leverage_feature,
                 leverage_projection=leverage_projection,
-                leverage_head_mean_dim=leverage_head_mean_dim,
                 leverage_normalize_rows=leverage_normalize_rows,
-                leverage_approx_method=leverage_approx_method,                leverage_ridge_lambda=leverage_ridge_lambda,
+                leverage_normalize_before_projection=leverage_normalize_before_projection,
+                leverage_normalize_before_projection_headwise=leverage_normalize_before_projection_headwise,
+                leverage_projected_key_cache=leverage_projected_key_cache,
+                leverage_approx_method=leverage_approx_method,
+                leverage_ridge_lambda=leverage_ridge_lambda,
                 leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
                 leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                 leverage_ridge_jitter=leverage_ridge_jitter,
                 leverage_ridge_dim=leverage_ridge_dim,
-                leverage_diag=leverage_diag,
-                leverage_diag_interval=leverage_diag_interval,
+                rls_refresh_interval=rls_refresh_interval,
                 leverage_random_seed=leverage_random_seed,
                 leverage_eviction_selector=leverage_eviction_selector,
-                leverage_similarity_granularity=leverage_similarity_granularity,
-                leverage_similarity_feature_projection=leverage_similarity_feature_projection,
-                leverage_similarity_leverage_gamma=leverage_similarity_leverage_gamma,
-                leverage_eviction_risk_mode=leverage_eviction_risk_mode,
-                leverage_high_outlier_z=leverage_high_outlier_z,
-                leverage_dpp_candidate_multiplier=leverage_dpp_candidate_multiplier,
-                leverage_dpp_greedy_block_size=leverage_dpp_greedy_block_size,
-                leverage_dpp_quality_beta=leverage_dpp_quality_beta,
-                leverage_dpp_diversity_beta=leverage_dpp_diversity_beta,
-                leverage_dpp_feature_projection=leverage_dpp_feature_projection,
-                leverage_dpp_recency_bonus=leverage_dpp_recency_bonus,
-                leverage_dpp_recency_lambda=leverage_dpp_recency_lambda,
-                leverage_dpp_recency_window=leverage_dpp_recency_window,
-                leverage_dpp_recency_gate_power=leverage_dpp_recency_gate_power,
-                leverage_dpp_recency_debug=leverage_dpp_recency_debug,
                 leverage_conf_gate=leverage_conf_gate,
                 leverage_conf_gate_floor=leverage_conf_gate_floor,
                 leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
@@ -349,62 +315,33 @@ class Attention(nn.Module):
                 layer_budget_value_norm_type=layer_budget_value_norm_type,
                 layer_budget_norm_source=layer_budget_norm_source,
                 layer_budget_eps=layer_budget_eps,
-                slots_per_direction=slots_per_direction,
-                hybrid_beta=hybrid_beta,
             )
             self._eviction_managers[manager_key] = eviction
-        candidate_evictable_mask = None
-        if eviction_protect_special_tokens and select_metadata is not None:
-            candidate_token_indices = select_metadata.token_indices[:, :, num_anchor_tokens:]
-            candidate_frame_ids = select_metadata.frame_ids[:, :, num_anchor_tokens:]
-            candidate_evictable_mask = (
-                (candidate_token_indices >= special_token_count)
-                | (
-                    (candidate_frame_ids >= 0)
-                    & candidate_frame_ids.remainder(eviction_protect_special_token_interval).ne(0)
-                )
-            )
-            if (
-                eviction_policy in ("svd_leverage", "dpp")
-                and leverage_granularity == "layer"
-                and leverage_eviction_selector != "layer_head_fast_dpp"
-            ):
-                candidate_evictable_mask = candidate_evictable_mask.all(dim=1)
-            candidate_evictable_mask = candidate_evictable_mask.to(device=select_k.device)
         selection_start = time.perf_counter() if profile_eviction else 0.0
         candidate_frame_ids = (
-            select_metadata.frame_ids[:, :, num_anchor_tokens:]
-            if select_metadata is not None
-            else (
-                select_confidence_state.frame_ids[:, num_anchor_tokens:]
-                if select_confidence_state is not None
-                else None
-            )
-        )
-        candidate_token_indices = (
-            select_metadata.token_indices[:, :, num_anchor_tokens:]
-            if select_metadata is not None
-            else (
-                select_confidence_state.token_indices[:, num_anchor_tokens:]
-                if select_confidence_state is not None
-                else None
-            )
+            select_confidence_state.frame_ids[:, num_anchor_tokens:]
+            if select_confidence_state is not None
+            else None
         )
         candidate_conf_gate = (
             select_confidence_state.confidence_gate[:, num_anchor_tokens:]
             if select_confidence_state is not None
             else None
         )
-        candidate_depth_confidence = (
-            select_metadata.accumulated_depth_confidence[:, :, num_anchor_tokens:]
-            if select_confidence_state is None and select_metadata is not None
+        candidate_attention_utility = (
+            select_confidence_state.attention_utility()[:, num_anchor_tokens:]
+            if select_confidence_state is not None and select_confidence_state.has_attention_utility
             else None
         )
-        candidate_point_confidence = (
-            select_metadata.accumulated_point_confidence[:, :, num_anchor_tokens:]
-            if select_confidence_state is None and select_metadata is not None
+        candidate_attention_observed = (
+            select_confidence_state.attention_count[:, num_anchor_tokens:].gt(0)
+            if select_confidence_state is not None
+            and select_confidence_state.has_attention_utility
+            and select_confidence_state.attention_count is not None
             else None
         )
+        candidate_depth_confidence = None
+        candidate_point_confidence = None
         eviction_result = eviction.select(
             select_k,
             selection_budget,
@@ -413,24 +350,19 @@ class Attention(nn.Module):
             need_summary=cache_analysis_config is not None or eviction_debug,
             layer_id=layer_id,
             step_idx=step_idx,
-            current_frame_idx=step_idx,
-            protect_recent_frames=eviction_protect_recent_frames,
+            current_frame_idx=current_frame_idx if current_frame_idx is not None else step_idx,
             candidate_frame_ids=candidate_frame_ids,
-            candidate_token_indices=candidate_token_indices,
             candidate_depth_confidence=candidate_depth_confidence,
             candidate_point_confidence=candidate_point_confidence,
             candidate_conf_gate=candidate_conf_gate,
-            candidate_evictable_mask=candidate_evictable_mask,
-            history_anchor_frame_ids=history_anchor_frame_ids,
-            history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
-            history_anchor_max_frames=history_anchor_max_frames,
-            special_token_count=special_token_count,
+            candidate_attention_utility=candidate_attention_utility,
+            candidate_attention_observed=candidate_attention_observed,
+            attention_utility_beta=leverage_attention_beta,
             need_leverage_basis=(
-                (svd_eviction_merge_config is not None
-                and svd_eviction_merge_config.enabled
-                and eviction_policy == "svd_leverage")
-                or (eviction_nn_analysis_config is not None and eviction_nn_analysis_config.wants_svd_coord())
+                eviction_nn_analysis_config is not None
+                and eviction_nn_analysis_config.wants_svd_coord()
             ),
+            capture_projected_norms=projected_norm_histogram_config is not None,
         )
         if profile_eviction and k.is_cuda and torch.cuda.is_available():
             torch.cuda.synchronize(k.device)
@@ -452,6 +384,19 @@ class Attention(nn.Module):
             )
 
         if (
+            projected_norm_histogram_config is not None
+            and layer_id is not None
+            and step_idx is not None
+            and eviction_policy == "svd_leverage"
+            and eviction._last_projected_pre_norms is not None
+        ):
+            projected_norm_histogram_config.record(
+                eviction._last_projected_pre_norms,
+                layer_id=layer_id,
+                step_idx=step_idx,
+            )
+
+        if (
             token_overlay_dump_config is not None
             and layer_id is not None
             and step_idx is not None
@@ -461,17 +406,15 @@ class Attention(nn.Module):
                 token_overlay_dump_config,
                 kept_candidate_indices=top_indices,
                 policy_scores=eviction_result.policy_scores,
-                metadata=select_metadata,
+                metadata=None,
                 layer_id=layer_id,
                 step_idx=step_idx,
-                cache_budget=select_budget,
+                cache_budget=cache_budget,
                 num_anchor_tokens=num_anchor_tokens,
                 tokens_per_frame=tokens_per_frame,
                 eviction_policy=eviction_policy,
                 leverage_granularity=leverage_granularity,
-                selection_granularity=(
-                    "head" if head_specific_keep_sets else leverage_granularity
-                ),
+                selection_granularity=leverage_granularity,
             )
 
         if eviction_nn_analysis_config is not None and layer_id is not None and step_idx is not None:
@@ -482,26 +425,16 @@ class Attention(nn.Module):
                 kept_candidate_indices=top_indices,
                 policy_scores=eviction_result.policy_scores,
                 leverage_basis=eviction_result.leverage_basis,
-                metadata=select_metadata,
+                metadata=None,
                 layer_id=layer_id,
                 step_idx=step_idx,
-                cache_budget=select_budget,
+                cache_budget=cache_budget,
                 num_anchor_tokens=num_anchor_tokens,
                 eviction_policy=eviction_policy,
                 leverage_granularity=leverage_granularity,
                 leverage_feature=leverage_feature,
-                selection_granularity=(
-                    "head" if head_specific_keep_sets else leverage_granularity
-                ),
+                selection_granularity=leverage_granularity,
             )
-
-        if (
-            svd_eviction_merge_config is not None
-            and svd_eviction_merge_config.enabled
-            and eviction_policy == "svd_leverage"
-        ):
-            merger = SvdEvictionMerger(svd_eviction_merge_config, num_anchor_tokens=num_anchor_tokens)
-            merger.merge(select_k, select_v, select_metadata, eviction_result, layer_id=layer_id, step_idx=step_idx)
 
         if cache_analysis_config is not None and layer_id is not None and step_idx is not None:
             dump_eviction_snapshot(
@@ -511,73 +444,69 @@ class Attention(nn.Module):
                 kept_candidate_indices=top_indices,
                 layer_id=layer_id,
                 step_idx=step_idx,
-                cache_budget=select_budget,
+                cache_budget=cache_budget,
                 num_anchor_tokens=num_anchor_tokens,
                 tokens_per_frame=tokens_per_frame,
                 eviction_policy=eviction_policy,
-                leverage_sketch_dim=leverage_sketch_dim,
+                leverage_sketch_dim=leverage_ridge_dim,
             )
-        
+
         index_update_start = time.perf_counter() if profile_eviction else 0.0
         anchor_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
         anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
-        keep_parts = [anchor_indices, top_indices + int(num_anchor_tokens)]
-        if tail_count > 0:
-            tail_indices = torch.arange(tail_start, N, device=k.device, dtype=torch.long)
-            tail_indices = tail_indices.view(1, 1, tail_count).expand(B, H, tail_count)
-            keep_parts.append(tail_indices)
-        keep_indices = torch.cat(keep_parts, dim=2)
-        final_cache_size = keep_indices.shape[2]
-        expanded_indices = keep_indices.unsqueeze(-1).expand(B, H, final_cache_size, D)
-        final_k = torch.gather(k, 2, expanded_indices)
-        final_v = torch.gather(v, 2, expanded_indices)
-        final_metadata = (
-            metadata.gather(keep_indices.detach().cpu())
-            if metadata is not None
-            else None
+        keep_indices = torch.cat([anchor_indices, top_indices + num_anchor_tokens,], dim=2,)
+        final_k, final_v = _materialize_kv_by_keep_indices(
+            k, v, keep_indices, head_shared=True
         )
         final_confidence_state = (
             confidence_state.gather(keep_indices)
             if confidence_state is not None
             else None
         )
+        eviction.update_projected_key_cache_after_eviction(
+            top_indices,
+            tail_k= None,
+        )
         if profile_eviction:
             if final_k.is_cuda and torch.cuda.is_available():
                 torch.cuda.synchronize(final_k.device)
             index_update_time = time.perf_counter() - index_update_start
             total_time = time.perf_counter() - eviction_total_start
-            print(
-                f"[Attention] eviction_profile layer={layer_id} step={step_idx} "
-                f"manager_select={selection_time * 1000.0:.3f}ms "
-                f"metadata_index_update={index_update_time * 1000.0:.3f}ms "
-                f"total_eviction={total_time * 1000.0:.3f}ms"
+            self._record_eviction_profile(
+                manager_select=selection_time,
+                cache_index_update=index_update_time,
+                total_eviction=total_time,
             )
 
         if layer_budget_score is not None:
-            if confidence_state is not None:
-                return final_k, final_v, final_metadata, final_confidence_state, (avg_scores, layer_budget_score)
-            return final_k, final_v, final_metadata, (avg_scores, layer_budget_score)
-        if confidence_state is not None:
-            return final_k, final_v, final_metadata, final_confidence_state, avg_scores
-        return final_k, final_v, final_metadata, avg_scores
+            score_payload = (avg_scores, layer_budget_score)
+        else:
+            score_payload = avg_scores
+        if final_confidence_state is not None:
+            return final_k, final_v, final_confidence_state, score_payload
+        return final_k, final_v, score_payload
 
-    def forward(self, 
-        x: torch.Tensor, 
-        pos=None, 
-        attn_mask=None, 
-        past_key_values=None, 
+    def forward(self,
+        x: torch.Tensor,
+        pos=None,
+        attn_mask=None,
+        past_key_values=None,
         use_cache=False,
         cache_budget = None,
         cache_analysis_config: Optional[CacheAnalysisConfig] = None,
         pre_eviction_snapshot_config: Optional[PreEvictionSnapshotConfig] = None,
         eviction_nn_analysis_config: Optional[EvictionNNAnalysisConfig] = None,
         leverage_score_histogram_config: Optional[LeverageScoreHistogramConfig] = None,
+        projected_norm_histogram_config: Optional[ProjectedNormHistogramConfig] = None,
         token_overlay_dump_config: Optional[TokenOverlayDumpConfig] = None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
+        current_frame_ids: Optional[Sequence[int]] = None,
+        current_frame_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
+        profile_eviction: bool = False,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -585,11 +514,15 @@ class Attention(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_normalize_before_projection: bool = False,
+        leverage_normalize_before_projection_headwise: bool = False,
+        leverage_projected_key_cache: bool = False,
         leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        rls_refresh_interval: int = 1,
         leverage_diag: bool = False,
         leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
@@ -614,6 +547,11 @@ class Attention(nn.Module):
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
         leverage_conf_gate_init: str = "mean",
+        leverage_attention_utility: bool = False,
+        leverage_attention_beta: float = 0.2,
+        leverage_attention_ema_decay: float = 0.9,
+        leverage_attention_freeze_updates: int = 5,
+        leverage_attention_colsum_subsample_ratio: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -621,72 +559,119 @@ class Attention(nn.Module):
         layer_budget_eps: float = 1e-12,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
-        eviction_protect_recent_frames: int = 0,
-        eviction_protect_special_tokens: bool = False,
-        eviction_protect_special_token_interval: int = 1,
-        special_token_count: int = 0,
         anchor_token_count: Optional[int] = None,
-        window_token_count: int = 0,
-        recent_merge_config: Optional[RecentMergeConfig] = None,
-        svd_eviction_merge_config: Optional[SvdEvictionMergeConfig] = None,
-        voxel_covis_frame_ids: Optional[Sequence[int]] = None,
-        voxel_covis_enabled: bool = False,
-        voxel_covis_fallback_recent: int = 0,
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
-        global_cache_history_anchor_special_tokens_only: bool = False,
-        history_anchor_frame_ids: Optional[Sequence[int]] = None,
-        history_anchor_patch_topk_per_frame: int = 0,
-        history_anchor_max_frames: int = 0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
+        leverage_attention_utility = bool(leverage_attention_utility)
+        if leverage_attention_utility:
+            if self.training:
+                raise RuntimeError("Frozen early-attention utility is inference-only")
+            if not use_cache:
+                raise ValueError("Frozen early-attention utility requires use_cache=True")
+            if self.head_dim != 64:
+                raise ValueError(f"STAC CUDA attention requires head_dim=64, got {self.head_dim}")
+            if attn_mask is not None:
+                raise ValueError("Frozen early-attention utility does not support attention masks")
+            if eviction_policy != "svd_leverage" or leverage_granularity != "layer":
+                raise ValueError("Frozen early-attention utility requires layer-wise svd_leverage eviction")
+            if leverage_eviction_selector != "topk":
+                raise ValueError("Frozen early-attention utility initially supports only layer-shared Top-K")
+            if not cache_write_current_frame or not cache_evict_current_frame:
+                raise ValueError("Frozen early-attention utility requires cache write and eviction on every current frame")
+            if not 0.0 <= float(leverage_attention_beta) <= 1.0:
+                raise ValueError("leverage_attention_beta must be in [0, 1]")
+            if not 0.0 <= float(leverage_attention_ema_decay) <= 1.0:
+                raise ValueError("leverage_attention_ema_decay must be in [0, 1]")
+            if not 1 <= int(leverage_attention_freeze_updates) <= 255:
+                raise ValueError("leverage_attention_freeze_updates must be in [1, 255]")
+            if not 0.0 < float(leverage_attention_colsum_subsample_ratio) <= 1.0:
+                raise ValueError("leverage_attention_colsum_subsample_ratio must be in (0, 1]")
+        profile_forward = bool(profile_eviction)
+        forward_start = self._profile_start(x, profile_forward)
+        qkv_start = self._profile_start(x, profile_forward)
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
+        self._record_forward_profile("qkv_projection", qkv_start, q, profile_forward)
         scores = None
+        norm_rope_start = self._profile_start(q, profile_forward)
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.rope is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
+        attention_output_dtype = q.dtype
+        if leverage_attention_utility:
+            attention_compute_dtype = torch.bfloat16 if q.dtype == torch.bfloat16 else torch.float16
+            # Materialize only the current-frame Q/K/V in SStream's native BHND
+            # layout. The persistent K/V cache then stays BHND-contiguous, so
+            # the full live cache never needs a transpose-contiguous copy.
+            q = q.to(dtype=attention_compute_dtype).contiguous()
+            k = k.to(dtype=attention_compute_dtype).contiguous()
+            v = v.to(dtype=attention_compute_dtype).contiguous()
+        self._record_forward_profile("qk_norm_rope", norm_rope_start, q, profile_forward)
 
         if use_cache and self.num_anchor_tokens == 0:
-            self.num_anchor_tokens = k.shape[2] 
+            self.num_anchor_tokens = k.shape[2]
 
         if use_cache:
+            cache_concat_start = self._profile_start(k, profile_forward)
             cache_write_current_frame = bool(cache_write_current_frame)
             cache_evict_current_frame = cache_write_current_frame and bool(cache_evict_current_frame)
             original_past_key_values = past_key_values
             current_k = k
             current_v = v
-            current_special_kv = None
-            metadata = None
             confidence_state = None
-            confidence_needed = bool(leverage_conf_gate)
-            metadata_needed = (
-                (recent_merge_config is not None and recent_merge_config.enabled)
-                or (svd_eviction_merge_config is not None and svd_eviction_merge_config.enabled and eviction_policy == "svd_leverage")
-                or eviction_nn_analysis_config is not None
-                or token_overlay_dump_config is not None
-                or int(eviction_protect_recent_frames) > 0
-                or bool(leverage_dpp_recency_bonus)
-                or bool(eviction_protect_special_tokens)
-                or bool(voxel_covis_enabled)
-                or bool(global_cache_history_anchor_special_tokens_only)
-                or int(history_anchor_patch_topk_per_frame) > 0
+            confidence_needed = bool(leverage_conf_gate) or leverage_attention_utility
+            if current_frame_ids is None:
+                resolved_current_frame_ids = [step_idx if step_idx is not None else 0]
+            else:
+                resolved_current_frame_ids = [int(frame_id) for frame_id in current_frame_ids]
+            if len(resolved_current_frame_ids) <= 0:
+                resolved_current_frame_ids = [step_idx if step_idx is not None else 0]
+            if leverage_attention_utility and len(resolved_current_frame_ids) != 1:
+                raise ValueError(
+                    "Frozen early-attention utility initially supports stream_chunk_size=1 "
+                    f"(got {len(resolved_current_frame_ids)} frames)"
+                )
+            resolved_current_frame_idx = (
+                int(current_frame_idx)
+                if current_frame_idx is not None
+                else int(resolved_current_frame_ids[-1])
             )
-            if metadata_needed:
-                metadata = KVCacheMetadata.for_current_frame(
+
+            def _current_confidence(num_tokens: int, initial_gate_value=None) -> KVConfidenceState:
+                if (
+                    tokens_per_frame is not None
+                    and int(tokens_per_frame) > 0
+                    and int(tokens_per_frame) * len(resolved_current_frame_ids) == int(num_tokens)
+                ):
+                    return KVConfidenceState.for_frame_chunk(
+                        batch_size=B,
+                        num_heads=self.num_heads,
+                        tokens_per_frame=int(tokens_per_frame),
+                        frame_ids=resolved_current_frame_ids,
+                        device=current_k.device,
+                        initial_gate=initial_gate_value,
+                        initialize_attention=leverage_attention_utility,
+                    )
+                return KVConfidenceState.for_current_frame(
                     batch_size=B,
                     num_heads=self.num_heads,
-                    num_tokens=current_k.shape[2],
-                    frame_id=step_idx if step_idx is not None else 0,
+                    num_tokens=num_tokens,
+                    frame_id=resolved_current_frame_idx,
+                    device=current_k.device,
+                    initial_gate=initial_gate_value,
+                    initialize_attention=leverage_attention_utility,
                 )
+
             initial_confidence_gate = None
             if confidence_needed:
                 parsed_conf_gate_init = parse_confidence_gate_init(leverage_conf_gate_init)
                 if parsed_conf_gate_init == "mean":
                     if past_key_values is not None:
-                        _, _, _, past_confidence_for_init = unpack_kv_cache(past_key_values)
+                        _, _, past_confidence_for_init = unpack_kv_cache(past_key_values)
                         if past_confidence_for_init is not None:
                             initial_confidence_gate = past_confidence_for_init.mean_gate().to(
                                 device=current_k.device,
@@ -694,69 +679,20 @@ class Attention(nn.Module):
                             )
                 else:
                     initial_confidence_gate = parsed_conf_gate_init
-                confidence_state = KVConfidenceState.for_current_frame(
-                    batch_size=B,
-                    num_heads=self.num_heads,
-                    num_tokens=current_k.shape[2],
-                    frame_id=step_idx if step_idx is not None else 0,
-                    device=current_k.device,
-                    initial_gate=initial_confidence_gate,
-                )
+                confidence_state = _current_confidence(current_k.shape[2], initial_confidence_gate)
 
             write_k = current_k
             write_v = current_v
-            write_metadata = metadata
             write_confidence_state = confidence_state
-            skip_current_special_tokens = (
-                bool(global_cache_history_anchor_special_tokens_only)
-                and cache_write_current_frame
-                and int(step_idx if step_idx is not None else 0) != 0
-                and int(special_token_count) > 0
-            )
-            if skip_current_special_tokens:
-                current_special_count = min(int(special_token_count), current_k.shape[2])
-                if current_special_count > 0:
-                    sidecar_metadata = None
-                    sidecar_confidence_state = None
-                    sidecar_indices = torch.arange(current_special_count, device=current_k.device, dtype=torch.long).view(1, 1, -1)
-                    sidecar_indices = sidecar_indices.expand(B, self.num_heads, current_special_count)
-                    write_indices = torch.arange(
-                        current_special_count,
-                        current_k.shape[2],
-                        device=current_k.device,
-                        dtype=torch.long,
-                    ).view(1, 1, -1)
-                    write_indices = write_indices.expand(B, self.num_heads, -1)
-                    if metadata is not None:
-                        sidecar_metadata = metadata.gather(sidecar_indices.detach().cpu())
-                        write_metadata = metadata.gather(write_indices.detach().cpu())
-                    if confidence_state is not None:
-                        sidecar_confidence_state = confidence_state.gather(sidecar_indices[:, 0, :])
-                        write_confidence_state = confidence_state.gather(write_indices[:, 0, :])
-                    current_special_kv = pack_kv_cache(
-                        current_k[:, :, :current_special_count, :],
-                        current_v[:, :, :current_special_count, :],
-                        sidecar_metadata,
-                        sidecar_confidence_state,
-                    )
-                    write_k = current_k[:, :, current_special_count:, :]
-                    write_v = current_v[:, :, current_special_count:, :]
 
             if past_key_values is not None:
-                past_k, past_v, past_metadata, past_confidence_state = unpack_kv_cache(past_key_values)
+                past_k, past_v, past_confidence_state = unpack_kv_cache(past_key_values)
                 if cache_write_current_frame:
                     k = torch.cat([past_k, write_k], dim=2)
                     v = torch.cat([past_v, write_v], dim=2)
                 else:
                     k = past_k
                     v = past_v
-                if write_metadata is not None and past_metadata is None:
-                    past_metadata = KVCacheMetadata.for_current_frame(
-                        batch_size=B,
-                        num_heads=self.num_heads,
-                        num_tokens=past_k.shape[2],
-                        frame_id=-1,
-                    )
                 if write_confidence_state is not None and past_confidence_state is None:
                     past_confidence_state = KVConfidenceState.for_current_frame(
                         batch_size=B,
@@ -764,14 +700,15 @@ class Attention(nn.Module):
                         num_tokens=past_k.shape[2],
                         frame_id=-1,
                         device=past_k.device,
+                        initialize_attention=leverage_attention_utility,
                     )
-                if cache_write_current_frame and write_metadata is not None and past_metadata is not None:
-                    metadata = past_metadata.concat(write_metadata)
-                elif cache_write_current_frame and write_metadata is not None:
-                    metadata = None
-                else:
-                    metadata = past_metadata
-                if cache_write_current_frame and write_confidence_state is not None and past_confidence_state is not None:
+                if leverage_attention_utility and past_confidence_state is not None:
+                    past_confidence_state.ensure_attention_utility()
+                if (
+                    cache_write_current_frame
+                    and write_confidence_state is not None
+                    and past_confidence_state is not None
+                ):
                     confidence_state = past_confidence_state.concat(write_confidence_state)
                 elif cache_write_current_frame and write_confidence_state is not None:
                     confidence_state = None
@@ -780,9 +717,10 @@ class Attention(nn.Module):
             else:
                 k = write_k if cache_write_current_frame else current_k
                 v = write_v if cache_write_current_frame else current_v
-                metadata = write_metadata if cache_write_current_frame else metadata
-                confidence_state = write_confidence_state if cache_write_current_frame else confidence_state
-
+                confidence_state = (
+                    write_confidence_state if cache_write_current_frame else confidence_state
+                )
+            self._record_forward_profile("cache_concat_update", cache_concat_start, k, profile_forward)
             if (
                 cache_write_current_frame
                 and pre_eviction_snapshot_config is not None
@@ -818,65 +756,45 @@ class Attention(nn.Module):
                     "cache_analysis_config": cache_analysis_config,
                     "eviction_nn_analysis_config": eviction_nn_analysis_config,
                     "leverage_score_histogram_config": leverage_score_histogram_config,
+                    "projected_norm_histogram_config": projected_norm_histogram_config,
                     "token_overlay_dump_config": token_overlay_dump_config,
                     "layer_id": layer_id,
                     "step_idx": step_idx,
+                    "current_frame_idx": resolved_current_frame_idx,
                     "tokens_per_frame": tokens_per_frame,
                     "eviction_policy": eviction_policy,
                     "eviction_policy_layers": eviction_policy_layers,
+                    "profile_eviction": profile_eviction,
                     "eviction_debug": eviction_debug,
-                    "leverage_sketch_dim": leverage_sketch_dim,
                     "leverage_granularity": leverage_granularity,
                     "leverage_feature": leverage_feature,
                     "leverage_projection": leverage_projection,
-                    "leverage_head_mean_dim": leverage_head_mean_dim,
+                    "leverage_normalize_before_projection": leverage_normalize_before_projection,
+                    "leverage_normalize_before_projection_headwise": leverage_normalize_before_projection_headwise,
+                    "leverage_projected_key_cache": leverage_projected_key_cache,
                     "leverage_approx_method": leverage_approx_method,                    "leverage_ridge_lambda": leverage_ridge_lambda,
                     "leverage_ridge_lambda_mode": leverage_ridge_lambda_mode,
                     "leverage_ridge_score_chunk_size": leverage_ridge_score_chunk_size,
                     "leverage_ridge_jitter": leverage_ridge_jitter,
                     "leverage_ridge_dim": leverage_ridge_dim,
-                    "leverage_diag": leverage_diag,
-                    "leverage_diag_interval": leverage_diag_interval,
+                    "rls_refresh_interval": rls_refresh_interval,
                     "leverage_random_seed": leverage_random_seed,
                     "leverage_eviction_selector": leverage_eviction_selector,
-                    "leverage_similarity_granularity": leverage_similarity_granularity,
-                    "leverage_similarity_feature_projection": leverage_similarity_feature_projection,
-                    "leverage_similarity_leverage_gamma": leverage_similarity_leverage_gamma,
-                    "leverage_eviction_risk_mode": leverage_eviction_risk_mode,
-                    "leverage_high_outlier_z": leverage_high_outlier_z,
-                    "leverage_dpp_candidate_multiplier": leverage_dpp_candidate_multiplier,
-                    "leverage_dpp_greedy_block_size": leverage_dpp_greedy_block_size,
-                    "leverage_dpp_quality_beta": leverage_dpp_quality_beta,
-                    "leverage_dpp_diversity_beta": leverage_dpp_diversity_beta,
-                    "leverage_dpp_feature_projection": leverage_dpp_feature_projection,
-                    "leverage_dpp_recency_bonus": leverage_dpp_recency_bonus,
-                    "leverage_dpp_recency_lambda": leverage_dpp_recency_lambda,
-                    "leverage_dpp_recency_window": leverage_dpp_recency_window,
-                    "leverage_dpp_recency_gate_power": leverage_dpp_recency_gate_power,
-                    "leverage_dpp_recency_debug": leverage_dpp_recency_debug,
                     "leverage_conf_gate": leverage_conf_gate,
                     "leverage_conf_gate_floor": leverage_conf_gate_floor,
                     "leverage_conf_gate_depth_alpha": leverage_conf_gate_depth_alpha,
                     "leverage_conf_gate_point_beta": leverage_conf_gate_point_beta,
+                    "leverage_attention_beta": leverage_attention_beta,
                     "layer_budget_strategy": layer_budget_strategy,
                     "layer_budget_value_gamma": layer_budget_value_gamma,
                     "layer_budget_value_norm_type": layer_budget_value_norm_type,
                     "layer_budget_norm_source": layer_budget_norm_source,
                     "layer_budget_eps": layer_budget_eps,
-                    "slots_per_direction": slots_per_direction,
-                    "hybrid_beta": hybrid_beta,
-                    "eviction_protect_recent_frames": eviction_protect_recent_frames,
-                    "eviction_protect_special_tokens": eviction_protect_special_tokens,
-                    "eviction_protect_special_token_interval": eviction_protect_special_token_interval,
-                    "special_token_count": special_token_count,
-                    "window_token_count": window_token_count,
-                    "svd_eviction_merge_config": svd_eviction_merge_config,
-                    "history_anchor_frame_ids": history_anchor_frame_ids,
-                    "history_anchor_patch_topk_per_frame": history_anchor_patch_topk_per_frame,
-                    "history_anchor_max_frames": history_anchor_max_frames,
                 }
                 if leverage_normalize_rows:
                     eviction_kwargs["leverage_normalize_rows"] = leverage_normalize_rows
+                eviction_kwargs["leverage_normalize_before_projection"] = leverage_normalize_before_projection
+                eviction_kwargs["leverage_normalize_before_projection_headwise"] = leverage_normalize_before_projection_headwise
                 effective_anchor_count = (
                     int(anchor_token_count)
                     if anchor_token_count is not None
@@ -885,81 +803,74 @@ class Attention(nn.Module):
                 eviction_result = self.eviction(
                     k,
                     v,
-                    metadata,
                     cache_budget,
                     effective_anchor_count,
                     confidence_state=confidence_state,
                     **eviction_kwargs,
                 )
                 if confidence_state is not None:
-                    k, v, metadata, confidence_state, scores = eviction_result
+                    k, v, confidence_state, scores = eviction_result
                 else:
-                    k, v, metadata, scores = eviction_result
+                    k, v, scores = eviction_result
 
-            if cache_write_current_frame:
-                new_kv = pack_kv_cache(k, v, metadata, confidence_state)
+            cache_read_start = self._profile_start(k, profile_forward)
+            if cache_write_current_frame and not leverage_attention_utility:
+                new_kv = pack_kv_cache(k, v, confidence_state)
+            elif leverage_attention_utility:
+                new_kv = None
             else:
                 new_kv = original_past_key_values
 
             read_k = k
             read_v = v
-            read_metadata = metadata
             read_confidence_state = confidence_state
             if not cache_write_current_frame:
                 if past_key_values is not None:
                     read_k = torch.cat([k, current_k], dim=2)
                     read_v = torch.cat([v, current_v], dim=2)
-                    if metadata is not None:
-                        current_read_metadata = KVCacheMetadata.for_current_frame(
-                            batch_size=B,
-                            num_heads=self.num_heads,
-                            num_tokens=current_k.shape[2],
-                            frame_id=step_idx if step_idx is not None else 0,
-                        )
-                        read_metadata = metadata.concat(current_read_metadata)
                     if confidence_state is not None:
-                        current_read_confidence = KVConfidenceState.for_current_frame(
-                            batch_size=B,
-                            num_heads=self.num_heads,
-                            num_tokens=current_k.shape[2],
-                            frame_id=step_idx if step_idx is not None else 0,
-                            device=current_k.device,
-                        )
+                        current_read_confidence = _current_confidence(current_k.shape[2])
                         read_confidence_state = confidence_state.concat(current_read_confidence)
                 else:
                     read_k = current_k
                     read_v = current_v
-            elif current_special_kv is not None:
-                sidecar_k, sidecar_v, sidecar_metadata, sidecar_confidence_state = unpack_kv_cache(current_special_kv)
-                read_k = torch.cat([k, sidecar_k], dim=2)
-                read_v = torch.cat([v, sidecar_v], dim=2)
-                if metadata is not None and sidecar_metadata is not None:
-                    read_metadata = metadata.concat(sidecar_metadata)
-                if confidence_state is not None and sidecar_confidence_state is not None:
-                    read_confidence_state = confidence_state.concat(sidecar_confidence_state)
 
-            if voxel_covis_enabled and read_metadata is not None and voxel_covis_frame_ids is not None:
-                k_read, v_read, covis_attn_mask = _filter_kv_for_voxel_covis(
-                    read_k,
-                    read_v,
-                    read_metadata,
-                    selected_frame_ids=voxel_covis_frame_ids,
-                    current_frame_id=step_idx if step_idx is not None else 0,
-                    query_len=N,
-                    fallback_recent=voxel_covis_fallback_recent,
-                )
-                k_for_attn = k_read
-                v_for_attn = v_read
-                attn_mask = _merge_attn_masks(attn_mask, covis_attn_mask, q.dtype)
-            else:
-                k_for_attn = read_k
-                v_for_attn = read_v
+            self._record_forward_profile("cache_read_prepare", cache_read_start, read_k, profile_forward)
+            k_for_attn = read_k
+            v_for_attn = read_v
         else:
-            current_special_kv = None
             k_for_attn = k
             v_for_attn = v
 
-        if self.fused_attn:
+        attention_kernel_start = self._profile_start(q, profile_forward)
+        attention_colsum = None
+        if leverage_attention_utility:
+            if not q.is_cuda or q.dtype not in (torch.float16, torch.bfloat16):
+                raise RuntimeError(
+                    "STAC CUDA attention requires CUDA FP16/BF16 Q/K/V, "
+                    f"got device={q.device} dtype={q.dtype}"
+                )
+            try:
+                import attn_cuda
+            except (ImportError, OSError) as exc:
+                raise RuntimeError(
+                    "Frozen early-attention utility requires the local attn-cuda extension. "
+                    "Build it with 'pip install -e ./attn-cuda --no-build-isolation'."
+                ) from exc
+            if not attn_cuda.is_available():
+                raise RuntimeError("attn-cuda reports that the CUDA extension is unavailable")
+            if not q.is_contiguous() or not k_for_attn.is_contiguous() or not v_for_attn.is_contiguous():
+                raise RuntimeError("SStream STAC Q/K/V cache tensors must be contiguous in [B, H, N, D] layout")
+            x_stac, _, attention_colsum = attn_cuda.flash_attn_bias_colsum_bhnd(
+                q,
+                k_for_attn,
+                v_for_attn,
+                softmax_scale=self.scale,
+                return_colsum=True,
+                subsample_ratio=float(leverage_attention_colsum_subsample_ratio),
+            )
+            x = x_stac.to(dtype=attention_output_dtype)
+        elif self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q,
                 k_for_attn,
@@ -983,101 +894,37 @@ class Attention(nn.Module):
 
             x = attn @ v_for_attn
 
+        if leverage_attention_utility:
+            if confidence_state is None or attention_colsum is None:
+                raise RuntimeError("Attention utility state or CUDA column-sum is missing")
+            if k_for_attn.shape[2] != confidence_state.frame_ids.shape[1]:
+                raise RuntimeError(
+                    "Attention utility state must align with the live KV cache, "
+                    f"got keys={k_for_attn.shape[2]} state={confidence_state.frame_ids.shape[1]}"
+                )
+            attention_score = scale_stac_colsum(
+                attention_colsum,
+                live_tokens=k_for_attn.shape[2],
+                query_tokens=q.shape[2],
+            )
+            confidence_state.update_attention_utility(
+                attention_score,
+                ema_decay=float(leverage_attention_ema_decay),
+                freeze_updates=int(leverage_attention_freeze_updates),
+            )
+            new_kv = pack_kv_cache(k, v, confidence_state)
+
+        self._record_forward_profile("attention_kernel", attention_kernel_start, x, profile_forward)
+        output_projection_start = self._profile_start(x, profile_forward)
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        self._record_forward_profile("output_projection", output_projection_start, x, profile_forward)
+        self._record_forward_profile("forward_total", forward_start, x, profile_forward)
+        self._attention_forward_profile_count += 1 if profile_forward else 0
         if use_cache:
-            if current_special_kv is not None:
-                return x, new_kv, scores, current_special_kv
             return x, new_kv, scores
         return x
-
-
-def _filter_kv_for_voxel_covis(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    metadata: KVCacheMetadata,
-    selected_frame_ids: Sequence[int],
-    current_frame_id: int,
-    query_len: int,
-    fallback_recent: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build a padded read-only cache containing selected past frames plus current tokens."""
-    B, H, _, D = k.shape
-    frame_ids = metadata.frame_ids
-    selected = torch.as_tensor(list(selected_frame_ids), dtype=torch.long)
-    keep_masks = []
-    max_count = 0
-    for b in range(B):
-        row = []
-        for h in range(H):
-            head_frames = frame_ids[b, h]
-            if selected.numel() > 0:
-                selected_mask = torch.isin(head_frames, selected)
-            else:
-                selected_mask = torch.zeros_like(head_frames, dtype=torch.bool)
-            has_selected_past = bool((selected_mask & (head_frames != int(current_frame_id))).any().item())
-            if not has_selected_past and int(fallback_recent) > 0:
-                fallback_frames = _recent_cached_frame_ids(
-                    head_frames,
-                    int(current_frame_id),
-                    int(fallback_recent),
-                )
-                if fallback_frames:
-                    fallback = torch.as_tensor(fallback_frames, dtype=head_frames.dtype)
-                    selected_mask = selected_mask | torch.isin(head_frames, fallback)
-            mask = selected_mask | (head_frames == int(current_frame_id))
-            count = int(mask.sum().item())
-            max_count = max(max_count, count)
-            row.append(mask)
-        keep_masks.append(row)
-
-    if max_count == 0:
-        return k, v, torch.zeros((B, H, query_len, k.shape[2]), device=k.device, dtype=k.dtype)
-
-    if max_count == k.shape[2] and all(bool(mask.all()) for row in keep_masks for mask in row):
-        return k, v, torch.zeros((B, H, query_len, k.shape[2]), device=k.device, dtype=k.dtype)
-
-    k_read = torch.zeros((B, H, max_count, D), device=k.device, dtype=k.dtype)
-    v_read = torch.zeros((B, H, max_count, D), device=v.device, dtype=v.dtype)
-    valid = torch.zeros((B, H, max_count), device=k.device, dtype=torch.bool)
-
-    for b in range(B):
-        for h in range(H):
-            indices = torch.nonzero(keep_masks[b][h], as_tuple=False).flatten().to(device=k.device)
-            count = int(indices.numel())
-            if count == 0:
-                continue
-            k_read[b, h, :count] = k[b, h].index_select(0, indices)
-            v_read[b, h, :count] = v[b, h].index_select(0, indices)
-            valid[b, h, :count] = True
-
-    min_value = torch.finfo(k.dtype).min
-    mask = torch.zeros((B, H, 1, max_count), device=k.device, dtype=k.dtype)
-    mask = mask.masked_fill(~valid.unsqueeze(2), min_value)
-    mask = mask.expand(B, H, query_len, max_count)
-    return k_read, v_read, mask
-
-
-def _recent_cached_frame_ids(head_frames: torch.Tensor, current_frame_id: int, count: int) -> list[int]:
-    if count <= 0:
-        return []
-    past = head_frames[head_frames < int(current_frame_id)]
-    if past.numel() == 0:
-        return []
-    return sorted({int(fid) for fid in past.tolist()}, reverse=True)[:count]
-
-
-def _merge_attn_masks(
-    existing_mask: Optional[torch.Tensor],
-    covis_mask: torch.Tensor,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    covis_mask = covis_mask.to(dtype=dtype)
-    if existing_mask is None:
-        return covis_mask
-    return existing_mask.to(device=covis_mask.device, dtype=dtype) + covis_mask
-
 
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None, pos=None) -> Tensor:

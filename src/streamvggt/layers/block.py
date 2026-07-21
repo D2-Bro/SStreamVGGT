@@ -1,5 +1,7 @@
 import logging
 import os
+import time
+import inspect
 from typing import Callable, List, Any, Tuple, Dict, Union, Optional, Set
 import warnings
 
@@ -67,6 +69,37 @@ class Block(nn.Module):
         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.sample_drop_ratio = drop_path
+        self._block_profile_totals = {}
+        self._block_profile_count = 0
+
+    def _profile_sync(self, tensor: Optional[Tensor]) -> None:
+        if tensor is not None and tensor.is_cuda and torch.cuda.is_available():
+            torch.cuda.synchronize(tensor.device)
+
+    def _profile_start(self, tensor: Optional[Tensor], enabled: bool) -> float:
+        if not enabled:
+            return 0.0
+        self._profile_sync(tensor)
+        return time.perf_counter()
+
+    def _profile_record(self, name: str, start: float, tensor: Optional[Tensor], enabled: bool) -> None:
+        if not enabled:
+            return
+        self._profile_sync(tensor)
+        self._block_profile_totals[name] = self._block_profile_totals.get(name, 0.0) + (time.perf_counter() - start)
+
+    def reset_profile_stats(self) -> None:
+        self._block_profile_totals = {}
+        self._block_profile_count = 0
+        reset = getattr(self.attn, "reset_profile_stats", None)
+        if reset is not None:
+            reset()
+
+    def get_block_profile_stats(self) -> Dict[str, Any]:
+        return {
+            "count": self._block_profile_count,
+            "totals": dict(self._block_profile_totals),
+        }
 
     def forward(
         self,
@@ -80,12 +113,16 @@ class Block(nn.Module):
         pre_eviction_snapshot_config=None,
         eviction_nn_analysis_config=None,
         leverage_score_histogram_config=None,
+        projected_norm_histogram_config=None,
         token_overlay_dump_config=None,
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
+        current_frame_ids=None,
+        current_frame_idx: Optional[int] = None,
         tokens_per_frame: Optional[int] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
+        profile_eviction: bool = False,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 16,
         leverage_granularity: str = "head",
@@ -93,11 +130,15 @@ class Block(nn.Module):
         leverage_projection: str = "random",
         leverage_head_mean_dim: int = 1,
         leverage_normalize_rows: bool = False,
+        leverage_normalize_before_projection: bool = False,
+        leverage_normalize_before_projection_headwise: bool = False,
+        leverage_projected_key_cache: bool = False,
         leverage_approx_method: str = "right_sketch",        leverage_ridge_lambda: float = 1e-3,
         leverage_ridge_lambda_mode: str = "relative",
         leverage_ridge_score_chunk_size: int = 4096,
         leverage_ridge_jitter: float = 1e-6,
         leverage_ridge_dim: Optional[int] = None,
+        rls_refresh_interval: int = 1,
         leverage_diag: bool = False,
         leverage_diag_interval: int = 0,
         leverage_random_seed: int = 0,
@@ -122,6 +163,11 @@ class Block(nn.Module):
         leverage_conf_gate_depth_alpha: float = 1.0,
         leverage_conf_gate_point_beta: float = 1.0,
         leverage_conf_gate_init: str = "mean",
+        leverage_attention_utility: bool = False,
+        leverage_attention_beta: float = 0.2,
+        leverage_attention_ema_decay: float = 0.9,
+        leverage_attention_freeze_updates: int = 5,
+        leverage_attention_colsum_subsample_ratio: float = 1.0,
         layer_budget_strategy: str = "uniform",
         layer_budget_value_gamma: float = 0.5,
         layer_budget_value_norm_type: str = "rms",
@@ -129,23 +175,9 @@ class Block(nn.Module):
         layer_budget_eps: float = 1e-12,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
-        eviction_protect_recent_frames: int = 0,
-        eviction_protect_special_tokens: bool = False,
-        eviction_protect_special_token_interval: int = 1,
-        special_token_count: int = 0,
         anchor_token_count: Optional[int] = None,
-        window_token_count: int = 0,
-        recent_merge_config=None,
-        svd_eviction_merge_config=None,
-        voxel_covis_frame_ids=None,
-        voxel_covis_enabled: bool = False,
-        voxel_covis_fallback_recent: int = 0,
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
-        global_cache_history_anchor_special_tokens_only: bool = False,
-        history_anchor_frame_ids=None,
-        history_anchor_patch_topk_per_frame: int = 0,
-        history_anchor_max_frames: int = 0,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             
         def attn_residual_func(
@@ -167,12 +199,16 @@ class Block(nn.Module):
                     pre_eviction_snapshot_config=pre_eviction_snapshot_config,
                     eviction_nn_analysis_config=eviction_nn_analysis_config,
                     leverage_score_histogram_config=leverage_score_histogram_config,
+                    projected_norm_histogram_config=projected_norm_histogram_config,
                     token_overlay_dump_config=token_overlay_dump_config,
                     layer_id=layer_id,
                     step_idx=step_idx,
+                    current_frame_ids=current_frame_ids,
+                    current_frame_idx=current_frame_idx,
                     tokens_per_frame=tokens_per_frame,
                     eviction_policy=eviction_policy,
                     eviction_policy_layers=eviction_policy_layers,
+                    profile_eviction=profile_eviction,
                     eviction_debug=eviction_debug,
                     leverage_sketch_dim=leverage_sketch_dim,
                     leverage_granularity=leverage_granularity,
@@ -180,11 +216,15 @@ class Block(nn.Module):
                     leverage_projection=leverage_projection,
                     leverage_head_mean_dim=leverage_head_mean_dim,
                     leverage_normalize_rows=leverage_normalize_rows,
+                    leverage_normalize_before_projection=leverage_normalize_before_projection,
+                    leverage_normalize_before_projection_headwise=leverage_normalize_before_projection_headwise,
+                    leverage_projected_key_cache=leverage_projected_key_cache,
                     leverage_approx_method=leverage_approx_method,                    leverage_ridge_lambda=leverage_ridge_lambda,
                     leverage_ridge_lambda_mode=leverage_ridge_lambda_mode,
                     leverage_ridge_score_chunk_size=leverage_ridge_score_chunk_size,
                     leverage_ridge_jitter=leverage_ridge_jitter,
                     leverage_ridge_dim=leverage_ridge_dim,
+                    rls_refresh_interval=rls_refresh_interval,
                     leverage_diag=leverage_diag,
                     leverage_diag_interval=leverage_diag_interval,
                     leverage_random_seed=leverage_random_seed,
@@ -209,6 +249,11 @@ class Block(nn.Module):
                     leverage_conf_gate_depth_alpha=leverage_conf_gate_depth_alpha,
                     leverage_conf_gate_point_beta=leverage_conf_gate_point_beta,
                     leverage_conf_gate_init=leverage_conf_gate_init,
+                    leverage_attention_utility=leverage_attention_utility,
+                    leverage_attention_beta=leverage_attention_beta,
+                    leverage_attention_ema_decay=leverage_attention_ema_decay,
+                    leverage_attention_freeze_updates=leverage_attention_freeze_updates,
+                    leverage_attention_colsum_subsample_ratio=leverage_attention_colsum_subsample_ratio,
                     layer_budget_strategy=layer_budget_strategy,
                     layer_budget_value_gamma=layer_budget_value_gamma,
                     layer_budget_value_norm_type=layer_budget_value_norm_type,
@@ -216,47 +261,41 @@ class Block(nn.Module):
                     layer_budget_eps=layer_budget_eps,
                     slots_per_direction=slots_per_direction,
                     hybrid_beta=hybrid_beta,
-                    eviction_protect_recent_frames=eviction_protect_recent_frames,
-                    eviction_protect_special_tokens=eviction_protect_special_tokens,
-                    eviction_protect_special_token_interval=eviction_protect_special_token_interval,
-                    special_token_count=special_token_count,
                     anchor_token_count=anchor_token_count,
-                    window_token_count=window_token_count,
-                    recent_merge_config=recent_merge_config,
-                    svd_eviction_merge_config=svd_eviction_merge_config,
-                    voxel_covis_frame_ids=voxel_covis_frame_ids,
-                    voxel_covis_enabled=voxel_covis_enabled,
-                    voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                     cache_write_current_frame=cache_write_current_frame,
                     cache_evict_current_frame=cache_evict_current_frame,
-                    global_cache_history_anchor_special_tokens_only=global_cache_history_anchor_special_tokens_only,
-                    history_anchor_frame_ids=history_anchor_frame_ids,
-                    history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
-                    history_anchor_max_frames=history_anchor_max_frames,
                 )
-                if len(attn_result) == 4:
-                    output, new_kv, scores, special_kv_sidecar = attn_result
-                    return self.ls1(output), new_kv, scores, special_kv_sidecar
                 output, new_kv, scores = attn_result
                 return self.ls1(output), new_kv, scores
             else:
+                attn_kwargs = {"pos": pos}
                 if attn_mask is not None:
-                    return self.ls1(self.attn(self.norm1(x), pos=pos, attn_mask=attn_mask))
-                else:
-                    return self.ls1(self.attn(self.norm1(x), pos=pos))
+                    attn_kwargs["attn_mask"] = attn_mask
+                if "profile_eviction" in inspect.signature(self.attn.forward).parameters:
+                    attn_kwargs["profile_eviction"] = profile_eviction
+                return self.ls1(self.attn(self.norm1(x), **attn_kwargs))
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
         
+        profile_block = bool(profile_eviction)
+
         if use_cache:
+            block_start = self._profile_start(x, profile_block)
+            attn_start = self._profile_start(x, profile_block)
             cache_result = attn_residual_func(x, pos=pos, past_key_values=past_key_values, use_cache=True, cache_budget=cache_budget)
-            if len(cache_result) == 4:
-                attn_output, new_kv, scores, special_kv_sidecar = cache_result
-                x = x + attn_output
-                x = x + ffn_residual_func(x)
-                return x, new_kv, scores, special_kv_sidecar
-            attn_output, new_kv, scores = cache_result
+            attn_output = cache_result[0]
+            self._profile_record("attention", attn_start, attn_output, profile_block)
+            self._profile_record("cache_attention", attn_start, attn_output, profile_block)
             x = x + attn_output
-            x = x + ffn_residual_func(x)
+            mlp_start = self._profile_start(x, profile_block)
+            mlp_output = ffn_residual_func(x)
+            self._profile_record("mlp", mlp_start, mlp_output, profile_block)
+            self._profile_record("cache_mlp", mlp_start, mlp_output, profile_block)
+            x = x + mlp_output
+            self._profile_record("block", block_start, x, profile_block)
+            self._profile_record("cache_block", block_start, x, profile_block)
+            self._block_profile_count += 1 if profile_block else 0
+            _, new_kv, scores = cache_result
             return x, new_kv, scores
 
         if self.training and self.sample_drop_ratio > 0.1:
@@ -276,8 +315,20 @@ class Block(nn.Module):
             x = x + self.drop_path1(attn_residual_func(x, pos=pos, attn_mask=attn_mask))
             x = x + self.drop_path1(ffn_residual_func(x))  # FIXME: drop_path2
         else:
-            x = x + attn_residual_func(x, pos=pos, attn_mask=attn_mask)
-            x = x + ffn_residual_func(x)
+            block_start = self._profile_start(x, profile_block)
+            attn_start = self._profile_start(x, profile_block)
+            attn_output = attn_residual_func(x, pos=pos, attn_mask=attn_mask)
+            self._profile_record("attention", attn_start, attn_output, profile_block)
+            self._profile_record("noncache_attention", attn_start, attn_output, profile_block)
+            x = x + attn_output
+            mlp_start = self._profile_start(x, profile_block)
+            mlp_output = ffn_residual_func(x)
+            self._profile_record("mlp", mlp_start, mlp_output, profile_block)
+            self._profile_record("noncache_mlp", mlp_start, mlp_output, profile_block)
+            x = x + mlp_output
+            self._profile_record("block", block_start, x, profile_block)
+            self._profile_record("noncache_block", block_start, x, profile_block)
+            self._block_profile_count += 1 if profile_block else 0
         return x
 
 def drop_add_residual_stochastic_depth(

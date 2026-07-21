@@ -18,12 +18,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-PREFERRED_POLICIES = ("mean", "svd_leverage", "layer_svd_leverage")
+PREFERRED_POLICIES = (
+    "mean",
+    "svd_leverage",
+    "layer_svd_leverage",
+    "normalized_layer_svd_leverage",
+    "projected_norm_layer_leverage",
+)
 
 
 def comparison_policies(comp: dict[str, Any]) -> tuple[str, ...]:
     """Return policy result keys present in a comparison payload."""
-    return tuple(policy for policy in PREFERRED_POLICIES if policy in comp)
+    policies = [policy for policy in PREFERRED_POLICIES if policy in comp]
+    extras = sorted(
+        key
+        for key, value in comp.items()
+        if key not in policies and isinstance(value, dict) and "evict_indices" in value
+    )
+    return tuple(policies + extras)
 
 
 def pca_project(keys: torch.Tensor, projection_dim: int) -> dict[str, torch.Tensor]:
@@ -649,6 +661,36 @@ def analyze_comparison(path: Path, args: argparse.Namespace, out_dir: Path) -> t
             delta[f"{key}_layer_svd_minus_head_svd"] = float(
                 by_policy["layer_svd_leverage"][key] - by_policy["svd_leverage"][key]
             )
+        if "normalized_layer_svd_leverage" in by_policy:
+            delta[f"{key}_normalized_layer_svd_minus_mean"] = float(
+                by_policy["normalized_layer_svd_leverage"][key] - by_policy["mean"][key]
+            )
+            delta[f"{key}_normalized_layer_svd_minus_head_svd"] = float(
+                by_policy["normalized_layer_svd_leverage"][key] - by_policy["svd_leverage"][key]
+            )
+            if "layer_svd_leverage" in by_policy:
+                delta[f"{key}_normalized_layer_svd_minus_layer_svd"] = float(
+                    by_policy["normalized_layer_svd_leverage"][key] - by_policy["layer_svd_leverage"][key]
+                )
+        for projected_policy in sorted(
+            policy for policy in by_policy if policy.startswith("projected_norm_layer_leverage")
+        ):
+            delta_prefix = projected_policy.replace("projected_norm_layer_leverage", "projected_norm_layer")
+            delta[f"{key}_{delta_prefix}_minus_mean"] = float(
+                by_policy[projected_policy][key] - by_policy["mean"][key]
+            )
+            delta[f"{key}_{delta_prefix}_minus_head_svd"] = float(
+                by_policy[projected_policy][key] - by_policy["svd_leverage"][key]
+            )
+            if "layer_svd_leverage" in by_policy:
+                delta[f"{key}_{delta_prefix}_minus_layer_svd"] = float(
+                    by_policy[projected_policy][key] - by_policy["layer_svd_leverage"][key]
+                )
+            if "normalized_layer_svd_leverage" in by_policy:
+                delta[f"{key}_{delta_prefix}_minus_normalized_layer_svd"] = float(
+                    by_policy[projected_policy][key] - by_policy["normalized_layer_svd_leverage"][key]
+                )
+
 
     with (head_dir / "comparison_delta.json").open("w", encoding="utf-8") as f:
         json.dump(delta, f, indent=2)

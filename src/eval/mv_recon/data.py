@@ -117,6 +117,8 @@ class SevenScenes(BaseStereoViewDataset):
                     # seq is string, take the int part and make it 01, 02, 03
                     # seq_id = 'seq-{:2d}'.format(int(seq_id))
                     num_part = "".join(filter(str.isdigit, seq_id))
+                    # if num_part != "6":
+                    #     continue  # Only use seq-06 for evaluation, as in SimpleRecon
                     seq_id = f"seq-{num_part.zfill(2)}"
                     if self.seq_id is not None and seq_id != self.seq_id:
                         continue
@@ -174,19 +176,6 @@ class SevenScenes(BaseStereoViewDataset):
             if resolution != (224, 224) or self.rebuttal:
                 rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
                     rgb_image, depthmap, intrinsics_, resolution, rng=rng, info=impath
-                )
-            else:
-                rgb_image, depthmap, intrinsics = self._crop_resize_if_necessary(
-                    rgb_image, depthmap, intrinsics_, (512, 384), rng=rng, info=impath
-                )
-                W, H = rgb_image.size
-                cx = W // 2
-                cy = H // 2
-                l, t = cx - 112, cy - 112
-                r, b = cx + 112, cy + 112
-                crop_bbox = (l, t, r, b)
-                rgb_image, depthmap, intrinsics = cropping.crop_image_depthmap(
-                    rgb_image, depthmap, intrinsics, crop_bbox
                 )
 
             views.append(
@@ -356,6 +345,95 @@ class ETH3D(BaseStereoViewDataset):
                 label=f"{scene_id}/{name}",
                 instance=img_path,
             ))
+        return views
+
+
+class ETH3D_undistort(ETH3D):
+    """ETH3D loader for the precomputed ``custom_undistorted`` data."""
+
+    def _get_views(self, idx, resolution, rng):
+        scene_id = self.scene_list[idx // self.num_seq]
+        seq_idx = idx % self.num_seq
+
+        scene_dir = osp.join(self.ROOT, scene_id)
+        image_dir = osp.join(scene_dir, "images", "custom_undistorted")
+        depth_dir = osp.join(
+            scene_dir, "ground_truth_depth", "custom_undistorted"
+        )
+        camera_dir = osp.join(scene_dir, "custom_undistorted_cam")
+
+        img_names = sorted(
+            name for name in os.listdir(image_dir) if name.endswith(".JPG")
+        )
+        if not self.full_video:
+            if self.shuffle_seed >= 0:
+                rng_local = np.random.default_rng(self.shuffle_seed + seq_idx)
+                rng_local.shuffle(img_names)
+            else:
+                rng.shuffle(img_names)
+            img_names = img_names[: self.num_frames]
+        else:
+            img_names = img_names[:: self.kf_every]
+
+        views = []
+        for name in img_names:
+            img_path = osp.join(image_dir, name)
+            depth_path = osp.join(depth_dir, name)
+            camera_path = osp.join(camera_dir, osp.splitext(name)[0] + ".npz")
+
+            rgb = imread_cv2(img_path)
+            h, w = rgb.shape[:2]
+            depth = self._read_depth_raw(depth_path, (h, w))
+
+            with np.load(camera_path) as camera:
+                K = camera["intrinsics"].astype(np.float32)
+                Tw2c = camera["extrinsics"].astype(np.float32)
+
+            if Tw2c.shape == (3, 4):
+                Tw2c_4x4 = np.eye(4, dtype=np.float32)
+                Tw2c_4x4[:3] = Tw2c
+                Tw2c = Tw2c_4x4
+            if Tw2c.shape != (4, 4):
+                raise ValueError(
+                    f"Expected a 3x4 or 4x4 extrinsics matrix in {camera_path}, "
+                    f"got {Tw2c.shape}"
+                )
+
+            # The npz stores COLMAP world-to-camera extrinsics, while the
+            # mv_recon interface expects a camera-to-world camera_pose.
+            camera_pose = np.linalg.inv(Tw2c).astype(np.float32)
+
+            if resolution != (224, 224):
+                rgb, depth, K = self._crop_resize_if_necessary(
+                    rgb, depth, K, resolution, rng=rng, info=img_path
+                )
+            else:
+                rgb, depth, K = self._crop_resize_if_necessary(
+                    rgb, depth, K, (512, 384), rng=rng, info=img_path
+                )
+                width, height = rgb.size
+                crop_bbox = (
+                    width // 2 - 112,
+                    height // 2 - 112,
+                    width // 2 + 112,
+                    height // 2 + 112,
+                )
+                rgb, depth, K = cropping.crop_image_depthmap(
+                    rgb, depth, K, crop_bbox
+                )
+
+            views.append(
+                dict(
+                    img=rgb,
+                    depthmap=depth,
+                    camera_pose=camera_pose,
+                    camera_intrinsics=K,
+                    dataset="eth3d_undistort",
+                    label=f"{scene_id}/{name}",
+                    instance=img_path,
+                )
+            )
+
         return views
 
 
@@ -769,7 +847,10 @@ class NRGBD(BaseStereoViewDataset):
         ]
 
         if self.test_id is not None:
-            self.scene_list = [self.test_id]
+            if isinstance(self.test_id, list):
+                self.scene_list = self.test_id
+            else:
+                self.scene_list = [self.test_id]
 
         else:
             self.scene_list = scenes

@@ -38,8 +38,10 @@ def sintel_cam_read(filename):
     return M, N
 
 
-def load_replica_traj(gt_file):
-    traj_w_c = np.loadtxt(gt_file)
+def replica_pose_rows_to_traj_tum(traj_w_c):
+    traj_w_c = np.asarray(traj_w_c)
+    if traj_w_c.ndim == 1:
+        traj_w_c = traj_w_c[None, :]
     assert traj_w_c.shape[1] == 12 or traj_w_c.shape[1] == 16
     poses = [
         np.array(
@@ -65,6 +67,11 @@ def load_replica_traj(gt_file):
 
     traj_tum = np.column_stack((xyz, quat))
     return (traj_tum, timestamps_mat)
+
+
+def load_replica_traj(gt_file):
+    traj_w_c = np.loadtxt(gt_file)
+    return replica_pose_rows_to_traj_tum(traj_w_c)
 
 
 def load_sintel_traj(gt_file):  # './data/sintel/training/camdata_left/alley_2'

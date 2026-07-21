@@ -1,0 +1,8 @@
+# ninja log v7
+0	19316	1783769839497308703	/home/dongjae/SStreamVGGT/attn-cuda/build/temp.linux-x86_64-cpython-311/csrc/bindings.o	55f5fc3694e6f84e
+1	125406	1783769839497308703	/home/dongjae/SStreamVGGT/attn-cuda/build/temp.linux-x86_64-cpython-311/csrc/launch.o	d5e103e201634c69
+29	128836	1783769919956907472	/home/dongjae/SStreamVGGT/attn-cuda/build/temp.linux-x86_64-cpython-311/csrc/launch.o	d5e103e201634c69
+12	16770	1783770068100795308	/home/dongjae/SStreamVGGT/attn-cuda/build/temp.linux-x86_64-cpython-311/csrc/bindings.o	55f5fc3694e6f84e
+12	120777	1783770068100795308	/home/dongjae/SStreamVGGT/attn-cuda/build/temp.linux-x86_64-cpython-311/csrc/launch.o	d5e103e201634c69
+7	17551	1783770185925936857	/home/dongjae/SStreamVGGT/attn-cuda/build/temp.linux-x86_64-cpython-311/csrc/bindings.o	55f5fc3694e6f84e
+7	128353	1783770185925936857	/home/dongjae/SStreamVGGT/attn-cuda/build/temp.linux-x86_64-cpython-311/csrc/launch.o	d5e103e201634c69

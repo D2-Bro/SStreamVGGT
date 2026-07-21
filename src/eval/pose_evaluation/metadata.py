@@ -4,7 +4,7 @@ from tqdm import tqdm
 
 
 def _seven_scenes_root():
-    return os.environ.get("SSTREAMVGGT_7SCENES_ROOT", "/home/dongjae/data/7scenes_sfm")
+    return os.environ.get("SSTREAMVGGT_7SCENES_ROOT", "/home/dongjae/data/7scenes")
 
 
 def _seven_scenes_seq_from_split_line(line):
@@ -71,6 +71,139 @@ def _replica_image_files(dir_path):
     return sorted(glob.glob(os.path.join(dir_path, "frame*.jpg")))
 
 
+def _replica_repeat_image_files(dir_path):
+    filelist = _replica_image_files(dir_path)
+    return filelist + list(reversed(filelist))
+
+
+def _replica_frame_index(image_path):
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    if not stem.startswith("frame") or not stem[5:].isdigit():
+        raise ValueError(f"Unsupported Replica frame filename: {image_path}")
+    return int(stem[5:])
+
+
+def _replica_repeat_gt_traj_from_filelist(img_path, anno_path, seq, filelist):
+    import numpy as np
+    from eval.pose_evaluation.evo_utils import replica_pose_rows_to_traj_tum
+
+    if not filelist:
+        raise ValueError(f"No selected frames for Replica repeat sequence {seq}")
+
+    traj_path = os.path.join(anno_path, seq, "traj.txt")
+    if not os.path.exists(traj_path):
+        raise FileNotFoundError(f"Missing Replica traj.txt for sequence {seq}: {traj_path}")
+
+    traj_rows = np.loadtxt(traj_path, dtype=np.float64)
+    if traj_rows.ndim == 1:
+        traj_rows = traj_rows[None, :]
+    if traj_rows.ndim != 2 or traj_rows.shape[1] not in (12, 16):
+        raise ValueError(
+            f"Unsupported Replica trajectory shape {traj_rows.shape} in {traj_path}"
+        )
+
+    selected_rows = []
+    for image_path in filelist:
+        frame_idx = _replica_frame_index(image_path)
+        if frame_idx >= traj_rows.shape[0]:
+            raise IndexError(
+                f"Frame index {frame_idx} from {image_path} is outside trajectory length {traj_rows.shape[0]}"
+            )
+        selected_rows.append(traj_rows[frame_idx])
+
+    return replica_pose_rows_to_traj_tum(np.stack(selected_rows, axis=0))
+
+
+def _replica_multiagent_root():
+    return os.environ.get(
+        "SSTREAMVGGT_REPLICA_MULTIAGENT_ROOT",
+        "/home/dongjae/data/ReplicaMultiagent",
+    )
+
+
+def _replica_multiagent_part_dirs(scene_dir):
+    if not os.path.isdir(scene_dir):
+        return []
+    return sorted(
+        part_dir
+        for part_dir in glob.glob(os.path.join(scene_dir, "*"))
+        if os.path.isdir(part_dir)
+        and os.path.isdir(os.path.join(part_dir, "results"))
+        and os.path.exists(os.path.join(part_dir, "traj.txt"))
+    )
+
+
+def _replica_multiagent_sequences(root=None):
+    root = root or _replica_multiagent_root()
+    if not os.path.isdir(root):
+        return []
+    return sorted(
+        scene
+        for scene in os.listdir(root)
+        if len(_replica_multiagent_part_dirs(os.path.join(root, scene))) >= 2
+    )
+
+
+def _replica_multiagent_image_files(scene_dir):
+    part_dirs = _replica_multiagent_part_dirs(scene_dir)
+    if len(part_dirs) < 2:
+        raise FileNotFoundError(
+            f"ReplicaMultiagent scene needs at least two part folders with results/ and traj.txt: {scene_dir}"
+        )
+
+    filelist = []
+    for part_dir in part_dirs:
+        part_files = _replica_image_files(os.path.join(part_dir, "results"))
+        if not part_files:
+            raise FileNotFoundError(f"No ReplicaMultiagent RGB frames found in {part_dir}/results")
+        filelist.extend(part_files)
+    return filelist
+
+
+def _replica_multiagent_frame_index(image_path):
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    if not stem.startswith("frame") or not stem[5:].isdigit():
+        raise ValueError(f"Unsupported ReplicaMultiagent frame filename: {image_path}")
+    return int(stem[5:])
+
+
+def _replica_multiagent_gt_traj_from_filelist(img_path, anno_path, seq, filelist):
+    import numpy as np
+    from eval.pose_evaluation.evo_utils import replica_pose_rows_to_traj_tum
+
+    if not filelist:
+        raise ValueError(f"No selected frames for ReplicaMultiagent sequence {seq}")
+
+    traj_cache = {}
+    selected_rows = []
+    for image_path in filelist:
+        results_dir = os.path.dirname(image_path)
+        part_dir = os.path.dirname(results_dir)
+        traj_path = os.path.join(part_dir, "traj.txt")
+        if not os.path.exists(traj_path):
+            raise FileNotFoundError(f"Missing ReplicaMultiagent traj.txt for frame {image_path}")
+
+        if traj_path not in traj_cache:
+            traj_rows = np.loadtxt(traj_path, dtype=np.float64)
+            if traj_rows.ndim == 1:
+                traj_rows = traj_rows[None, :]
+            if traj_rows.ndim != 2 or traj_rows.shape[1] not in (12, 16):
+                raise ValueError(
+                    f"Unsupported ReplicaMultiagent trajectory shape {traj_rows.shape} in {traj_path}"
+                )
+            traj_cache[traj_path] = traj_rows
+
+        frame_idx = _replica_multiagent_frame_index(image_path)
+        traj_rows = traj_cache[traj_path]
+        if frame_idx >= traj_rows.shape[0]:
+            raise IndexError(
+                f"Frame index {frame_idx} from {image_path} is outside trajectory length {traj_rows.shape[0]}"
+            )
+        selected_rows.append(traj_rows[frame_idx])
+
+    return replica_pose_rows_to_traj_tum(np.stack(selected_rows, axis=0))
+
+
 def _nrgbd_root():
     return os.environ.get("SSTREAMVGGT_NRGBD_ROOT", "/home/dongjae/data/neural_rgbd_data")
 
@@ -101,6 +234,113 @@ def _nrgbd_image_files(dir_path):
         glob.glob(os.path.join(dir_path, "img*.png")),
         key=_nrgbd_image_sort_key,
     )
+
+
+def _vkitti2_gen_root():
+    return os.environ.get(
+        "SSTREAMVGGT_VKITTI2_GEN_ROOT",
+        "/home/dongjae/data/vkitti2/vkitti2_gen",
+    )
+
+
+def _vkitti2_clone_00_sequences(root=None):
+    root = root or _vkitti2_gen_root()
+    if not os.path.isdir(root):
+        return []
+
+    seq_list = []
+    for scene in sorted(os.listdir(root)):
+        seq = os.path.join(scene, "clone")
+        seq_dir = os.path.join(root, seq)
+        if (
+            os.path.isdir(os.path.join(seq_dir, "images", "00"))
+            and os.path.exists(os.path.join(seq_dir, "cameras", "00", "extri.yml"))
+        ):
+            seq_list.append(seq)
+    return seq_list
+
+
+def _vkitti2_image_files(dir_path):
+    return sorted(glob.glob(os.path.join(dir_path, "*.jpg")))
+
+
+def _vkitti2_frame_id(image_path):
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    if not stem.isdigit():
+        raise ValueError(f"Unsupported VKITTI2 frame filename: {image_path}")
+    return stem
+
+
+def _vkitti2_read_extri_matrix(storage, key, shape, extri_path):
+    node = storage.getNode(key)
+    if node.empty():
+        raise KeyError(f"Missing {key} in VKITTI2 extrinsics: {extri_path}")
+    matrix = node.mat()
+    if matrix is None:
+        raise ValueError(f"Could not read {key} from VKITTI2 extrinsics: {extri_path}")
+    return matrix.reshape(shape)
+
+
+def _vkitti2_clone_00_gt_traj_from_filelist(img_path, anno_path, seq, filelist):
+    import cv2
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    if not filelist:
+        raise ValueError(f"No selected frames for VKITTI2 sequence {seq}")
+
+    extri_path = os.path.join(img_path, seq, "cameras", "00", "extri.yml")
+    if not os.path.exists(extri_path):
+        raise FileNotFoundError(f"Missing VKITTI2 camera extrinsics for {seq}: {extri_path}")
+
+    storage = cv2.FileStorage(extri_path, cv2.FILE_STORAGE_READ)
+    if not storage.isOpened():
+        raise OSError(f"Could not open VKITTI2 camera extrinsics: {extri_path}")
+
+    poses_c2w = []
+    try:
+        for image_path in filelist:
+            frame_id = _vkitti2_frame_id(image_path)
+            R_w2c = _vkitti2_read_extri_matrix(
+                storage, f"R_{frame_id}", (3, 3), extri_path
+            )
+            T_w2c = _vkitti2_read_extri_matrix(
+                storage, f"T_{frame_id}", (3,), extri_path
+            )
+
+            w2c = np.eye(4, dtype=np.float64)
+            w2c[:3, :3] = R_w2c
+            w2c[:3, 3] = T_w2c
+            poses_c2w.append(np.linalg.inv(w2c))
+    finally:
+        storage.release()
+
+    xyz = np.stack([pose[:3, 3] for pose in poses_c2w], axis=0)
+    quat_xyzw = Rotation.from_matrix(
+        np.stack([pose[:3, :3] for pose in poses_c2w], axis=0)
+    ).as_quat()
+    quat_wxyz = quat_xyzw[:, [3, 0, 1, 2]]
+    traj_tum = np.concatenate([xyz, quat_wxyz], axis=1)
+    timestamps = np.arange(len(poses_c2w), dtype=float)
+    return traj_tum, timestamps
+
+
+def _vkitti2_clone_00_metadata():
+    return {
+        "img_path": _vkitti2_gen_root(),
+        "anno_path": _vkitti2_gen_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "images", "00"),
+        "filelist_func": _vkitti2_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: None,
+        "gt_traj_loader": _vkitti2_clone_00_gt_traj_from_filelist,
+        "traj_format": "vkitti2",
+        "seq_list": _vkitti2_clone_00_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    }
 
 
 KITTI_ODOMETRY_GT_SEQS = [f"{i:02d}" for i in range(11)]
@@ -216,6 +456,36 @@ dataset_metadata = {
         "skip_condition": None,
         "process_func": None,
     },
+    "replica_repeat": {
+        "img_path": _replica_root(),
+        "anno_path": _replica_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "results"),
+        "filelist_func": _replica_repeat_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: None,
+        "gt_traj_loader": _replica_repeat_gt_traj_from_filelist,
+        "traj_format": "replica_repeat",
+        "seq_list": _replica_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "replica_multiagent": {
+        "img_path": _replica_multiagent_root(),
+        "anno_path": _replica_multiagent_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
+        "filelist_func": _replica_multiagent_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: None,
+        "gt_traj_loader": _replica_multiagent_gt_traj_from_filelist,
+        "traj_format": "replica_multiagent",
+        "seq_list": _replica_multiagent_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
     "NRGBD": {
         "img_path": _nrgbd_root(),
         "anno_path": _nrgbd_root(),
@@ -230,6 +500,8 @@ dataset_metadata = {
         "skip_condition": None,
         "process_func": None,
     },
+    "vkitti2": _vkitti2_clone_00_metadata(),
+    "vkitti2_clone_00": _vkitti2_clone_00_metadata(),
     "bonn": {
         "img_path": "data/bonn/rgbd_bonn_dataset",
         "mask_path": None,
@@ -322,7 +594,7 @@ dataset_metadata = {
         "process_func": lambda args, img_path: process_scannet(args, img_path),
     },
     "tum": {
-        "img_path": "data/tum",
+        "img_path": "/home/dongjae/data/tum",
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "rgb_90"),
         "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
@@ -335,9 +607,23 @@ dataset_metadata = {
         "skip_condition": None,
         "process_func": None,
     },
+    "tum_stride2": {
+        "img_path": "/home/dongjae/data/tum",
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "rgb_stride2"),
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
+            img_path, seq, "groundtruth_stride2.txt"
+        ),
+        "traj_format": "tum",
+        "seq_list": None,
+        "full_seq": True,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
     "sintel": {
-        "img_path": "/home/ma-user/work/dataset/3D_Reconstruction/sintel/training/final",
-        "anno_path": "/home/ma-user/work/dataset/3D_Reconstruction/sintel/training/camdata_left",
+        "img_path": "/home/dongjae/data/sintel/training/final",
+        "anno_path": "/home/dongjae/data/sintel/training/camdata_left",
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
         "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(anno_path, seq),

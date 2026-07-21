@@ -10,6 +10,7 @@ matplotlib
 tqdm
 opencv-python
 scipy
+pykdtree
 einops
 trimesh
 tensorboard
