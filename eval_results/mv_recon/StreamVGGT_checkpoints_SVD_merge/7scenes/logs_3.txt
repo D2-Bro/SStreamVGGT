@@ -1,1 +1,0 @@
-Timing before eval - Idx: redkitchen/seq-12, Time: 301.240692, FPS: 0.996

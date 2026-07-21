@@ -416,26 +416,32 @@ def make_token_confidence_gate(
     return gate
 
 
-def pack_kv_cache(k: torch.Tensor, v: torch.Tensor, metadata=None, confidence_state: Optional[KVConfidenceState] = None):
+def pack_kv_cache(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    confidence_state: Optional[KVConfidenceState] = None,
+):
     if confidence_state is not None:
-        return k, v, metadata, confidence_state
-    if metadata is not None:
-        return k, v, metadata
+        return k, v, confidence_state
     return k, v
 
 
-def unpack_kv_cache(kv) -> Tuple[torch.Tensor, torch.Tensor, object, Optional[KVConfidenceState]]:
+def unpack_kv_cache(kv) -> Tuple[torch.Tensor, torch.Tensor, Optional[KVConfidenceState]]:
     if kv is None:
         raise ValueError("Cannot unpack a None KV cache")
+    # Accept the former (k, v, metadata, confidence_state) shape during the
+    # transition, but metadata is deliberately discarded.
     if len(kv) == 4:
-        k, v, metadata, confidence_state = kv
-        return k, v, metadata, confidence_state
+        k, v, _, confidence_state = kv
+        return k, v, confidence_state
     if len(kv) == 3:
-        k, v, metadata = kv
-        return k, v, metadata, None
+        k, v, confidence_state = kv
+        if confidence_state is not None and not isinstance(confidence_state, KVConfidenceState):
+            raise ValueError("Legacy metadata-only KV caches are no longer supported")
+        return k, v, confidence_state
     if len(kv) == 2:
         k, v = kv
-        return k, v, None, None
+        return k, v, None
     raise ValueError(f"Expected KV tuple of length 2, 3, or 4, got {len(kv)}")
 
 

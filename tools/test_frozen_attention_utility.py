@@ -257,8 +257,8 @@ def test_cuda_beta_zero_pre_eviction_cache_parity_if_available() -> None:
             leverage_attention_colsum_subsample_ratio=1.0,
             **common_kwargs,
         )
-        baseline_k, baseline_v, _, baseline_state = unpack_kv_cache(baseline_cache)
-        utility_k, utility_v, _, utility_state = unpack_kv_cache(utility_cache)
+        baseline_k, baseline_v, baseline_state = unpack_kv_cache(baseline_cache)
+        utility_k, utility_v, utility_state = unpack_kv_cache(utility_cache)
         assert baseline_k.shape[2] <= 10 and utility_k.shape[2] <= 10
         assert torch.equal(baseline_k, utility_k)
         assert torch.equal(baseline_v, utility_v)
@@ -307,7 +307,7 @@ def test_cuda_pre_attention_eviction_if_available() -> None:
             current_frame_idx=frame_idx,
             **kwargs,
         )
-        k, _, _, state = unpack_kv_cache(cache)
+        k, _, state = unpack_kv_cache(cache)
         assert out.shape == frame_x.shape
         assert out.dtype == torch.float32
         assert k.dtype == torch.float16
@@ -319,7 +319,7 @@ def test_cuda_pre_attention_eviction_if_available() -> None:
         current_mask = state.frame_ids.eq(frame_idx)
         if torch.any(current_mask):
             assert torch.all(state.attention_count[current_mask] == 1)
-    k, _, _, state = unpack_kv_cache(cache)
+    k, _, state = unpack_kv_cache(cache)
     assert state is not None and state.attention_count is not None
     assert torch.all((state.attention_count >= 1) & (state.attention_count <= 5))
 

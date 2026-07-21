@@ -28,7 +28,7 @@ def get_args_parser():
     parser.add_argument(
         "--align",
         type=str,
-        default="scale&shift",
+        default="scale",
         choices=["scale&shift", "scale", "metric"],
     )
     return parser

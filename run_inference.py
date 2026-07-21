@@ -21,22 +21,12 @@ from streamvggt.utils.cache_analysis import (
     add_eviction_nn_analysis_args,
     eviction_nn_config_from_args,
 )
-from streamvggt.layers.recent_merge import RecentMergeConfig
-from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
-from streamvggt.layers.voxel_covis import VoxelCovisConfig
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
 if SRC_ROOT not in sys.path:
     sys.path.append(SRC_ROOT)
 
-
-def resolve_global_attn_idx_ranges(args: argparse.Namespace) -> Optional[str]:
-    if args.middle_global_only and args.global_attn_idx_ranges is not None:
-        raise ValueError("--middle-global-only cannot be combined with --global-attn-idx-ranges")
-    if args.middle_global_only:
-        return "9:"
-    return args.global_attn_idx_ranges
 
 
 def run_inference(args: argparse.Namespace):
@@ -96,140 +86,8 @@ def run_inference(args: argparse.Namespace):
             f"got {args.stream_chunk_size}."
         )
         return
-    if args.merge_window < 1:
-        print(f"Error: --merge_window must be >= 1, got {args.merge_window}.")
-        return
-    if not (0.0 <= args.merge_similarity_threshold <= 1.0):
-        print(
-            "Error: --merge_similarity_threshold must be in [0, 1], "
-            f"got {args.merge_similarity_threshold}."
-        )
-        return
-    if args.merge_voxel_size <= 0:
-        print(f"Error: --merge_voxel_size must be > 0, got {args.merge_voxel_size}.")
-        return
-    if args.merge_chunk_size < 1:
-        print(f"Error: --merge_chunk_size must be >= 1, got {args.merge_chunk_size}.")
-        return
-    if args.merge_patch_radius < 0:
-        print(f"Error: --merge_patch_radius must be >= 0, got {args.merge_patch_radius}.")
-        return
-    if args.merge_voxel_neighbor_radius < 0:
-        print(
-            "Error: --merge_voxel_neighbor_radius must be >= 0, "
-            f"got {args.merge_voxel_neighbor_radius}."
-        )
-        return
-    if args.merge_max_candidates_per_token < 1:
-        print(
-            "Error: --merge_max_candidates_per_token must be >= 1, "
-            f"got {args.merge_max_candidates_per_token}."
-        )
-        return
-    if args.merge_recall_debug_max_tokens < 1:
-        print(
-            "Error: --merge_recall_debug_max_tokens must be >= 1, "
-            f"got {args.merge_recall_debug_max_tokens}."
-        )
-        return
-    if args.eviction_protect_recent_frames < 0:
-        print(
-            "Error: --eviction_protect_recent_frames must be >= 0, "
-            f"got {args.eviction_protect_recent_frames}."
-        )
-        return
-    if args.eviction_protect_special_token_interval < 1:
-        print(
-            "Error: --eviction_protect_special_token_interval must be >= 1, "
-            f"got {args.eviction_protect_special_token_interval}."
-        )
-        return
-    if args.svd_eviction_merge_candidate_axes < 1:
-        print("Error: --svd_eviction_merge_candidate_axes must be >= 1.")
-        return
-    if args.svd_eviction_merge_reps_per_axis < 1:
-        print("Error: --svd_eviction_merge_reps_per_axis must be >= 1.")
-        return
-    if not (0.0 <= args.svd_eviction_merge_similarity_threshold <= 1.0):
-        print("Error: --svd_eviction_merge_similarity_threshold must be in [0, 1].")
-        return
-    if args.svd_eviction_merge_voxel_neighbor_radius < 0:
-        print("Error: --svd_eviction_merge_voxel_neighbor_radius must be >= 0.")
-        return
-    if not (0.0 <= args.svd_eviction_merge_ema_decay <= 1.0):
-        print("Error: --svd_eviction_merge_ema_decay must be in [0, 1].")
-        return
-    if args.svd_eviction_merge_max_candidates_per_token < 1:
-        print("Error: --svd_eviction_merge_max_candidates_per_token must be >= 1.")
-        return
-    if args.svd_eviction_merge_chunk_size < 1:
-        print("Error: --svd_eviction_merge_chunk_size must be >= 1.")
-        return
-    if args.voxel_size <= 0:
-        print(f"Error: --voxel_size must be > 0, got {args.voxel_size}.")
-        return
-    if args.covis_min_shared_voxels < 0:
-        print(
-            "Error: --covis_min_shared_voxels must be >= 0, "
-            f"got {args.covis_min_shared_voxels}."
-        )
-        return
-    if not (0.0 <= args.covis_min_overlap <= 1.0):
-        print(
-            "Error: --covis_min_overlap must be in [0, 1], "
-            f"got {args.covis_min_overlap}."
-        )
-        return
-    if args.covis_fallback_recent < 0:
-        print(
-            "Error: --covis_fallback_recent must be >= 0, "
-            f"got {args.covis_fallback_recent}."
-        )
-        return
     if args.total_budget < 1:
         print(f"Error: --total_budget must be >= 1, got {args.total_budget}.")
-        return
-    if args.leverage_head_mean_dim < 1:
-        print(
-            "Error: --leverage_head_mean_dim must be >= 1, "
-            f"got {args.leverage_head_mean_dim}."
-        )
-        return
-    if args.leverage_dpp_candidate_multiplier < 1:
-        print(
-            "Error: --leverage_dpp_candidate_multiplier must be >= 1, "
-            f"got {args.leverage_dpp_candidate_multiplier}."
-        )
-        return
-    if args.leverage_dpp_greedy_block_size < 1:
-        print(
-            "Error: --leverage_dpp_greedy_block_size must be >= 1, "
-            f"got {args.leverage_dpp_greedy_block_size}."
-        )
-        return
-    if args.leverage_dpp_quality_beta < 0:
-        print(
-            "Error: --leverage_dpp_quality_beta must be >= 0, "
-            f"got {args.leverage_dpp_quality_beta}."
-        )
-        return
-    if args.leverage_dpp_recency_lambda < 0:
-        print(
-            "Error: --leverage_dpp_recency_lambda must be >= 0, "
-            f"got {args.leverage_dpp_recency_lambda}."
-        )
-        return
-    if args.leverage_dpp_recency_window < 1:
-        print(
-            "Error: --leverage_dpp_recency_window must be >= 1, "
-            f"got {args.leverage_dpp_recency_window}."
-        )
-        return
-    if args.leverage_dpp_recency_gate_power < 0:
-        print(
-            "Error: --leverage_dpp_recency_gate_power must be >= 0, "
-            f"got {args.leverage_dpp_recency_gate_power}."
-        )
         return
     if args.leverage_ridge_lambda < 0:
         print(
@@ -276,11 +134,7 @@ def run_inference(args: argparse.Namespace):
             )
             return
         args.leverage_ridge_dim = int(resolved_ridge_dim)
-    try:
-        global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        return
+
     print(f"Using eviction policy: {args.eviction_policy}")
     if args.eviction_policy == "svd_leverage":
         sketch_label = "exact" if args.leverage_sketch_dim == 0 else str(args.leverage_sketch_dim)
@@ -307,79 +161,6 @@ def run_inference(args: argparse.Namespace):
             f"dpp_greedy_block_size={args.leverage_dpp_greedy_block_size}, "
             f"dpp_quality_beta={args.leverage_dpp_quality_beta})"
         )
-        print(f"Using SVD leverage recent-frame protection: {args.eviction_protect_recent_frames}")
-    recent_merge_config = RecentMergeConfig(
-        enabled=args.enable_recent_merge,
-        window=args.merge_window,
-        similarity_threshold=args.merge_similarity_threshold,
-        voxel_size=args.merge_voxel_size,
-        use_depth_confidence=args.merge_use_depth_confidence,
-        debug=args.merge_debug,
-        chunk_size=args.merge_chunk_size,
-        disable_geometry_check=args.merge_disable_geometry_check,
-        candidate_mode=args.merge_candidate_mode,
-        patch_radius=args.merge_patch_radius,
-        voxel_neighbor_radius=args.merge_voxel_neighbor_radius,
-        max_candidates_per_token=args.merge_max_candidates_per_token,
-        local_fallback=args.merge_local_fallback,
-        profile=args.merge_profile,
-        recall_debug=args.merge_recall_debug,
-        recall_debug_max_tokens=args.merge_recall_debug_max_tokens,
-    )
-    if recent_merge_config.enabled:
-        print(
-            "Recent similarity merge enabled: "
-            f"mode={recent_merge_config.candidate_mode}, "
-            f"window={recent_merge_config.window}, "
-            f"threshold={recent_merge_config.similarity_threshold}, "
-            f"voxel_size={recent_merge_config.voxel_size}"
-        )
-    svd_eviction_merge_config = SvdEvictionMergeConfig(
-        enabled=args.enable_svd_eviction_merge,
-        mode=args.svd_eviction_merge_mode,
-        candidate_axes=args.svd_eviction_merge_candidate_axes,
-        reps_per_axis=args.svd_eviction_merge_reps_per_axis,
-        similarity_threshold=args.svd_eviction_merge_similarity_threshold,
-        use_u_sigma=args.svd_eviction_merge_use_u_sigma,
-        geometry_gate=args.svd_eviction_merge_geometry_gate,
-        voxel_neighbor_radius=args.svd_eviction_merge_voxel_neighbor_radius,
-        allow_missing_geometry=args.svd_eviction_merge_allow_missing_geometry,
-        ema_decay=args.svd_eviction_merge_ema_decay,
-        use_depth_confidence=args.svd_eviction_merge_use_depth_confidence,
-        max_candidates_per_token=args.svd_eviction_merge_max_candidates_per_token,
-        chunk_size=args.svd_eviction_merge_chunk_size,
-        debug=args.svd_eviction_merge_debug,
-        profile=args.svd_eviction_merge_profile,
-    )
-    if svd_eviction_merge_config.enabled:
-        print(
-            "SVD eviction merge enabled: "
-            f"mode={svd_eviction_merge_config.mode}, "
-            f"axes={svd_eviction_merge_config.candidate_axes}, "
-            f"reps_per_axis={svd_eviction_merge_config.reps_per_axis}, "
-            f"threshold={svd_eviction_merge_config.similarity_threshold}, "
-            f"geometry_gate={svd_eviction_merge_config.geometry_gate}"
-        )
-    voxel_covis_config = VoxelCovisConfig(
-        enabled=args.use_voxel_covis,
-        voxel_size=args.voxel_size,
-        min_shared_voxels=args.covis_min_shared_voxels,
-        min_overlap=args.covis_min_overlap,
-        max_covis_frames=args.max_covis_frames,
-        fallback_recent=args.covis_fallback_recent,
-        debug=args.covis_debug_log,
-    )
-    if voxel_covis_config.enabled:
-        print(
-            "Voxel covisibility KV filtering enabled: "
-            f"voxel_size={voxel_covis_config.voxel_size}, "
-            f"min_shared={voxel_covis_config.min_shared_voxels}, "
-            f"min_overlap={voxel_covis_config.min_overlap}, "
-            f"max_frames={voxel_covis_config.max_covis_frames}, "
-            f"fallback_recent={voxel_covis_config.fallback_recent}"
-        )
-    if global_attn_idx_ranges is not None:
-        print(f"Global attention index ranges enabled: {global_attn_idx_ranges}")
 
     print(f"Using total KV cache budget: {args.total_budget}")
     model = StreamVGGT(total_budget=args.total_budget)
@@ -394,7 +175,7 @@ def run_inference(args: argparse.Namespace):
     print(f"Loading images from input directory: {args.input_dir}")
     # image_names = sorted(glob.glob(os.path.join(args.input_dir, "*color.*")))
     image_names = sorted(glob.glob(os.path.join(args.input_dir, "*.png")))
-    
+
     if not image_names:
         print(f"Error: No images found in {args.input_dir}. Please check the path and file extensions.")
         return
@@ -474,22 +255,6 @@ def run_inference(args: argparse.Namespace):
                 leverage_diag_interval=args.leverage_diag_interval,
                 leverage_random_seed=args.leverage_random_seed,
                 leverage_eviction_selector=args.leverage_eviction_selector,
-                leverage_dpp_candidate_multiplier=args.leverage_dpp_candidate_multiplier,
-                leverage_dpp_greedy_block_size=args.leverage_dpp_greedy_block_size,
-                leverage_dpp_quality_beta=args.leverage_dpp_quality_beta,
-                leverage_dpp_recency_bonus=args.leverage_dpp_recency_bonus,
-                leverage_dpp_recency_lambda=args.leverage_dpp_recency_lambda,
-                leverage_dpp_recency_window=args.leverage_dpp_recency_window,
-                leverage_dpp_recency_gate_power=args.leverage_dpp_recency_gate_power,
-                leverage_dpp_recency_debug=args.leverage_dpp_recency_debug,
-                eviction_protect_recent_frames=args.eviction_protect_recent_frames,
-                eviction_protect_special_tokens=args.eviction_protect_special_tokens,
-                eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
-                recent_merge_config=recent_merge_config,
-                svd_eviction_merge_config=svd_eviction_merge_config,
-                voxel_covis_config=voxel_covis_config,
-                global_attn_idx_ranges=global_attn_idx_ranges,
-                global_attn_debug=args.global_attn_debug,
                 leverage_normalize_rows=args.leverage_normalize_rows,
             )
 
@@ -505,7 +270,7 @@ def run_inference(args: argparse.Namespace):
     print(f"  Model Execution Time: {model_execution_time:.4f} seconds")
     print(f"  Peak GPU Memory Usage: {peak_memory_gb:.2f} GB")
     print("="*50 + "\n")
-    
+
     if (not cache_results) or output.ress is None or len(output.ress) == 0:
         summary = {"per_frame_only": True}
         if args.frame_cache_dir:
@@ -532,7 +297,7 @@ def run_inference(args: argparse.Namespace):
 
     # Convert pose encoding to extrinsic and intrinsic matrices
     extrinsic, intrinsic = pose_encoding_to_extri_intri(
-        predictions["pose_enc"].unsqueeze(0), 
+        predictions["pose_enc"].unsqueeze(0),
         images.shape[-2:]
     )
     predictions["extrinsic"] = extrinsic.squeeze(0)
@@ -553,14 +318,14 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
-        "--input_dir", 
-        type=str, 
-        default="/examples",  
+        "--input_dir",
+        type=str,
+        default="/examples",
         help="Path to the directory containing input images."
     )
     parser.add_argument(
-        "--checkpoint_path", 
-        type=str, 
+        "--checkpoint_path",
+        type=str,
         default="../OVGGT/ckpt/checkpoints.pth",
         help="Path to the model checkpoint file (.pth)."
     )
@@ -857,285 +622,6 @@ if __name__ == "__main__":
     parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for Fast DPP recency")
     parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print Fast DPP recency prior summary statistics")
     parser.add_argument(
-        "--eviction_protect_recent_frames",
-        "--eviction-protect-recent-frames",
-        type=int,
-        default=0,
-        help=(
-            "Protect tokens from the most recent N processed frames from eviction while still "
-            "including them in SVD leverage computation."
-        ),
-    )
-    parser.add_argument(
-        "--eviction_protect_special_tokens",
-        "--eviction-protect-special-tokens",
-        action="store_true",
-        help="Protect cached camera/CLS and register tokens from eviction.",
-    )
-    parser.add_argument(
-        "--eviction_protect_special_token_interval",
-        "--eviction-protect-special-token-interval",
-        type=int,
-        default=1,
-        help="Protect special tokens only for processed frame IDs divisible by N; 1 protects every cached frame.",
-    )
-    parser.add_argument(
-        "--enable_svd_eviction_merge",
-        "--enable-svd-eviction-merge",
-        action="store_true",
-        help="Enable feature-first SVD-guided merge for tokens selected by svd_leverage eviction",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_mode",
-        "--svd-eviction-merge-mode",
-        choices=("head", "layer_candidates", "layer"),
-        default="head",
-        help="SVD eviction merge mode: per-head, shared layer candidates, or shared layer merge pairs",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_candidate_axes",
-        "--svd-eviction-merge-candidate-axes",
-        type=int,
-        default=2,
-        help="Number of low-rank leverage axes used for SVD eviction merge candidate generation",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_reps_per_axis",
-        "--svd-eviction-merge-reps-per-axis",
-        type=int,
-        default=8,
-        help="Nearest retained representatives sampled per leverage axis",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_similarity_threshold",
-        "--svd-eviction-merge-similarity-threshold",
-        type=float,
-        default=0.9,
-        help="Minimum full-key cosine similarity for SVD eviction merge",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_use_u_sigma",
-        "--svd-eviction-merge-use-u-sigma",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Scale leverage coordinates by the QR diagonal proxy before candidate generation",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_geometry_gate",
-        "--svd-eviction-merge-geometry-gate",
-        choices=("none", "voxel_neighbor"),
-        default="voxel_neighbor",
-        help="Optional soft geometry gate for SVD eviction merge",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_voxel_neighbor_radius",
-        "--svd-eviction-merge-voxel-neighbor-radius",
-        type=int,
-        default=1,
-        help="Chebyshev voxel radius accepted by SVD eviction merge geometry gate",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_allow_missing_geometry",
-        "--svd-eviction-merge-allow-missing-geometry",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Allow feature-only SVD eviction merge when voxel metadata is unavailable",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_ema_decay",
-        "--svd-eviction-merge-ema-decay",
-        type=float,
-        default=0.5,
-        help="EMA retained-token weight when confidence weighting is disabled",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_use_depth_confidence",
-        "--svd-eviction-merge-use-depth-confidence",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use accumulated depth confidence to weight SVD eviction merges",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_max_candidates_per_token",
-        "--svd-eviction-merge-max-candidates-per-token",
-        type=int,
-        default=32,
-        help="Maximum retained candidates checked per evicted token",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_chunk_size",
-        "--svd-eviction-merge-chunk-size",
-        type=int,
-        default=512,
-        help="Evicted-token chunk size for SVD eviction merge",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_debug",
-        "--svd-eviction-merge-debug",
-        action="store_true",
-        help="Print per-layer SVD eviction merge diagnostics",
-    )
-    parser.add_argument(
-        "--svd_eviction_merge_profile",
-        "--svd-eviction-merge-profile",
-        action="store_true",
-        help="Print SVD eviction merge profiling timings",
-    )
-    parser.add_argument(
-        "--enable_recent_merge",
-        "--enable-recent-merge",
-        action="store_true",
-        help="Enable sliding-window geometry-validated KV similarity merging",
-    )
-    parser.add_argument(
-        "--merge_window",
-        "--merge-window",
-        type=int,
-        default=3,
-        help="Number of previous frames considered by recent KV merging",
-    )
-    parser.add_argument(
-        "--merge_similarity_threshold",
-        "--merge-similarity-threshold",
-        type=float,
-        default=0.9,
-        help="Minimum cosine similarity for recent KV merge candidates",
-    )
-    parser.add_argument(
-        "--merge_voxel_size",
-        "--merge-voxel-size",
-        type=float,
-        default=0.05,
-        help="Voxel size in world units for recent merge geometry validation",
-    )
-    parser.add_argument(
-        "--merge_use_depth_confidence",
-        "--merge-use-depth-confidence",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use depth confidence to weight recent KV EMA merges",
-    )
-    parser.add_argument(
-        "--merge_debug",
-        "--merge-debug",
-        action="store_true",
-        help="Print per-layer recent merge diagnostics",
-    )
-    parser.add_argument(
-        "--merge_chunk_size",
-        "--merge-chunk-size",
-        type=int,
-        default=512,
-        help="Current-token chunk size for batched recent merge cosine search",
-    )
-    parser.add_argument(
-        "--merge_disable_geometry_check",
-        "--merge-disable-geometry-check",
-        action="store_true",
-        help="Disable voxel validation for ablations; geometry check is enabled by default",
-    )
-    parser.add_argument(
-        "--merge_candidate_mode",
-        "--merge-candidate-mode",
-        choices=("full", "spatial", "voxel", "voxel_spatial"),
-        default="full",
-        help="Candidate search mode for recent merge",
-    )
-    parser.add_argument(
-        "--merge_patch_radius",
-        "--merge-patch-radius",
-        type=int,
-        default=1,
-        help="Patch-grid radius for local spatial recent merge candidate search",
-    )
-    parser.add_argument(
-        "--merge_voxel_neighbor_radius",
-        "--merge-voxel-neighbor-radius",
-        type=int,
-        default=0,
-        help="Chebyshev voxel neighbor radius for local voxel recent merge candidates",
-    )
-    parser.add_argument(
-        "--merge_max_candidates_per_token",
-        "--merge-max-candidates-per-token",
-        type=int,
-        default=64,
-        help="Maximum local recent merge candidates retained per current token",
-    )
-    parser.add_argument(
-        "--merge_local_fallback",
-        "--merge-local-fallback",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Allow local candidate modes to fall back to weaker local candidates",
-    )
-    parser.add_argument(
-        "--merge_profile",
-        "--merge-profile",
-        action="store_true",
-        help="Print recent merge profiling timings",
-    )
-    parser.add_argument(
-        "--merge_recall_debug",
-        "--merge-recall-debug",
-        action="store_true",
-        help="Compare local recent merge candidates against full-window candidates for diagnostics",
-    )
-    parser.add_argument(
-        "--merge_recall_debug_max_tokens",
-        "--merge-recall-debug-max-tokens",
-        type=int,
-        default=1024,
-        help="Maximum source tokens sampled per layer/head for recent merge recall diagnostics",
-    )
-    parser.add_argument(
-        "--use_voxel_covis",
-        "--use-voxel-covis",
-        action="store_true",
-        help="Enable read-only voxel covisibility filtering for streaming KV cache reads",
-    )
-    parser.add_argument(
-        "--voxel_size",
-        "--voxel-size",
-        type=float,
-        default=0.05,
-        help="Voxel size in world units for covisibility frame selection",
-    )
-    parser.add_argument(
-        "--covis_min_shared_voxels",
-        "--covis-min-shared-voxels",
-        type=int,
-        default=20,
-        help="Minimum shared voxels required for a covisible frame",
-    )
-    parser.add_argument(
-        "--covis_min_overlap",
-        "--covis-min-overlap",
-        type=float,
-        default=0.05,
-        help="Minimum shared/min voxel overlap required for a covisible frame",
-    )
-    parser.add_argument(
-        "--max_covis_frames",
-        "--max-covis-frames",
-        type=int,
-        default=8,
-        help="Maximum number of covisible previous frames to read from KV cache; <=0 disables the cap",
-    )
-    parser.add_argument(
-        "--covis_fallback_recent",
-        "--covis-fallback-recent",
-        type=int,
-        default=1,
-        help="Fallback recent frames when covisibility selection is empty",
-    )
-    parser.add_argument(
-        "--covis_debug_log",
-        "--covis-debug-log",
-        action="store_true",
-        help="Print per-frame voxel covisibility KV filtering diagnostics",
-    )
-    parser.add_argument(
         "--global_attn_idx_ranges",
         "--global-attn-idx-ranges",
         type=str,
@@ -1166,7 +652,7 @@ if __name__ == "__main__":
         action="store_true",
         help="L2 normalize leverage score rows before SVD eviction candidate generation",
     )
-    
+
     args = parser.parse_args()
     result = run_inference(args)
 

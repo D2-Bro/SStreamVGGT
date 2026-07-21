@@ -24,9 +24,6 @@ from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.utils.load_fn import load_and_preprocess_images
 from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
 from streamvggt.utils.cache_analysis import add_eviction_nn_analysis_args, eviction_nn_config_from_args
-from streamvggt.layers.recent_merge import RecentMergeConfig
-from streamvggt.layers.svd_eviction_merge import SvdEvictionMergeConfig
-from streamvggt.layers.voxel_covis import VoxelCovisConfig
 from viser_utils import PointCloudViewer
 
 
@@ -286,59 +283,6 @@ def validate_args(args):
             "--eviction_protect_special_token_interval must be >= 1, "
             f"got {args.eviction_protect_special_token_interval}"
         )
-    if args.merge_window < 1:
-        raise ValueError(f"--merge_window must be >= 1, got {args.merge_window}")
-    if not (0.0 <= args.merge_similarity_threshold <= 1.0):
-        raise ValueError(
-            "--merge_similarity_threshold must be in [0, 1], "
-            f"got {args.merge_similarity_threshold}"
-        )
-    if args.merge_voxel_size <= 0:
-        raise ValueError(f"--merge_voxel_size must be > 0, got {args.merge_voxel_size}")
-    if args.merge_chunk_size < 1:
-        raise ValueError(f"--merge_chunk_size must be >= 1, got {args.merge_chunk_size}")
-    if args.merge_patch_radius < 0:
-        raise ValueError(f"--merge_patch_radius must be >= 0, got {args.merge_patch_radius}")
-    if args.merge_voxel_neighbor_radius < 0:
-        raise ValueError(
-            "--merge_voxel_neighbor_radius must be >= 0, "
-            f"got {args.merge_voxel_neighbor_radius}"
-        )
-    if args.merge_max_candidates_per_token < 1:
-        raise ValueError(
-            "--merge_max_candidates_per_token must be >= 1, "
-            f"got {args.merge_max_candidates_per_token}"
-        )
-    if args.merge_recall_debug_max_tokens < 1:
-        raise ValueError(
-            "--merge_recall_debug_max_tokens must be >= 1, "
-            f"got {args.merge_recall_debug_max_tokens}"
-        )
-    if args.svd_eviction_merge_candidate_axes < 1:
-        raise ValueError("--svd_eviction_merge_candidate_axes must be >= 1")
-    if args.svd_eviction_merge_reps_per_axis < 1:
-        raise ValueError("--svd_eviction_merge_reps_per_axis must be >= 1")
-    if not (0.0 <= args.svd_eviction_merge_similarity_threshold <= 1.0):
-        raise ValueError("--svd_eviction_merge_similarity_threshold must be in [0, 1]")
-    if args.svd_eviction_merge_voxel_neighbor_radius < 0:
-        raise ValueError("--svd_eviction_merge_voxel_neighbor_radius must be >= 0")
-    if not (0.0 <= args.svd_eviction_merge_ema_decay <= 1.0):
-        raise ValueError("--svd_eviction_merge_ema_decay must be in [0, 1]")
-    if args.svd_eviction_merge_max_candidates_per_token < 1:
-        raise ValueError("--svd_eviction_merge_max_candidates_per_token must be >= 1")
-    if args.svd_eviction_merge_chunk_size < 1:
-        raise ValueError("--svd_eviction_merge_chunk_size must be >= 1")
-    if args.voxel_size <= 0:
-        raise ValueError(f"--voxel_size must be > 0, got {args.voxel_size}")
-    if args.covis_min_shared_voxels < 0:
-        raise ValueError(
-            "--covis_min_shared_voxels must be >= 0, "
-            f"got {args.covis_min_shared_voxels}"
-        )
-    if not (0.0 <= args.covis_min_overlap <= 1.0):
-        raise ValueError(f"--covis_min_overlap must be in [0, 1], got {args.covis_min_overlap}")
-    if args.covis_fallback_recent < 0:
-        raise ValueError(f"--covis_fallback_recent must be >= 0, got {args.covis_fallback_recent}")
     if args.leverage_ridge_lambda < 0:
         raise ValueError(f"--leverage_ridge_lambda must be >= 0, got {args.leverage_ridge_lambda}")
     if args.leverage_ridge_jitter <= 0:
@@ -365,51 +309,6 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
     images = load_and_preprocess_images(img_paths).to(device)
     inputs = [{"img": img.unsqueeze(0)} for img in images]
 
-    recent_merge_config = RecentMergeConfig(
-        enabled=args.enable_recent_merge,
-        window=args.merge_window,
-        similarity_threshold=args.merge_similarity_threshold,
-        voxel_size=args.merge_voxel_size,
-        use_depth_confidence=args.merge_use_depth_confidence,
-        debug=args.merge_debug,
-        chunk_size=args.merge_chunk_size,
-        disable_geometry_check=args.merge_disable_geometry_check,
-        candidate_mode=args.merge_candidate_mode,
-        patch_radius=args.merge_patch_radius,
-        voxel_neighbor_radius=args.merge_voxel_neighbor_radius,
-        max_candidates_per_token=args.merge_max_candidates_per_token,
-        local_fallback=args.merge_local_fallback,
-        profile=args.merge_profile,
-        recall_debug=args.merge_recall_debug,
-        recall_debug_max_tokens=args.merge_recall_debug_max_tokens,
-    )
-    svd_eviction_merge_config = SvdEvictionMergeConfig(
-        enabled=args.enable_svd_eviction_merge,
-        mode=args.svd_eviction_merge_mode,
-        candidate_axes=args.svd_eviction_merge_candidate_axes,
-        reps_per_axis=args.svd_eviction_merge_reps_per_axis,
-        similarity_threshold=args.svd_eviction_merge_similarity_threshold,
-        use_u_sigma=args.svd_eviction_merge_use_u_sigma,
-        geometry_gate=args.svd_eviction_merge_geometry_gate,
-        voxel_neighbor_radius=args.svd_eviction_merge_voxel_neighbor_radius,
-        allow_missing_geometry=args.svd_eviction_merge_allow_missing_geometry,
-        ema_decay=args.svd_eviction_merge_ema_decay,
-        use_depth_confidence=args.svd_eviction_merge_use_depth_confidence,
-        max_candidates_per_token=args.svd_eviction_merge_max_candidates_per_token,
-        chunk_size=args.svd_eviction_merge_chunk_size,
-        debug=args.svd_eviction_merge_debug,
-        profile=args.svd_eviction_merge_profile,
-    )
-    voxel_covis_config = VoxelCovisConfig(
-        enabled=args.use_voxel_covis,
-        voxel_size=args.voxel_size,
-        min_shared_voxels=args.covis_min_shared_voxels,
-        min_overlap=args.covis_min_overlap,
-        max_covis_frames=args.max_covis_frames,
-        fallback_recent=args.covis_fallback_recent,
-        debug=args.covis_debug_log,
-    )
-    covis_log_fn = print if args.covis_debug_log else None
     eviction_nn_analysis_config = eviction_nn_config_from_args(args)
 
     if torch.cuda.is_available() and str(device).startswith("cuda"):
@@ -455,10 +354,6 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             eviction_protect_recent_frames=args.eviction_protect_recent_frames,
             eviction_protect_special_tokens=args.eviction_protect_special_tokens,
             eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
-            recent_merge_config=recent_merge_config,
-            svd_eviction_merge_config=svd_eviction_merge_config,
-            voxel_covis_config=voxel_covis_config,
-            covis_log_fn=covis_log_fn,
             global_attn_idx_ranges=global_attn_idx_ranges,
             global_attn_debug=args.global_attn_debug,
         )
@@ -646,59 +541,6 @@ def main():
     parser.add_argument("--eviction_protect_special_tokens", "--eviction-protect-special-tokens", action="store_true")
     parser.add_argument("--eviction_protect_special_token_interval", "--eviction-protect-special-token-interval", type=int, default=1)
     add_eviction_nn_analysis_args(parser)
-    parser.add_argument("--enable_svd_eviction_merge", "--enable-svd-eviction-merge", action="store_true")
-    parser.add_argument(
-        "--svd_eviction_merge_mode",
-        "--svd-eviction-merge-mode",
-        choices=("head", "layer_candidates", "layer"),
-        default="head",
-    )
-    parser.add_argument("--svd_eviction_merge_candidate_axes", "--svd-eviction-merge-candidate-axes", type=int, default=2)
-    parser.add_argument("--svd_eviction_merge_reps_per_axis", "--svd-eviction-merge-reps-per-axis", type=int, default=8)
-    parser.add_argument("--svd_eviction_merge_similarity_threshold", "--svd-eviction-merge-similarity-threshold", type=float, default=0.9)
-    parser.add_argument("--svd_eviction_merge_use_u_sigma", "--svd-eviction-merge-use-u-sigma", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--svd_eviction_merge_geometry_gate",
-        "--svd-eviction-merge-geometry-gate",
-        choices=("none", "voxel_neighbor"),
-        default="voxel_neighbor",
-    )
-    parser.add_argument("--svd_eviction_merge_voxel_neighbor_radius", "--svd-eviction-merge-voxel-neighbor-radius", type=int, default=1)
-    parser.add_argument("--svd_eviction_merge_allow_missing_geometry", "--svd-eviction-merge-allow-missing-geometry", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--svd_eviction_merge_ema_decay", "--svd-eviction-merge-ema-decay", type=float, default=0.5)
-    parser.add_argument("--svd_eviction_merge_use_depth_confidence", "--svd-eviction-merge-use-depth-confidence", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--svd_eviction_merge_max_candidates_per_token", "--svd-eviction-merge-max-candidates-per-token", type=int, default=32)
-    parser.add_argument("--svd_eviction_merge_chunk_size", "--svd-eviction-merge-chunk-size", type=int, default=512)
-    parser.add_argument("--svd_eviction_merge_debug", "--svd-eviction-merge-debug", action="store_true")
-    parser.add_argument("--svd_eviction_merge_profile", "--svd-eviction-merge-profile", action="store_true")
-    parser.add_argument("--enable_recent_merge", "--enable-recent-merge", action="store_true")
-    parser.add_argument("--merge_window", "--merge-window", type=int, default=1)
-    parser.add_argument("--merge_similarity_threshold", "--merge-similarity-threshold", type=float, default=0.9)
-    parser.add_argument("--merge_voxel_size", "--merge-voxel-size", type=float, default=0.05)
-    parser.add_argument("--merge_use_depth_confidence", "--merge-use-depth-confidence", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--merge_debug", "--merge-debug", action="store_true")
-    parser.add_argument("--merge_chunk_size", "--merge-chunk-size", type=int, default=512)
-    parser.add_argument("--merge_disable_geometry_check", "--merge-disable-geometry-check", action="store_true")
-    parser.add_argument(
-        "--merge_candidate_mode",
-        "--merge-candidate-mode",
-        choices=("full", "spatial", "voxel", "voxel_spatial"),
-        default="full",
-    )
-    parser.add_argument("--merge_patch_radius", "--merge-patch-radius", type=int, default=1)
-    parser.add_argument("--merge_voxel_neighbor_radius", "--merge-voxel-neighbor-radius", type=int, default=0)
-    parser.add_argument("--merge_max_candidates_per_token", "--merge-max-candidates-per-token", type=int, default=64)
-    parser.add_argument("--merge_local_fallback", "--merge-local-fallback", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--merge_profile", "--merge-profile", action="store_true")
-    parser.add_argument("--merge_recall_debug", "--merge-recall-debug", action="store_true")
-    parser.add_argument("--merge_recall_debug_max_tokens", "--merge-recall-debug-max-tokens", type=int, default=1024)
-    parser.add_argument("--use_voxel_covis", "--use-voxel-covis", action="store_true")
-    parser.add_argument("--voxel_size", "--voxel-size", type=float, default=0.05)
-    parser.add_argument("--covis_min_shared_voxels", "--covis-min-shared-voxels", type=int, default=20)
-    parser.add_argument("--covis_min_overlap", "--covis-min-overlap", type=float, default=0.05)
-    parser.add_argument("--max_covis_frames", "--max-covis-frames", type=int, default=8)
-    parser.add_argument("--covis_fallback_recent", "--covis-fallback-recent", type=int, default=1)
-    parser.add_argument("--covis_debug_log", "--covis-debug-log", action="store_true")
     parser.add_argument("--global_attn_idx_ranges", "--global-attn-idx-ranges", type=str, default=None)
     parser.add_argument("--middle_global_only", "--middle-global-only", action="store_true")
     parser.add_argument("--global_attn_debug", "--global-attn-debug", action="store_true")

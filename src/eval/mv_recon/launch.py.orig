@@ -212,11 +212,6 @@ def get_args_parser():
         default=0.02,
         help="Metric voxel size for --recon_eval_mode voxel_icp",
     )
-    parser.add_argument(
-        "--eval_metrics_on_voxels",
-        action="store_true",
-        help="Compute reconstruction metrics on voxel centroids instead of full-resolution points",
-    )
     parser.add_argument("--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)")
     parser.add_argument("--budget_frame_multiplier", type=float, default=None, help="Set StreamVGGT total budget to ceil(multiplier * tokens_per_frame) * num_global_layers; overrides --budget")
     return parser
@@ -237,9 +232,7 @@ def main(args):
         print(
             "Using reconstruction evaluator: "
             f"mode=voxel_icp, voxel_size={args.eval_voxel_size}, "
-            "alignment=umeyama_sim3_then_icp, icp_threshold=0.1, "
-            "points=direct_predicted_3d, "
-            f"metrics={'voxel_centroids' if args.eval_metrics_on_voxels else 'full_points'}"
+            "icp_threshold=0.1, points=direct_predicted_3d, metrics=full_points"
         )
     if args.eviction_policy == "svd_leverage":
         print(
@@ -278,7 +271,7 @@ def main(args):
             f"layer_budget_norm_source={args.layer_budget_norm_source}, "
         )
     add_path_to_dust3r(args.weights)
-    from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D, ETH3D_undistort
+    from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D, Replica
     from eval.mv_recon.eval_scene_voxel_icp import eval_scene_voxel_icp
     from eval.mv_recon.utils import accuracy, completion
 
@@ -309,18 +302,6 @@ def main(args):
             full_video=True,
             kf_every=2,
             # test_id=[ "kitchen", "grey_white_room", "green_room"]
-        ),
-        "ETH3D": ETH3D(
-            ROOT="/home/dongjae/data/eth3d",
-            full_video=True,
-            resolution=resolution,
-            kf_every=1,
-        ),
-        "ETH3D_undistort": ETH3D_undistort(
-            ROOT="/home/dongjae/data/eth3d",
-            full_video=True,
-            resolution=resolution,
-            kf_every=1,
         ),
     }
 
@@ -611,18 +592,15 @@ def main(args):
                                 voxel_size=args.eval_voxel_size,
                                 eval_frame_stride=args.eval_frame_stride,
                                 icp_threshold=0.1,
-                                metrics_on_voxels=args.eval_metrics_on_voxels,
+                                criterion=criterion,
                             )
                             voxel_diag_msg = (
                                 f"Voxel ICP eval for {scene_id}: "
                                 f"voxel_size={args.eval_voxel_size}, "
                                 f"frames={voxel_result.eval_frame_count}/{len(batch)}, "
                                 f"raw_valid={voxel_result.raw_valid_points}, "
-                                f"sampled_valid={voxel_result.sampled_valid_points}, "
                                 f"removed_nonfinite={voxel_result.removed_nonfinite_points}, "
-                                f"metric_source={'voxel_centroids' if args.eval_metrics_on_voxels else 'full_points'}, "
-                                f"metric_pred_points={voxel_result.metric_pred_points}, "
-                                f"metric_gt_points={voxel_result.metric_gt_points}, "
+                                f"metric_points={voxel_result.raw_valid_points - voxel_result.removed_nonfinite_points}, "
                                 f"pred_voxels={voxel_result.pred_voxels}, "
                                 f"gt_voxels={voxel_result.gt_voxels}, "
                                 f"icp_fitness={voxel_result.icp_fitness}, "
@@ -663,8 +641,6 @@ def main(args):
                         pts_all = []
                         pts_gt_all = []
                         images_all = []
-                        masks_all = []
-                        conf_all = []
                         eval_frame_count = 0
                         sampling_rng = np.random.default_rng(seed=42)
 
@@ -690,54 +666,47 @@ def main(args):
 
                             pts_gt = gt_pts[j].detach().cpu().numpy()[0]
 
+                            # H, W = image.shape[:2]
+                            # cx = W // 2
+                            # cy = H // 2
+                            # l, t = cx - 112, cy - 112
+                            # r, b = cx + 112, cy + 112
+                            # image = image[t:b, l:r]
+                            # mask = mask[t:b, l:r]
+                            # pts = pts[t:b, l:r]
+                            # pts_gt = pts_gt[t:b, l:r]
+
+                            # Uniformly sample at most 224x224 GT-valid pixels per frame.
                             H, W = image.shape[:2]
-                            cx = W // 2
-                            cy = H // 2
-                            l, t = cx - 112, cy - 112
-                            r, b = cx + 112, cy + 112
-                            image = image[t:b, l:r]
-                            mask = mask[t:b, l:r]
-                            pts = pts[t:b, l:r]
-                            pts_gt = pts_gt[t:b, l:r]
+                            if (H, W) == (392, 518):
+                                valid_mask = mask.astype(bool, copy=False)
+                                valid_indices = np.flatnonzero(valid_mask)
+                                max_samples = 224 * 224
+                                if len(valid_indices) > max_samples:
+                                    valid_indices = sampling_rng.choice(
+                                        valid_indices,
+                                        size=max_samples,
+                                        replace=False,
+                                    )
+                                sampling_mask = np.zeros(
+                                    valid_mask.size, dtype=bool
+                                )
+                                sampling_mask[valid_indices] = True
+                                sampling_mask = sampling_mask.reshape(H, W)
+                                mask = sampling_mask
 
                             # Align predicted 3D points to the ground truth
                             # pts = geotrf(in_camera1, pts)
                             # pts_gt = geotrf(in_camera1, pts_gt)
 
-                            images_all.append(image[None, ...])
-                            pts_all.append(pts[None, ...])
-                            pts_gt_all.append(pts_gt[None, ...])
-                            masks_all.append(mask[None, ...])
-                            conf_all.append(conf[None, ...])
-
-                            # Uniformly sample at most 224x224 GT-valid pixels per frame.
-                            # H, W = image.shape[:2]
-                            # if (H, W) == (392, 518):
-                            #     valid_mask = mask.astype(bool, copy=False)
-                            #     valid_indices = np.flatnonzero(valid_mask)
-                            #     max_samples = 224 * 224
-                            #     if len(valid_indices) > max_samples:
-                            #         valid_indices = sampling_rng.choice(
-                            #             valid_indices,
-                            #             size=max_samples,
-                            #             replace=False,
-                            #         )
-                            #     sampling_mask = np.zeros(
-                            #         valid_mask.size, dtype=bool
-                            #     )
-                            #     sampling_mask[valid_indices] = True
-                            #     sampling_mask = sampling_mask.reshape(H, W)
-                            #     mask = sampling_mask
-
-                            # selected_mask = mask.astype(bool, copy=False)
-                            # images_all.append(
-                            #     image[selected_mask].reshape(-1, 3)
-                            # )
-                            # pts_all.append(pts[selected_mask].reshape(-1, 3))
-                            # pts_gt_all.append(
-                            #     pts_gt[selected_mask].reshape(-1, 3)
-                            # )
-                            
+                            selected_mask = mask.astype(bool, copy=False)
+                            images_all.append(
+                                image[selected_mask].reshape(-1, 3)
+                            )
+                            pts_all.append(pts[selected_mask].reshape(-1, 3))
+                            pts_gt_all.append(
+                                pts_gt[selected_mask].reshape(-1, 3)
+                            )
 
                     scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
                     if args.eval_frame_stride > 1:
@@ -751,14 +720,12 @@ def main(args):
                     images_all = np.concatenate(images_all, axis=0)
                     pts_all = np.concatenate(pts_all, axis=0)
                     pts_gt_all = np.concatenate(pts_gt_all, axis=0)
-                    masks_all = np.concatenate(masks_all, axis=0)
 
                     save_params = {}
 
                     save_params["images_all"] = images_all
                     save_params["pts_all"] = pts_all
                     save_params["pts_gt_all"] = pts_gt_all
-                    save_params["masks_all"] = masks_all
 
                     # np.save(
                     #     os.path.join(save_path, f"{scene_id.replace('/', '_')}.npy"),
@@ -770,23 +737,32 @@ def main(args):
                     else:
                         threshold = 0.1
 
-                    pts_all_masked = pts_all[masks_all > 0]
-                    pts_gt_all_masked = pts_gt_all[masks_all > 0]
-                    images_all_masked = images_all[masks_all > 0]
+                    pred_finite_mask = np.isfinite(pts_all).all(axis=-1)
+                    gt_finite_mask = np.isfinite(pts_gt_all).all(axis=-1)
+                    finite_mask = pred_finite_mask & gt_finite_mask
 
-                    mask = np.isfinite(pts_all_masked)  
-                    pts_all_masked = pts_all_masked[mask]
+                    num_sampled_points = int(finite_mask.size)
+                    num_removed_points = int((~finite_mask).sum())
+                    num_remaining_points = num_sampled_points - num_removed_points
+                    removed_ratio = (
+                        num_removed_points / num_sampled_points
+                        if num_sampled_points > 0
+                        else 0.0
+                    )
+                    finite_stats_msg = (
+                        f"Non-finite point filtering for {scene_id}: "
+                        f"sampled={num_sampled_points}, "
+                        f"removed={num_removed_points} ({removed_ratio:.2%}), "
+                        f"remaining={num_remaining_points}, "
+                        f"pred_nonfinite={int((~pred_finite_mask).sum())}, "
+                        f"gt_nonfinite={int((~gt_finite_mask).sum())}"
+                    )
+                    print(finite_stats_msg)
+                    print(finite_stats_msg, file=open(log_file, "a"))
 
-                    mask_gt = np.isfinite(pts_gt_all_masked)
-                    pts_gt_all_masked = pts_gt_all_masked[mask]
-
-                    # pred_finite_mask = np.isfinite(pts_all).all(axis=-1)
-                    # gt_finite_mask = np.isfinite(pts_gt_all).all(axis=-1)
-                    # finite_mask = pred_finite_mask & gt_finite_mask
-
-                    # pts_all = pts_all[finite_mask]
-                    # pts_gt_all = pts_gt_all[finite_mask]
-                    # images_all = images_all[finite_mask]
+                    pts_all = pts_all[finite_mask]
+                    pts_gt_all = pts_gt_all[finite_mask]
+                    images_all = images_all[finite_mask]
 
                     if args.use_proj:
                         def umeyama_alignment(src: np.ndarray, dst: np.ndarray, with_scale: bool = True):
@@ -824,14 +800,8 @@ def main(args):
                         pts_all = (s * (R @ pts_all.T)).T + t  # (N,3)
 
                     pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(
-                        pts_all_masked.reshape(-1, 3)
-                    )
-                    pcd.colors = o3d.utility.Vector3dVector(
-                        images_all_masked.reshape(-1, 3)
-                    )
-                    # pcd.points = o3d.utility.Vector3dVector(pts_all)
-                    # pcd.colors = o3d.utility.Vector3dVector(images_all)
+                    pcd.points = o3d.utility.Vector3dVector(pts_all)
+                    pcd.colors = o3d.utility.Vector3dVector(images_all)
                     # o3d.io.write_point_cloud(
                     #     os.path.join(
                     #         save_path, f"{scene_id.replace('/', '_')}-mask.ply"
@@ -840,14 +810,8 @@ def main(args):
                     # )
 
                     pcd_gt = o3d.geometry.PointCloud()
-                    pcd_gt.points = o3d.utility.Vector3dVector(
-                        pts_gt_all_masked.reshape(-1, 3)
-                    )
-                    pcd_gt.colors = o3d.utility.Vector3dVector(
-                        images_all_masked.reshape(-1, 3)
-                    )
-                    # pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_all)
-                    # pcd_gt.colors = o3d.utility.Vector3dVector(images_all)
+                    pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_all)
+                    pcd_gt.colors = o3d.utility.Vector3dVector(images_all)
                     # o3d.io.write_point_cloud(
                     #     os.path.join(save_path, f"{scene_id.replace('/', '_')}-gt.ply"),
                     #     pcd_gt,

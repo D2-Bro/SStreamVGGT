@@ -175,23 +175,9 @@ class Block(nn.Module):
         layer_budget_eps: float = 1e-12,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
-        eviction_protect_recent_frames: int = 0,
-        eviction_protect_special_tokens: bool = False,
-        eviction_protect_special_token_interval: int = 1,
-        special_token_count: int = 0,
         anchor_token_count: Optional[int] = None,
-        window_token_count: int = 0,
-        recent_merge_config=None,
-        svd_eviction_merge_config=None,
-        voxel_covis_frame_ids=None,
-        voxel_covis_enabled: bool = False,
-        voxel_covis_fallback_recent: int = 0,
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
-        global_cache_history_anchor_special_tokens_only: bool = False,
-        history_anchor_frame_ids=None,
-        history_anchor_patch_topk_per_frame: int = 0,
-        history_anchor_max_frames: int = 0,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             
         def attn_residual_func(
@@ -275,27 +261,10 @@ class Block(nn.Module):
                     layer_budget_eps=layer_budget_eps,
                     slots_per_direction=slots_per_direction,
                     hybrid_beta=hybrid_beta,
-                    eviction_protect_recent_frames=eviction_protect_recent_frames,
-                    eviction_protect_special_tokens=eviction_protect_special_tokens,
-                    eviction_protect_special_token_interval=eviction_protect_special_token_interval,
-                    special_token_count=special_token_count,
                     anchor_token_count=anchor_token_count,
-                    window_token_count=window_token_count,
-                    recent_merge_config=recent_merge_config,
-                    svd_eviction_merge_config=svd_eviction_merge_config,
-                    voxel_covis_frame_ids=voxel_covis_frame_ids,
-                    voxel_covis_enabled=voxel_covis_enabled,
-                    voxel_covis_fallback_recent=voxel_covis_fallback_recent,
                     cache_write_current_frame=cache_write_current_frame,
                     cache_evict_current_frame=cache_evict_current_frame,
-                    global_cache_history_anchor_special_tokens_only=global_cache_history_anchor_special_tokens_only,
-                    history_anchor_frame_ids=history_anchor_frame_ids,
-                    history_anchor_patch_topk_per_frame=history_anchor_patch_topk_per_frame,
-                    history_anchor_max_frames=history_anchor_max_frames,
                 )
-                if len(attn_result) == 4:
-                    output, new_kv, scores, special_kv_sidecar = attn_result
-                    return self.ls1(output), new_kv, scores, special_kv_sidecar
                 output, new_kv, scores = attn_result
                 return self.ls1(output), new_kv, scores
             else:
@@ -326,9 +295,6 @@ class Block(nn.Module):
             self._profile_record("block", block_start, x, profile_block)
             self._profile_record("cache_block", block_start, x, profile_block)
             self._block_profile_count += 1 if profile_block else 0
-            if len(cache_result) == 4:
-                _, new_kv, scores, special_kv_sidecar = cache_result
-                return x, new_kv, scores, special_kv_sidecar
             _, new_kv, scores = cache_result
             return x, new_kv, scores
 

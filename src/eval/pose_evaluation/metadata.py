@@ -4,7 +4,7 @@ from tqdm import tqdm
 
 
 def _seven_scenes_root():
-    return os.environ.get("SSTREAMVGGT_7SCENES_ROOT", "/home/dongjae/data/7scenes_sfm")
+    return os.environ.get("SSTREAMVGGT_7SCENES_ROOT", "/home/dongjae/data/7scenes")
 
 
 def _seven_scenes_seq_from_split_line(line):
