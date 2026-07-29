@@ -27,14 +27,6 @@ from streamvggt.utils.cache_analysis import add_eviction_nn_analysis_args, evict
 from viser_utils import PointCloudViewer
 
 
-def resolve_global_attn_idx_ranges(args):
-    if args.middle_global_only and args.global_attn_idx_ranges is not None:
-        raise ValueError("--middle-global-only cannot be combined with --global-attn-idx-ranges")
-    if args.middle_global_only:
-        return "9:"
-    return args.global_attn_idx_ranges
-
-
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.webp'}
 
 
@@ -273,6 +265,17 @@ def validate_args(args):
             "--layer_budget_strategy leverage/covariance-based modes require "
             "--eviction_policy svd_leverage and --leverage_granularity layer"
         )
+    if args.layer_budget_score_only:
+        if args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer":
+            raise ValueError(
+                "--layer-budget-score-only requires --eviction-policy svd_leverage "
+                "and --leverage-granularity layer"
+            )
+        if args.layer_budget_strategy != "value_weighted_leverage_pr":
+            raise ValueError(
+                "--layer-budget-score-only requires "
+                "--layer-budget-strategy value_weighted_leverage_pr"
+            )
     if args.eviction_protect_recent_frames < 0:
         raise ValueError(
             "--eviction_protect_recent_frames must be >= 0, "
@@ -304,7 +307,7 @@ def validate_args(args):
 
 
 @torch.no_grad()
-def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
+def run_inference(model, img_paths, args):
     device = args.device
     images = load_and_preprocess_images(img_paths).to(device)
     inputs = [{"img": img.unsqueeze(0)} for img in images]
@@ -342,6 +345,7 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             leverage_dpp_recency_gate_power=args.leverage_dpp_recency_gate_power,
             leverage_dpp_recency_debug=args.leverage_dpp_recency_debug,
             layer_budget_strategy=args.layer_budget_strategy,
+            layer_budget_score_only=args.layer_budget_score_only,
             layer_budget_alpha=args.layer_budget_alpha,
             layer_budget_min_tokens=args.layer_budget_min_tokens,
             layer_budget_eps=args.layer_budget_eps,
@@ -354,8 +358,6 @@ def run_inference(model, img_paths, args, global_attn_idx_ranges=None):
             eviction_protect_recent_frames=args.eviction_protect_recent_frames,
             eviction_protect_special_tokens=args.eviction_protect_special_tokens,
             eviction_protect_special_token_interval=args.eviction_protect_special_token_interval,
-            global_attn_idx_ranges=global_attn_idx_ranges,
-            global_attn_debug=args.global_attn_debug,
         )
 
     # Unpack structured results directly to tensors
@@ -529,6 +531,13 @@ def main():
         default="leverage_pr",
         choices=("uniform", "leverage_pr", "covariance_pr", "hybrid_cap", "hybrid_geom", "leverage_entropy", "depth_weighted_leverage_pr", "value_weighted_leverage_pr", "value_weighted_covariance_pr", "value_weighted_hybrid_cap", "value_weighted_hybrid_geom"),
     )
+    parser.add_argument(
+        "--layer_budget_score_only",
+        "--layer-budget-score-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute value_weighted_leverage_pr every frame without removing KV cache tokens",
+    )
     parser.add_argument("--layer_budget_alpha", "--layer-budget-alpha", type=float, default=1.0)
     parser.add_argument("--layer_budget_min_tokens", "--layer-budget-min-tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", "--layer-budget-eps", type=float, default=1e-12)
@@ -541,12 +550,8 @@ def main():
     parser.add_argument("--eviction_protect_special_tokens", "--eviction-protect-special-tokens", action="store_true")
     parser.add_argument("--eviction_protect_special_token_interval", "--eviction-protect-special-token-interval", type=int, default=1)
     add_eviction_nn_analysis_args(parser)
-    parser.add_argument("--global_attn_idx_ranges", "--global-attn-idx-ranges", type=str, default=None)
-    parser.add_argument("--middle_global_only", "--middle-global-only", action="store_true")
-    parser.add_argument("--global_attn_debug", "--global-attn-debug", action="store_true")
     args = parser.parse_args()
     validate_args(args)
-    global_attn_idx_ranges = resolve_global_attn_idx_ranges(args)
 
     # Load Data
     print(f"Loading from {args.seq_path}...")
@@ -579,7 +584,7 @@ def main():
     model.eval()
 
     # Inference & Save
-    preds = run_inference(model, img_paths, args, global_attn_idx_ranges)
+    preds = run_inference(model, img_paths, args)
     vis_data = save_and_format(preds, args.output_dir)
 
     # Alignment (if GT exists)

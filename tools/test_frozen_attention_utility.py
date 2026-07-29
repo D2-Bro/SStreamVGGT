@@ -172,6 +172,38 @@ def test_unobserved_tokens_keep_full_leverage_score() -> None:
     assert torch.equal(all_unobserved, scores)
 
 
+def test_beta_one_preserves_all_current_frame_tokens() -> None:
+    raw_scores = torch.tensor([[0.9, 0.8, 0.1, 0.0]])
+
+    def fixed_scores(self, candidate_k, candidate_v=None, return_basis=False):
+        out = raw_scores.to(candidate_k.device)
+        return (out, None) if return_basis else out
+
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_eviction_selector="topk",
+    )
+    manager._layer_svd_leverage_scores = MethodType(fixed_scores, manager)
+    k = torch.randn(1, 2, 4, 4)
+    v = torch.randn_like(k)
+    result = manager.select(
+        k,
+        2,
+        0,
+        v=v,
+        candidate_frame_ids=torch.tensor([[0, 0, 1, 1]], dtype=torch.int32),
+        current_frame_idx=1,
+        candidate_attention_utility=torch.tensor([[2.0, 1.0, 0.0, 0.0]]),
+        candidate_attention_observed=torch.tensor([[True, True, False, False]]),
+        attention_utility_beta=1.0,
+    )
+    assert torch.equal(
+        result.kept_candidate_indices,
+        torch.tensor([[[2, 3], [2, 3]]]),
+    )
+
+
 def test_cuda_attention_reference_if_available() -> None:
     if not torch.cuda.is_available():
         return
@@ -228,6 +260,8 @@ def test_cuda_beta_zero_pre_eviction_cache_parity_if_available() -> None:
         tokens_per_frame=8,
         eviction_policy="svd_leverage",
         leverage_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=4,
         leverage_eviction_selector="topk",
         leverage_conf_gate=True,
         leverage_attention_beta=0.0,
@@ -286,6 +320,8 @@ def test_cuda_pre_attention_eviction_if_available() -> None:
         tokens_per_frame=8,
         eviction_policy="svd_leverage",
         leverage_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=4,
         leverage_eviction_selector="topk",
         leverage_attention_utility=True,
         leverage_attention_beta=0.2,
@@ -324,6 +360,42 @@ def test_cuda_pre_attention_eviction_if_available() -> None:
     assert torch.all((state.attention_count >= 1) & (state.attention_count <= 5))
 
 
+def test_frame_gate_vectorized_layouts() -> None:
+    devices = [torch.device("cpu")]
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda"))
+    for device in devices:
+        frame_ids = torch.tensor(
+            [
+                [0, 1, 7, 7, 7],
+                [7, 2, 7, 3, 7],
+                [0, 7, 1, 7, 3],
+            ],
+            device=device, dtype=torch.int32,
+        )
+        token_indices = torch.tensor(
+            [
+                [0, 0, 0, 1, 2],
+                [2, 0, 0, 0, 1],
+                [0, 0, 0, 2, 0],
+            ],
+            device=device, dtype=torch.int32,
+        )
+        initial = torch.full((3, 5), 0.5, device=device, dtype=torch.float16)
+        gate_sum, gate_count = KVConfidenceState._stats_from_gate(initial)
+        state = KVConfidenceState(frame_ids, token_indices, initial.clone(), gate_sum, gate_count)
+        updates = torch.tensor([[0.2, 0.4, 0.6], [0.3, 0.5, 0.7], [0.1, 0.8, 0.9]], device=device)
+        state.update_frame_gate(7, updates)
+        expected = initial.clone()
+        mask = frame_ids.eq(7)
+        batch_ids = torch.arange(3, device=device).view(3, 1).expand_as(frame_ids)
+        expected[mask] = updates[batch_ids[mask], token_indices[mask].long()].to(expected.dtype)
+        assert torch.equal(state.confidence_gate, expected)
+        expected_sum, expected_count = KVConfidenceState._stats_from_gate(expected)
+        assert torch.allclose(state.gate_sum, expected_sum)
+        assert torch.equal(state.gate_count, expected_count)
+
+
 def main() -> None:
     test_five_updates_then_freeze()
     test_attention_normalizer_matches_bias_corrected_ema()
@@ -333,6 +405,8 @@ def main() -> None:
     test_beta_zero_and_attention_tiebreak()
     test_mean_normalization_preserves_score_ratios()
     test_unobserved_tokens_keep_full_leverage_score()
+    test_beta_one_preserves_all_current_frame_tokens()
+    test_frame_gate_vectorized_layouts()
     test_cuda_attention_reference_if_available()
     test_cuda_beta_zero_pre_eviction_cache_parity_if_available()
     test_cuda_pre_attention_eviction_if_available()

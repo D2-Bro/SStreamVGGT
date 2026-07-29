@@ -88,32 +88,56 @@ conda install 'llvm-openmp<16'
 
 ## ▶️ Run Inference
 ```bash
-# Run on your own data
-python run_inference.py --input_dir path/to/your/images_dir
+# Run mv_recon inference on all naturally sorted images in a directory
+python run_inference.py \
+    --input_dir path/to/your/images_dir \
+    --output_dir path/to/inference_results
 
 # Run long sequence and store the result to directory for each frame
 python run_inference.py \
     --input_dir path/to/your/images_dir \
     --frame_cache_dir path/to/your/results_perframe_dir \
     --no_cache_results
-
-# AVGGT-style global-to-frame conversion: keep global attention from global_idx >= 9
-python run_inference.py \
-    --input_dir path/to/your/images_dir \
-    --global-attn-idx-ranges 9:
-
-# Keep only a middle global-attention window
-python run_inference.py \
-    --input_dir path/to/your/images_dir \
-    --global-attn-idx-ranges 9:20
-
-# Keep multiple global-attention windows
-python run_inference.py \
-    --input_dir path/to/your/images_dir \
-    --global-attn-idx-ranges 6:10,14:20
 ```
 
-`--global-attn-idx-ranges` uses zero-based indices over original global-attention blocks only, not raw transformer block indices. Ranges are half-open: `9:` means `global_idx >= 9`, `9:20` means `9 <= global_idx < 20`, `:9` means `global_idx < 9`, and `12` keeps only `global_idx == 12`. `--middle-global-only` is a shortcut for `--global-attn-idx-ranges 9:`. In this mode, the total KV cache budget is redistributed across enabled global indices only; disabled global indices do not read/write cache and receive zero budget.
+The default preset matches `src/eval/mv_recon/run_final.sh`: SVD-leverage
+eviction with layer-wise right-sketch ridge scoring, projected-key caching,
+confidence gating, and value-weighted layer budgets. Supported input formats
+are PNG, JPEG, WebP, BMP, and TIFF. All images are processed by default; use
+`--frame_stride` or `--max_frames` to select a subset.
+
+To measure `value_weighted_leverage_pr` on the full cache without removing any
+KV tokens, enable score-only mode:
+
+```bash
+python run_inference.py \
+    --input_dir path/to/your/images_dir \
+    --layer-budget-score-only
+```
+
+In this mode `total_budget` is a shadow layer-allocation budget only. The live
+KV cache grows with the sequence, so GPU memory use is unbounded.
+
+The output directory contains:
+
+- `reconstruction.ply`: colored direct world-point predictions.
+- `cameras.ply`: tube-wireframe camera frustums with RGB local axes and a camera trajectory.
+- `poses.npz` and `trajectory.txt`: numeric world-to-camera, camera-to-world,
+  intrinsic, and trajectory results.
+- `depth/*.npy` and `depth/*.png`: float32 depth and sequence-normalized Turbo
+  visualizations.
+- `manifest.json`: input order, coordinate conventions, filters, depth display
+  range, and inference settings.
+
+These results remain in the model-predicted common scene scale because arbitrary
+input images do not provide ground truth for the scale/shift alignment used by
+the reconstruction evaluator. Use `--conf_thresh`, `--point_stride`, or
+`--voxel_size` when a smaller or more selective reconstruction PLY is desired.
+Camera visualization auto-limits frustums to about 50 by default and can be
+tuned with `--camera_size`, `--camera_thickness`, `--camera_stride`,
+`--no-camera-axes`, and `--no-camera-trajectory`.
+`--output_path` can additionally save the complete raw prediction dictionary as
+a PyTorch file.
 
 ```bash
 # Multi-view reconstruction evaluation
@@ -122,14 +146,6 @@ accelerate launch --num_processes 1 --main_process_port 29602 ./eval/mv_recon/la
     --output_dir path/to/output_dir \
     --model_name StreamVGGT \
     --max_frames 300
-
-# AVGGT-style evaluation
-accelerate launch --num_processes 1 --main_process_port 29602 ./eval/mv_recon/launch.py \
-    --weights path/to/checkpoints.pth \
-    --output_dir path/to/output_dir \
-    --model_name StreamVGGT \
-    --max_frames 300 \
-    --global-attn-idx-ranges 9:
 ```
 
 ## 🚀 Run Demo

@@ -1,0 +1,190 @@
+import torch
+
+from streamvggt.layers.eviction import (
+    EvictionManager,
+    _allocate_layer_budgets_from_scores,
+    _combine_value_weighted_leverage_pr_scores,
+    _integer_allocate_by_weights,
+    _layer_score_leverage_pr,
+)
+from streamvggt.models.aggregator import Aggregator
+
+
+def test_leverage_participation_ratio():
+    concentrated = torch.tensor([1.0, 0.0, 0.0])
+    uniform = torch.tensor([1.0, 1.0, 1.0])
+    assert torch.allclose(_layer_score_leverage_pr(concentrated), torch.tensor(1.0))
+    assert torch.allclose(_layer_score_leverage_pr(uniform), torch.tensor(3.0))
+
+
+def test_value_weighted_scores():
+    base = torch.tensor([1.0, 1.0, 1.0])
+    value_norms = torch.tensor([1.0, 2.0, 4.0])
+    combined = _combine_value_weighted_leverage_pr_scores(
+        base,
+        value_norms,
+        gamma=1.0,
+        eps=0.0,
+    )
+    assert combined[2] > combined[1] > combined[0]
+
+
+def test_integer_capacity_redistribution():
+    capacities = {0: 2, 1: 100, 2: 100}
+    weights = {0: 10.0, 1: 1.0, 2: 1.0}
+    budgets = _integer_allocate_by_weights(capacities, weights, total_budget=20)
+    assert sum(budgets.values()) == 20
+    assert budgets[0] == 2
+    assert budgets[1] + budgets[2] == 18
+
+
+def test_score_allocation_invariants():
+    capacities = {0: 3, 1: 20, 2: 30}
+    scores = {0: torch.tensor(10.0), 1: torch.tensor(2.0), 2: torch.tensor(1.0)}
+    budgets = _allocate_layer_budgets_from_scores(
+        scores,
+        capacities,
+        total_budget=25,
+        alpha=0.7,
+    )
+    assert sum(budgets.values()) == 25
+    assert all(0 <= budgets[layer] <= capacities[layer] for layer in capacities)
+
+
+def test_current_manager_configuration():
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=256,
+        rls_refresh_interval=8,
+        leverage_eviction_selector="topk",
+        layer_budget_strategy="value_weighted_leverage_pr",
+        layer_budget_value_gamma=0.7,
+        layer_budget_value_norm_type="mean",
+        layer_budget_norm_source="key",
+    )
+    assert manager.leverage_ridge_dim == 256
+    assert manager.rls_refresh_interval == 8
+
+
+def _make_budget_aggregator(depth):
+    aggregator = Aggregator.__new__(Aggregator)
+    torch.nn.Module.__init__(aggregator)
+    aggregator.depth = depth
+    aggregator.last_scores = torch.zeros(depth)
+    aggregator.last_layer_budget_scores = torch.zeros(depth)
+    aggregator.last_layer_budget_base_scores = torch.zeros(depth)
+    aggregator.last_layer_budget_value_norms = torch.zeros(depth)
+    return aggregator
+
+
+def _cache_with_tokens(num_tokens):
+    if num_tokens <= 0:
+        return None
+    cache = torch.zeros(1, 1, num_tokens, 1)
+    return cache, cache.clone()
+
+
+def test_uniform_budget_preserves_total():
+    for depth, total_budget in ((3, 10), (24, 100)):
+        aggregator = _make_budget_aggregator(depth)
+        budgets = aggregator._calculate_dynamic_budgets(
+            total_budget,
+            layer_budget_strategy="uniform",
+            past_key_values=[None] * depth,
+            current_token_count=100,
+        )
+        assert int(budgets.sum()) == total_budget
+        assert int(budgets.max() - budgets.min()) <= 1
+        if depth == 3:
+            assert budgets.tolist() == [4, 3, 3]
+        else:
+            assert budgets[:4].tolist() == [5, 5, 5, 5]
+            assert budgets[4:].tolist() == [4] * 20
+
+
+def test_uniform_budget_respects_and_redistributes_capacity():
+    aggregator = _make_budget_aggregator(3)
+    budgets = aggregator._calculate_dynamic_budgets(
+        20,
+        layer_budget_strategy="uniform",
+        past_key_values=[
+            _cache_with_tokens(2),
+            _cache_with_tokens(100),
+            _cache_with_tokens(100),
+        ],
+    )
+    assert budgets.tolist() == [2, 9, 9]
+
+
+def test_uniform_budget_edge_cases():
+    aggregator = _make_budget_aggregator(3)
+    past_key_values = [
+        None,
+        _cache_with_tokens(4),
+        _cache_with_tokens(6),
+    ]
+    zero_budgets = aggregator._calculate_dynamic_budgets(
+        -1,
+        layer_budget_strategy="uniform",
+        past_key_values=past_key_values,
+    )
+    full_budgets = aggregator._calculate_dynamic_budgets(
+        100,
+        layer_budget_strategy="uniform",
+        past_key_values=past_key_values,
+    )
+    assert zero_budgets.tolist() == [0, 0, 0]
+    assert full_budgets.tolist() == [0, 4, 6]
+
+
+def test_uniform_svd_leverage_skips_layer_score():
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_dim=4,
+        layer_budget_strategy="uniform",
+    )
+    result = manager.select(
+        torch.randn(1, 2, 8, 4),
+        cache_budget=6,
+        num_anchor_tokens=2,
+        v=torch.randn(1, 2, 8, 4),
+    )
+    assert result.kept_candidate_indices.shape == (1, 2, 4)
+    assert result.layer_budget_score is None
+
+
+def test_layer_budget_payload_stays_tensor():
+    devices = [torch.device("cpu")]
+    if torch.cuda.is_available():
+        devices.append(torch.device("cuda"))
+    for device in devices:
+        payload = torch.tensor([2.0, 4.0], device=device)
+        score, base, norm = Aggregator._coerce_layer_budget_payload(
+            payload,
+            fallback_score=torch.tensor(0.0),
+            fallback_base=torch.tensor(0.0),
+            fallback_value_norm=torch.tensor(0.0),
+            strategy="value_weighted_leverage_pr",
+            device=device,
+        )
+        assert all(isinstance(value, torch.Tensor) and value.device == device for value in (score, base, norm))
+        assert torch.equal(torch.stack((score, base, norm)), torch.tensor([2.0, 2.0, 4.0], device=device))
+        pscore, pbase, pnorm = Aggregator._coerce_layer_budget_payload(payload[:1], 0.0, 0.0, 0.0, "leverage_pr", device)
+        assert torch.equal(torch.stack((pscore, pbase, pnorm)), torch.tensor([2.0, 2.0, 0.0], device=device))
+
+
+if __name__ == "__main__":
+    test_leverage_participation_ratio()
+    test_value_weighted_scores()
+    test_integer_capacity_redistribution()
+    test_score_allocation_invariants()
+    test_current_manager_configuration()
+    test_uniform_budget_preserves_total()
+    test_uniform_budget_respects_and_redistributes_capacity()
+    test_uniform_budget_edge_cases()
+    test_uniform_svd_leverage_skips_layer_score()
+    print("active layer budget strategy sanity checks passed")

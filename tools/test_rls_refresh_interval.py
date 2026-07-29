@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+from unittest import mock
 
 import torch
 
@@ -17,26 +18,25 @@ from streamvggt.layers.eviction import EvictionManager  # noqa: E402
 
 
 def _set_frame(manager: EvictionManager, frame_idx: int, *, granularity: str = "layer") -> None:
-    manager._set_leverage_diag_context(
-        layer_id=0,
-        step_idx=frame_idx,
-        current_frame_idx=frame_idx,
-        granularity=granularity,
-        batch_size=1,
-        num_heads=1,
-    )
+    manager._set_rls_context(step_idx=frame_idx, current_frame_idx=frame_idx)
 
 
-def _manager(method: str, *, interval: int, profile: bool = False, device: torch.device | str = "cpu") -> EvictionManager:
+def _manager(
+    method: str,
+    *,
+    interval: int,
+    profile: bool = False,
+    device: torch.device | str = "cpu",
+    jitter: float = 1e-6,
+) -> EvictionManager:
     kwargs = {
         "policy": "svd_leverage",
         "profile": profile,
         "leverage_approx_method": method,
-        "leverage_sketch_dim": 0,
         "leverage_ridge_lambda": 1e-3,
         "leverage_ridge_lambda_mode": "relative",
         "leverage_ridge_score_chunk_size": 3,
-        "leverage_ridge_jitter": 1e-6,
+        "leverage_ridge_jitter": jitter,
         "rls_refresh_interval": interval,
         "leverage_random_seed": 123,
     }
@@ -47,17 +47,21 @@ def _manager(method: str, *, interval: int, profile: bool = False, device: torch
     return mgr
 
 
+def _scores(manager: EvictionManager, matrix: torch.Tensor) -> torch.Tensor:
+    return manager._layer_svd_leverage_scores(matrix.unsqueeze(0).unsqueeze(0)).squeeze(0)
+
+
 def check_interval_one_matches_fresh() -> None:
     torch.manual_seed(7)
     frames = [torch.randn(9, 6) for _ in range(4)]
-    for method in ("full_d_ridge", "right_sketch_ridge"):
+    for method in ("right_sketch_ridge",):
         cached = _manager(method, interval=1)
         for frame_idx, mat in enumerate(frames):
             _set_frame(cached, frame_idx)
-            score_cached = cached.compute_svd_leverage_scores(mat)
+            score_cached = _scores(cached, mat)
             fresh = _manager(method, interval=1)
             _set_frame(fresh, frame_idx)
-            score_fresh = fresh.compute_svd_leverage_scores(mat)
+            score_fresh = _scores(fresh, mat)
             if not torch.allclose(score_cached, score_fresh, atol=1e-5, rtol=1e-5):
                 raise AssertionError(f"interval=1 differs from fresh baseline for {method} at frame {frame_idx}")
         if cached.rls_cache_hit_count != 0 or cached.rls_refresh_count != len(frames):
@@ -69,14 +73,14 @@ def check_interval_one_matches_fresh() -> None:
 
 def check_interval_three_refresh_counts() -> None:
     torch.manual_seed(11)
-    manager = _manager("full_d_ridge", interval=3, profile=True)
+    manager = _manager("right_sketch_ridge", interval=3, profile=True)
     expected_refresh_counts = [1, 1, 1, 2, 2, 2, 3]
     expected_hit_counts = [0, 1, 2, 2, 3, 4, 4]
     expected_refreshed = [1, 0, 0, 1, 0, 0, 1]
     for frame_idx in range(7):
         mat = torch.randn(10, 5)
         _set_frame(manager, frame_idx)
-        manager.compute_svd_leverage_scores(mat)
+        _scores(manager, mat)
         profile = manager._last_leverage_profile
         if manager.rls_refresh_count != expected_refresh_counts[frame_idx]:
             raise AssertionError(f"bad refresh count at frame {frame_idx}: {manager.rls_refresh_count}")
@@ -90,7 +94,7 @@ def check_interval_three_refresh_counts() -> None:
 
 def check_offset_interval_refresh_counts() -> None:
     torch.manual_seed(17)
-    manager = _manager("full_d_ridge", interval=4, profile=True)
+    manager = _manager("right_sketch_ridge", interval=4, profile=True)
     frames = [3, 5, 7, 11]
     expected_refresh_counts = [1, 1, 2, 3]
     expected_hit_counts = [0, 1, 1, 1]
@@ -99,7 +103,7 @@ def check_offset_interval_refresh_counts() -> None:
     for idx, frame_idx in enumerate(frames):
         mat = torch.randn(10, 5)
         _set_frame(manager, frame_idx)
-        manager.compute_svd_leverage_scores(mat)
+        _scores(manager, mat)
         profile = manager._last_leverage_profile
         if manager.rls_refresh_count != expected_refresh_counts[idx]:
             raise AssertionError(f"bad offset refresh count at frame {frame_idx}: {manager.rls_refresh_count}")
@@ -114,16 +118,16 @@ def check_offset_interval_refresh_counts() -> None:
 
 
 def check_reset_forces_refresh() -> None:
-    manager = _manager("full_d_ridge", interval=5)
+    manager = _manager("right_sketch_ridge", interval=5)
     _set_frame(manager, 0)
-    manager.compute_svd_leverage_scores(torch.randn(8, 4))
+    _scores(manager, torch.randn(8, 4))
     _set_frame(manager, 1)
-    manager.compute_svd_leverage_scores(torch.randn(8, 4))
+    _scores(manager, torch.randn(8, 4))
     if manager.rls_cache_hit_count != 1:
         raise AssertionError("frame 1 should reuse cache before reset")
     manager.reset_rls_cache()
     _set_frame(manager, 2)
-    manager.compute_svd_leverage_scores(torch.randn(8, 4))
+    _scores(manager, torch.randn(8, 4))
     if manager.rls_refresh_count != 1 or manager.rls_cache_hit_count != 0 or manager.last_rls_refresh_frame != 2:
         raise AssertionError("reset_rls_cache did not force a refresh on the next frame")
 
@@ -132,11 +136,11 @@ def check_device_dtype(device: torch.device) -> None:
     dtypes = [torch.float32, torch.float64]
     if device.type == "cuda":
         dtypes.append(torch.float16)
-    manager = _manager("full_d_ridge", interval=2, device=device)
+    manager = _manager("right_sketch_ridge", interval=2, device=device)
     for frame_idx, dtype in enumerate(dtypes):
         mat = torch.randn(7, 3, device=device, dtype=dtype)
         _set_frame(manager, frame_idx)
-        scores = manager.compute_svd_leverage_scores(mat)
+        scores = _scores(manager, mat)
         if scores.device != mat.device:
             raise AssertionError(f"score device mismatch: {scores.device} vs {mat.device}")
         if scores.dtype != torch.float32:
@@ -146,12 +150,12 @@ def check_device_dtype(device: torch.device) -> None:
 
 
 def check_backward_reuse_path() -> None:
-    manager = _manager("full_d_ridge", interval=4)
+    manager = _manager("right_sketch_ridge", interval=4)
     _set_frame(manager, 0)
-    manager.compute_svd_leverage_scores(torch.randn(8, 4))
+    _scores(manager, torch.randn(8, 4))
     mat = torch.randn(8, 4, requires_grad=True)
     _set_frame(manager, 1)
-    scores = manager.compute_svd_leverage_scores(mat)
+    scores = _scores(manager, mat)
     loss = scores.sum()
     loss.backward()
     if mat.grad is None or not torch.isfinite(mat.grad).all() or mat.grad.abs().sum().item() <= 0.0:
@@ -160,17 +164,24 @@ def check_backward_reuse_path() -> None:
 
 def check_inverse_backend_matches_cholesky_solve() -> None:
     torch.manual_seed(23)
-    manager = _manager("full_d_ridge", interval=4, profile=True)
+    manager = _manager("right_sketch_ridge", interval=4, profile=True)
     for frame_idx in (0, 1):
         mat = torch.randn(11, 5)
         _set_frame(manager, frame_idx)
-        scores = manager.compute_svd_leverage_scores(mat)
+        scores = _scores(manager, mat)
         profile = manager._last_leverage_profile
         if manager.cached_rls_inv is None or manager.cached_rls_chol is None:
             raise AssertionError("expected both cached inverse and cached Cholesky factor")
         if profile.get("score_backend") != "inverse":
             raise AssertionError(f"expected inverse scoring backend, got {profile}")
-        work = torch.nan_to_num(mat.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        candidate_k = mat.unsqueeze(0).unsqueeze(0)
+        sketch_dim = manager._resolve_ridge_sketch_dim(mat.shape[-1], mat.shape[-2])
+        omega = manager._get_leverage_right_sketch(
+            mat.shape[-1], sketch_dim, device=mat.device, seed=manager.leverage_random_seed
+        )
+        work, _ = manager._project_key_with_omega(
+            candidate_k, omega.view(1, mat.shape[-1], sketch_dim)
+        )
         rhs = work.transpose(-2, -1).contiguous()
         solved = torch.cholesky_solve(rhs, manager.cached_rls_chol)
         expected = torch.nan_to_num((rhs * solved).sum(dim=-2), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
@@ -187,12 +198,31 @@ def check_inverse_backend_matches_cholesky_solve() -> None:
 
 def check_invalid_interval() -> None:
     try:
-        _manager("full_d_ridge", interval=0)
+        _manager("right_sketch_ridge", interval=0)
     except ValueError as exc:
         if "rls_refresh_interval" not in str(exc):
             raise AssertionError(f"unexpected ValueError: {exc}")
     else:
         raise AssertionError("rls_refresh_interval=0 should raise ValueError")
+
+
+def check_zero_jitter_cholesky_failure_falls_back_after_one_attempt() -> None:
+    manager = _manager("right_sketch_ridge", interval=1, jitter=0.0)
+    _set_frame(manager, 0)
+
+    def fail_cholesky(matrix: torch.Tensor):
+        info = torch.ones(matrix.shape[:-2], device=matrix.device, dtype=torch.int32)
+        return torch.zeros_like(matrix), info
+
+    with mock.patch.object(torch.linalg, "cholesky_ex", side_effect=fail_cholesky) as cholesky_ex:
+        scores = _scores(manager, torch.randn(8, 4))
+
+    if cholesky_ex.call_count != 1:
+        raise AssertionError(f"jitter=0 should attempt Cholesky once, got {cholesky_ex.call_count}")
+    if manager.cached_rls_chol is not None or manager.cached_rls_inv is None:
+        raise AssertionError("jitter=0 Cholesky failure did not use the pinv fallback")
+    if not torch.isfinite(scores).all():
+        raise AssertionError("pinv fallback returned non-finite scores")
 
 
 def main() -> None:
@@ -206,6 +236,7 @@ def main() -> None:
     check_backward_reuse_path()
     check_inverse_backend_matches_cholesky_solve()
     check_invalid_interval()
+    check_zero_jitter_cholesky_failure_falls_back_after_one_attempt()
     print("RLS refresh interval smoke tests passed")
 
 

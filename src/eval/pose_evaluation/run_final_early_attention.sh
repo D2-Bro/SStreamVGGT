@@ -10,12 +10,11 @@ model_name="StreamVGGT"
 ckpt_name="checkpoints"
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 
-eval_dataset="${POSE_EVAL_DATASET:-replica}"
+eval_dataset="${POSE_EVAL_DATASET:-tum_stride2}"
 
 size="518"
-max_frames="full_seq"
-kf_every="1"
-pose_eval_stride="5"
+max_frames="100"
+pose_eval_stride="1"
 empty_cache_interval="1"
 eviction_policy="svd_leverage"
 layer_budget_strategy="value_weighted_leverage_pr" #value_weighted_leverage_pr
@@ -34,7 +33,7 @@ leverage_approx_method="right_sketch_ridge"
 leverage_ridge_lambda="0"
 leverage_ridge_lambda_mode="absolute"
 leverage_ridge_score_chunk_size="16384"
-leverage_ridge_jitter="1e-6"
+leverage_ridge_jitter="0"
 leverage_ridge_dim="256"
 leverage_random_seed="42"
 
@@ -47,7 +46,7 @@ leverage_conf_gate_special_mode="mean"
 leverage_conf_gate_init="mean"
 leverage_projected_key_cache="true"
 
-attention_beta="${LEVERAGE_ATTENTION_BETA:-0.3}"
+attention_beta="${LEVERAGE_ATTENTION_BETA:-0.5}"
 attention_ema_decay="${LEVERAGE_ATTENTION_EMA_DECAY:-0.9}"
 attention_freeze_updates="${LEVERAGE_ATTENTION_FREEZE_UPDATES:-5}"
 attention_colsum_subsample_ratio="${LEVERAGE_ATTENTION_COLSUM_SUBSAMPLE_RATIO:-1.0}"
@@ -70,7 +69,7 @@ projected_key_cache_args=()
 if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
-output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_S${model_name}_${max_frames}_a${layer_budget_alpha}_TopK_ridge${leverage_ridge_dim}_headNorm_poseStride${pose_eval_stride}_${layer_budget_strategy}_${budget_suffix}_seed${leverage_random_seed}_stride${kf_every}_chunk1_cacheRLS8_${leverage_conf_gate_transform}${attention_utility_suffix}"
+output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_Final_B0.5_${total_budget}_100f"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -84,7 +83,7 @@ accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evalua
     --model_name "$model_name" \
     --eval_dataset "$eval_dataset" \
     --size "$size" \
-    --kf_every "$kf_every" \
+    --max_frames "$max_frames" \
     --pose_eval_stride "$pose_eval_stride" \
     --eviction_policy "$eviction_policy" \
     --leverage_granularity layer \

@@ -1,5 +1,6 @@
 import numpy as np
-from scipy.spatial import cKDTree as KDTree
+# from scipy.spatial import cKDTree as KDTree
+from pykdtree.kdtree import KDTree
 import torch
 
 def umeyama(X, Y):
@@ -46,35 +47,67 @@ def completion_ratio(gt_points, rec_points, dist_th=0.05):
     return comp_ratio
 
 
-def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None):
-    gt_points_kd_tree = KDTree(gt_points)
-    distances, idx = gt_points_kd_tree.query(rec_points, workers=-1)
-    acc = np.mean(distances)
+def accuracy(gt_points, rec_points, gt_normals=None, rec_normals=None, dist_ths=(0.05, 0.10, 0.25)):
+    # gt_points_kd_tree = KDTree(gt_points)
+    # distances, idx = gt_points_kd_tree.query(rec_points, workers=-1)
+    # acc = np.mean(distances)
 
-    acc_median = np.median(distances)
+    # acc_median = np.median(distances)
 
-    # if gt_normals is not None and rec_normals is not None:
-    #     normal_dot = np.sum(gt_normals[idx] * rec_normals, axis=-1)
-    #     normal_dot = np.abs(normal_dot)
+    # # if gt_normals is not None and rec_normals is not None:
+    # #     normal_dot = np.sum(gt_normals[idx] * rec_normals, axis=-1)
+    # #     normal_dot = np.abs(normal_dot)
 
-    #     return acc, acc_median, np.mean(normal_dot), np.median(normal_dot)
+    # #     return acc, acc_median, np.mean(normal_dot), np.median(normal_dot)
 
-    return acc, acc_median, 0.0, 0.0
+    # return acc, acc_median, 0.0, 0.0
+    gt_points = np.ascontiguousarray(np.asarray(gt_points))
+    rec_points = np.ascontiguousarray(np.asarray(rec_points))
+
+    tree = KDTree(gt_points)
+    distances, idx = tree.query(
+        rec_points,
+        k=1,
+        sqr_dists=False,
+    )
+
+    precisions = {
+        th: float(np.mean(distances < th))
+        for th in dist_ths
+    }
+
+    return np.mean(distances), np.median(distances), 0.0, 0.0, precisions
 
 
-def completion(gt_points, rec_points, gt_normals=None, rec_normals=None):
-    gt_points_kd_tree = KDTree(rec_points)
-    distances, idx = gt_points_kd_tree.query(gt_points, workers=-1)
-    comp = np.mean(distances)
-    comp_median = np.median(distances)
+def completion(gt_points, rec_points, gt_normals=None, rec_normals=None, dist_ths=(0.05, 0.10, 0.25)):
+    # gt_points_kd_tree = KDTree(rec_points)
+    # distances, idx = gt_points_kd_tree.query(gt_points, workers=-1)
+    # comp = np.mean(distances)
+    # comp_median = np.median(distances)
 
-    # if gt_normals is not None and rec_normals is not None:
-    #     normal_dot = np.sum(gt_normals * rec_normals[idx], axis=-1)
-    #     normal_dot = np.abs(normal_dot)
+    # # if gt_normals is not None and rec_normals is not None:
+    # #     normal_dot = np.sum(gt_normals * rec_normals[idx], axis=-1)
+    # #     normal_dot = np.abs(normal_dot)
 
-    #     return comp, comp_median, np.mean(normal_dot), np.median(normal_dot)
+    # #     return comp, comp_median, np.mean(normal_dot), np.median(normal_dot)
 
-    return comp, comp_median, 0.0, 0.0
+    # return comp, comp_median, 0.0, 0.0
+    gt_points = np.ascontiguousarray(np.asarray(gt_points))
+    rec_points = np.ascontiguousarray(np.asarray(rec_points))
+
+    tree = KDTree(rec_points)
+    distances, idx = tree.query(
+        gt_points,
+        k=1,
+        sqr_dists=False,
+    )
+
+    recalls = {
+        th: float(np.mean(distances < th))
+        for th in dist_ths
+    }
+
+    return np.mean(distances), np.median(distances), 0.0, 0.0, recalls
 
 
 def compute_iou(pred_vox, target_vox):

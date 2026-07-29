@@ -160,7 +160,6 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         past_key_values=None,
         use_cache=False,
         past_frame_idx=0,
-        global_attn_debug: bool = False,
     ):
         images = torch.stack(
             [view["img"] for view in views], dim=0
@@ -177,11 +176,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
         aggregated_tokens_list, patch_start_idx = self.aggregator(
             images,
-            global_attn_debug=global_attn_debug,
         )
         predictions = {}
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             if self.camera_head is not None:
                 pose_enc_list = self.camera_head(aggregated_tokens_list)
                 predictions["pose_enc"] = pose_enc_list[-1]  # pose encoding of the last iteration
@@ -302,7 +300,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 0,
         layer_budget_log_path: Optional[str] = None,
-        global_attn_debug: bool = False,
+        layer_budget_score_only: bool = False,
     ):
         anchor_manager = None
         window_token_count = 0
@@ -318,6 +316,37 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         camera_cache_tokens_per_frame = None
         camera_cache_anchor_frame_ids = [0]
         total_budget = self.total_budget if total_budget is None else total_budget
+        layer_budget_score_only = bool(layer_budget_score_only)
+        if layer_budget_score_only:
+            if eviction_policy != "svd_leverage" or leverage_granularity != "layer":
+                raise ValueError(
+                    "Layer-budget score-only mode requires eviction_policy='svd_leverage' "
+                    "and leverage_granularity='layer'"
+                )
+            if layer_budget_strategy != "value_weighted_leverage_pr":
+                raise ValueError(
+                    "Layer-budget score-only mode requires "
+                    "layer_budget_strategy='value_weighted_leverage_pr'"
+                )
+            if leverage_attention_utility:
+                raise ValueError("Layer-budget score-only mode is incompatible with leverage_attention_utility")
+            incompatible_outputs = []
+            if cache_analysis_config is not None:
+                incompatible_outputs.append("cache_analysis_config")
+            if eviction_nn_analysis_config is not None:
+                incompatible_outputs.append("eviction_nn_analysis_config")
+            if token_overlay_dump_config is not None:
+                incompatible_outputs.append("token_overlay_dump_config")
+            if incompatible_outputs:
+                raise ValueError(
+                    "Layer-budget score-only mode does not produce kept/evicted indices and is "
+                    f"incompatible with: {', '.join(incompatible_outputs)}"
+                )
+            print(
+                "[LayerBudgetScoreOnly] enabled: KV cache retention is unlimited; "
+                "total_budget is used only for one-step-lag shadow layer allocation. "
+                "Token selectors and confidence gates do not affect layer-budget scoring."
+            )
         stream_chunk_size = int(stream_chunk_size)
         if stream_chunk_size < 1:
             raise ValueError(f"stream_chunk_size must be >= 1, got {stream_chunk_size}")
@@ -466,6 +495,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 layer_budget_min_tokens=layer_budget_min_tokens,
                 layer_budget_eps=layer_budget_eps,
                 layer_budget_log_path=layer_budget_log_path,
+                layer_budget_score_only=layer_budget_score_only,
                 cache_write_current_frame=cache_write_current_frame,
                 cache_evict_current_frame=cache_evict_current_frame,
             )
@@ -478,7 +508,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
             profile_heads_start = _profile_start()
             track_all = vis_all = track_conf_all = None
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 if self.camera_head is not None:
                     profile_stage_start = _profile_start()
                     pose_enc_list, past_key_values_camera = self.camera_head(

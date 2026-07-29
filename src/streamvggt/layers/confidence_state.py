@@ -278,64 +278,36 @@ class KVConfidenceState:
                 "token_confidence_gate must have shape [B, tokens_per_frame], "
                 f"got {tuple(token_confidence_gate.shape)} for batch {B}"
             )
-        tokens_per_frame = int(token_confidence_gate.shape[1])
-        if tokens_per_frame > 0 and tokens_per_frame <= N:
-            is_frame = self.frame_ids == int(frame_id)
-            frame_counts = is_frame.sum(dim=1)
-            if bool(torch.all(frame_counts == tokens_per_frame).item()):
-                starts = is_frame.to(dtype=torch.int64).argmax(dim=1)
-                same_start = bool(torch.all(starts == starts[0]).item())
-                start = int(starts[0].item()) if same_start else -1
-                end = start + tokens_per_frame
-                if same_start and 0 <= start and end <= N:
-                    expected_tokens = torch.arange(
-                        tokens_per_frame,
-                        device=self.token_indices.device,
-                        dtype=self.token_indices.dtype,
-                    ).view(1, tokens_per_frame)
-                    block_frame_ids = self.frame_ids[:, start:end]
-                    block_token_ids = self.token_indices[:, start:end]
-                    is_contiguous_frame = bool(torch.all(block_frame_ids == int(frame_id)).item())
-                    has_expected_tokens = bool(torch.all(block_token_ids == expected_tokens).item())
-                    if is_contiguous_frame and has_expected_tokens:
-                        old_gate = self.confidence_gate[:, start:end].float()
-                        old_finite = torch.isfinite(old_gate)
-                        old_sum = torch.where(old_finite, old_gate, torch.zeros_like(old_gate)).sum(dim=1)
-                        old_count = old_finite.sum(dim=1).to(dtype=torch.int32)
-
-                        new_gate = token_confidence_gate.to(dtype=self.confidence_gate.dtype)
-                        self.confidence_gate[:, start:end] = new_gate
-                        new_sum, new_count = self._stats_from_gate(new_gate)
-                        self.gate_sum = self.gate_sum - old_sum + new_sum
-                        self.gate_count = self.gate_count - old_count + new_count
-                        return
 
         is_frame = self.frame_ids == int(frame_id)
-        suffix_mask = is_frame.flip(1).cumprod(dim=1).flip(1).bool()
-
         token_ids = self.token_indices.long()
-        valid = suffix_mask & (token_ids >= 0) & (token_ids < token_confidence_gate.shape[1])
-        batch_ids = torch.arange(B, device=self.frame_ids.device, dtype=torch.long).view(B, 1).expand(B, N)
+        old_gate = self.confidence_gate.float()
+        old_finite = is_frame & torch.isfinite(old_gate)
+        old_contribution = torch.where(old_finite, old_gate, torch.zeros_like(old_gate))
 
-        old_batch_ids = batch_ids[suffix_mask]
-        old_values = self.confidence_gate[suffix_mask].float()
-        old_finite = torch.isfinite(old_values)
-        old_sum = torch.zeros((B,), device=self.confidence_gate.device, dtype=torch.float32)
-        old_count = torch.zeros((B,), device=self.confidence_gate.device, dtype=torch.int32)
-        old_sum.scatter_add_(0, old_batch_ids[old_finite], old_values[old_finite])
-        old_count.scatter_add_(0, old_batch_ids[old_finite], torch.ones_like(old_batch_ids[old_finite], dtype=old_count.dtype))
+        tokens_per_frame = int(token_confidence_gate.shape[1])
+        if tokens_per_frame > 0:
+            safe_token_ids = token_ids.clamp(0, tokens_per_frame - 1)
+            gathered_values = torch.gather(token_confidence_gate, 1, safe_token_ids)
+            valid = is_frame & (token_ids >= 0) & (token_ids < tokens_per_frame)
+            frame_values = torch.where(valid, gathered_values, torch.ones_like(gathered_values))
+        else:
+            frame_values = torch.ones_like(old_gate)
+        frame_values = frame_values.to(dtype=self.confidence_gate.dtype)
+        updated_gate = torch.where(is_frame, frame_values, self.confidence_gate)
+        self.confidence_gate.copy_(updated_gate)
 
-        self.confidence_gate[suffix_mask] = 1.0
-        valid_batch_ids = batch_ids[valid]
-        valid_values = token_confidence_gate[valid_batch_ids, token_ids[valid]]
-        self.confidence_gate[valid] = valid_values.to(dtype=self.confidence_gate.dtype)
-        valid_delta = torch.zeros((B,), device=self.confidence_gate.device, dtype=torch.float32)
-        valid_delta.scatter_add_(0, valid_batch_ids, valid_values - 1.0)
-
-        suffix_count = suffix_mask.sum(dim=1).to(dtype=torch.int32)
-        new_sum = suffix_count.to(dtype=torch.float32) + valid_delta
-        self.gate_sum = self.gate_sum - old_sum + new_sum
-        self.gate_count = self.gate_count - old_count + suffix_count
+        updated_gate_float = updated_gate.float()
+        new_finite = is_frame & torch.isfinite(updated_gate_float)
+        new_contribution = torch.where(
+            new_finite,
+            updated_gate_float,
+            torch.zeros_like(updated_gate_float),
+        )
+        self.gate_sum = self.gate_sum + (new_contribution - old_contribution).sum(dim=1)
+        self.gate_count = self.gate_count + (
+            new_finite.to(dtype=torch.int32) - old_finite.to(dtype=torch.int32)
+        ).sum(dim=1, dtype=torch.int32)
 
 
 def make_token_confidence_gate(

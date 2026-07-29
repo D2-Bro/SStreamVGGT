@@ -208,6 +208,7 @@ class Attention(nn.Module):
         layer_budget_value_norm_type: str = "mean",
         layer_budget_norm_source: str = "key",
         layer_budget_eps: float = 0,
+        layer_budget_score_only: bool = False,
     ):
         """
         Evicts tokens from the key-value cache based on key cosine similarity.
@@ -224,12 +225,12 @@ class Attention(nn.Module):
         B, H, N, D = k.shape
         num_anchor_tokens = max(0, min(int(num_anchor_tokens), N))
 
-        if N <= cache_budget or N <= num_anchor_tokens:
+        if not layer_budget_score_only and (N <= cache_budget or N <= num_anchor_tokens):
             if confidence_state is not None:
                 return k, v, confidence_state, 0.0
             return k, v, 0.0
 
-        if cache_budget <= num_anchor_tokens:
+        if not layer_budget_score_only and cache_budget <= num_anchor_tokens:
             keep_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
             keep_indices = keep_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
             final_k, final_v = _materialize_kv_by_keep_indices(
@@ -317,6 +318,53 @@ class Attention(nn.Module):
                 layer_budget_eps=layer_budget_eps,
             )
             self._eviction_managers[manager_key] = eviction
+
+        if layer_budget_score_only:
+            score_start = time.perf_counter() if profile_eviction else 0.0
+            score_result = eviction.score_layer_budget(
+                k,
+                num_anchor_tokens,
+                v=v,
+                layer_id=layer_id,
+                step_idx=step_idx,
+                current_frame_idx=current_frame_idx if current_frame_idx is not None else step_idx,
+                capture_projected_norms=projected_norm_histogram_config is not None,
+            )
+            if profile_eviction and k.is_cuda and torch.cuda.is_available():
+                torch.cuda.synchronize(k.device)
+            score_time = time.perf_counter() - score_start if profile_eviction else 0.0
+            if (
+                leverage_score_histogram_config is not None
+                and layer_id is not None
+                and step_idx is not None
+            ):
+                leverage_score_histogram_config.record(
+                    score_result.policy_scores,
+                    layer_id=layer_id,
+                    step_idx=step_idx,
+                )
+            if (
+                projected_norm_histogram_config is not None
+                and layer_id is not None
+                and step_idx is not None
+                and eviction._last_projected_pre_norms is not None
+            ):
+                projected_norm_histogram_config.record(
+                    eviction._last_projected_pre_norms,
+                    layer_id=layer_id,
+                    step_idx=step_idx,
+                )
+            if profile_eviction:
+                total_time = time.perf_counter() - eviction_total_start
+                self._record_eviction_profile(
+                    manager_score_only=score_time,
+                    total_score_only=total_time,
+                )
+            score_payload = (0.0, score_result.layer_budget_score)
+            if confidence_state is not None:
+                return k, v, confidence_state, score_payload
+            return k, v, score_payload
+
         selection_start = time.perf_counter() if profile_eviction else 0.0
         candidate_frame_ids = (
             select_confidence_state.frame_ids[:, num_anchor_tokens:]
@@ -557,6 +605,7 @@ class Attention(nn.Module):
         layer_budget_value_norm_type: str = "rms",
         layer_budget_norm_source: str = "value",
         layer_budget_eps: float = 1e-12,
+        layer_budget_score_only: bool = False,
         slots_per_direction: float = 4.0,
         hybrid_beta: float = 0.5,
         anchor_token_count: Optional[int] = None,
@@ -564,6 +613,34 @@ class Attention(nn.Module):
         cache_evict_current_frame: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         B, N, C = x.shape
+        layer_budget_score_only = bool(layer_budget_score_only)
+        if layer_budget_score_only:
+            if not use_cache:
+                raise ValueError("Layer-budget score-only mode requires use_cache=True")
+            if eviction_policy != "svd_leverage" or leverage_granularity != "layer":
+                raise ValueError(
+                    "Layer-budget score-only mode requires eviction_policy='svd_leverage' "
+                    "and leverage_granularity='layer'"
+                )
+            if layer_budget_strategy != "value_weighted_leverage_pr":
+                raise ValueError(
+                    "Layer-budget score-only mode requires "
+                    "layer_budget_strategy='value_weighted_leverage_pr'"
+                )
+            if leverage_attention_utility:
+                raise ValueError("Layer-budget score-only mode is incompatible with leverage_attention_utility")
+            incompatible_outputs = []
+            if cache_analysis_config is not None:
+                incompatible_outputs.append("cache_analysis_config")
+            if eviction_nn_analysis_config is not None:
+                incompatible_outputs.append("eviction_nn_analysis_config")
+            if token_overlay_dump_config is not None:
+                incompatible_outputs.append("token_overlay_dump_config")
+            if incompatible_outputs:
+                raise ValueError(
+                    "Layer-budget score-only mode does not produce kept/evicted indices and is "
+                    f"incompatible with: {', '.join(incompatible_outputs)}"
+                )
         leverage_attention_utility = bool(leverage_attention_utility)
         if leverage_attention_utility:
             if self.training:
@@ -747,10 +824,11 @@ class Attention(nn.Module):
                 and step_idx <= pre_eviction_snapshot_config.target_step_idx
             )
             if (
-                cache_evict_current_frame
+                (layer_budget_score_only or cache_evict_current_frame)
+                and cache_write_current_frame
                 and cache_budget is not None
-                and k.shape[2] > cache_budget
-                and not eviction_deferred_for_snapshot
+                and (layer_budget_score_only or k.shape[2] > cache_budget)
+                and (layer_budget_score_only or not eviction_deferred_for_snapshot)
             ):
                 eviction_kwargs = {
                     "cache_analysis_config": cache_analysis_config,
@@ -790,6 +868,7 @@ class Attention(nn.Module):
                     "layer_budget_value_norm_type": layer_budget_value_norm_type,
                     "layer_budget_norm_source": layer_budget_norm_source,
                     "layer_budget_eps": layer_budget_eps,
+                    "layer_budget_score_only": layer_budget_score_only,
                 }
                 if leverage_normalize_rows:
                     eviction_kwargs["leverage_normalize_rows"] = leverage_normalize_rows

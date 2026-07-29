@@ -33,6 +33,16 @@ from streamvggt.utils.cache_analysis import (
     token_overlay_dump_config_from_args,
 )
 
+import hashlib
+from pathlib import Path
+import attn_cuda._ext as attn_ext
+
+_attn_ext_path = Path(attn_ext.__file__).resolve()
+print(
+    f"[attn_cuda] path={_attn_ext_path} "
+    f"sha256={hashlib.sha256(_attn_ext_path.read_bytes()).hexdigest()}",
+    flush=True,
+)
 
 def wait_for_rank_logs(
     save_path, dataset_name, num_processes, min_mtime, timeout_s=6000, poll_s=2
@@ -184,6 +194,13 @@ def get_args_parser():
     parser.add_argument("--leverage_attention_colsum_subsample_ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument("--leverage_conf_gate_special_mode", type=str, default="mean", choices=("mean", "one"), help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0")
     parser.add_argument("--layer_budget_strategy", type=str, default="value_weighted_leverage_pr", choices=("uniform", "leverage_pr", "key_norm", "value_weighted_leverage_pr"), help="Layer-wise KV budget allocation strategy")
+    parser.add_argument(
+        "--layer_budget_score_only",
+        "--layer-budget-score-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute value_weighted_leverage_pr every frame without removing KV cache tokens",
+    )
     parser.add_argument("--layer_budget_alpha", type=float, default=0.7)
     parser.add_argument("--layer_budget_min_tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", type=float, default=0)
@@ -299,7 +316,8 @@ def main(args):
             resolution=resolution,
             num_seq=1,
             full_video=True,
-            kf_every=2,
+            kf_every=5,
+            # max_frames=100
         ),
         "NRGBD": NRGBD(
             split="test",
@@ -307,21 +325,22 @@ def main(args):
             resolution=resolution,
             num_seq=1,
             full_video=True,
-            kf_every=2,
-            # test_id=[ "kitchen", "grey_white_room", "green_room"]
+            kf_every=5,
+            # test_id=[ "whiteroom"]
+            # max_frames=100
         ),
-        "ETH3D": ETH3D(
-            ROOT="/home/dongjae/data/eth3d",
-            full_video=True,
-            resolution=resolution,
-            kf_every=1,
-        ),
-        "ETH3D_undistort": ETH3D_undistort(
-            ROOT="/home/dongjae/data/eth3d",
-            full_video=True,
-            resolution=resolution,
-            kf_every=1,
-        ),
+        # "ETH3D": ETH3D(
+        #     ROOT="/home/dongjae/data/eth3d",
+        #     full_video=True,
+        #     resolution=resolution,
+        #     kf_every=1,
+        # ),
+        # "ETH3D_undistort": ETH3D_undistort(
+        #     ROOT="/home/dongjae/data/eth3d",
+        #     full_video=True,
+        #     resolution=resolution,
+        #     kf_every=1,
+        # ),
     }
 
     accelerator = Accelerator(
@@ -381,6 +400,10 @@ def main(args):
             save_path = osp.join(args.output_dir, name_data)
             os.makedirs(save_path, exist_ok=True)
             log_file = osp.join(save_path, f"logs_{accelerator.process_index}.txt")
+            # Each rank owns its log file. Start a fresh file for every run so
+            # metrics left by an earlier run cannot be included in this run's mean.
+            with open(log_file, "w"):
+                pass
 
             acc_all = 0
             acc_all_med = 0
@@ -426,318 +449,242 @@ def main(args):
                     images_all = []
                     in_camera1 = None
 
-                    if model_name == "stream3r" or "VGGT":
-                        revisit = args.revisit
-                        update = not args.freeze
-                        num_input_frames = len(batch)
-                        if revisit > 1:
-                            # repeat input for 'revisit' times
-                            new_views = []
-                            for r in range(revisit):
-                                for i in range(len(batch)):
-                                    new_view = deepcopy(batch[i])
-                                    new_view["idx"] = [
-                                        (r * len(batch) + i)
-                                        for _ in range(len(batch[i]["idx"]))
-                                    ]
-                                    new_view["instance"] = [
-                                        str(r * len(batch) + i)
-                                        for _ in range(len(batch[i]["instance"]))
-                                    ]
-                                    if r > 0:
-                                        if not update:
-                                            new_view["update"] = torch.zeros_like(
-                                                batch[i]["update"]
-                                            ).bool()
-                                    new_views.append(new_view)
-                            batch = new_views
-                        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-                        with torch.cuda.amp.autocast(dtype=dtype):
-                            if isinstance(batch, dict) and "img" in batch:
-                                batch["img"] = (batch["img"] + 1.0) / 2.0
-                            elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
-                                for view in batch:
-                                    view["img"] = (view["img"] + 1.0) / 2.0
+                    revisit = args.revisit
+                    update = not args.freeze
+                    num_input_frames = len(batch)
+                    if revisit > 1:
+                        # repeat input for 'revisit' times
+                        new_views = []
+                        for r in range(revisit):
+                            for i in range(len(batch)):
+                                new_view = deepcopy(batch[i])
+                                new_view["idx"] = [
+                                    (r * len(batch) + i)
+                                    for _ in range(len(batch[i]["idx"]))
+                                ]
+                                new_view["instance"] = [
+                                    str(r * len(batch) + i)
+                                    for _ in range(len(batch[i]["instance"]))
+                                ]
+                                if r > 0:
+                                    if not update:
+                                        new_view["update"] = torch.zeros_like(
+                                            batch[i]["update"]
+                                        ).bool()
+                                new_views.append(new_view)
+                        batch = new_views
+                    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                    with torch.cuda.amp.autocast(dtype=dtype):
+                        if isinstance(batch, dict) and "img" in batch:
+                            batch["img"] = (batch["img"] + 1.0) / 2.0
+                        elif isinstance(batch, list) and all(isinstance(v, dict) and "img" in v for v in batch):
+                            for view in batch:
+                                view["img"] = (view["img"] + 1.0) / 2.0
 
-                        with torch.cuda.amp.autocast(dtype=dtype):
-                            with torch.no_grad():
-                                if torch.cuda.is_available():
-                                    torch.cuda.synchronize(device)
-                                infer_start = time.perf_counter()
+                    with torch.cuda.amp.autocast(dtype=dtype):
+                        with torch.no_grad():
+                            # if torch.cuda.is_available():
+                            #     torch.cuda.synchronize(device)
+                            # infer_start = time.perf_counter()
 
-                                scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
-                                safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
-                                scene_key = f"{int(data_idx):04d}_{safe_scene}"
-                                rank_label = f"rank_{accelerator.process_index}"
-                                eviction_nn_analysis_config = None
-                                leverage_score_histogram_config = None
-                                projected_norm_histogram_config = None
-                                token_overlay_dump_config = None
-                                layer_budget_log_path = None
-                                if args.eviction_nn_analysis_dir:
-                                    nn_dir = osp.join(
-                                        args.eviction_nn_analysis_dir,
-                                        name_data,
-                                        rank_label,
-                                        scene_key,
-                                    )
-                                    eviction_nn_analysis_config = eviction_nn_config_from_args(args, output_dir=nn_dir)
-                                if args.leverage_score_histogram_dir:
-                                    hist_dir = osp.join(
-                                        args.leverage_score_histogram_dir,
-                                        name_data,
-                                        rank_label,
-                                        scene_key,
-                                    )
-                                    leverage_score_histogram_config = leverage_score_histogram_config_from_args(args, output_dir=hist_dir)
-                                if args.projected_norm_histogram_dir:
-                                    norm_hist_dir = osp.join(
-                                        args.projected_norm_histogram_dir,
-                                        name_data,
-                                        rank_label,
-                                        scene_key,
-                                    )
-                                    projected_norm_histogram_config = projected_norm_histogram_config_from_args(args, output_dir=norm_hist_dir)
-                                if args.token_overlay_dump_dir:
-                                    overlay_dump_dir = osp.join(
-                                        args.token_overlay_dump_dir,
-                                        name_data,
-                                        rank_label,
-                                        scene_key,
-                                    )
-                                    token_overlay_dump_config = token_overlay_dump_config_from_args(args, output_dir=overlay_dump_dir)
-                                if args.layer_budget_log_path:
-                                    layer_budget_log_path = args.layer_budget_log_path
-                                elif args.layer_budget_log_scores:
-                                    layer_budget_log_path = osp.join(
-                                        args.output_dir,
-                                        name_data,
-                                        scene_key,
-                                        "layer_budget_scores.csv",
-                                    )
-
-                                results = model.inference(
-                                    batch,
-                                    eviction_policy=args.eviction_policy,
-                                    stream_chunk_size=args.stream_chunk_size,
-                                    budget_frame_multiplier=args.budget_frame_multiplier,
-                                    leverage_granularity=args.leverage_granularity,
-                                    leverage_feature=args.leverage_feature,
-                                    leverage_projection=args.leverage_projection,
-                                    leverage_normalize_rows=args.leverage_normalize_rows,
-                                    leverage_normalize_before_projection=args.leverage_normalize_before_projection,
-                                    leverage_normalize_before_projection_headwise=args.leverage_normalize_before_projection_headwise,
-                                    leverage_projected_key_cache=args.leverage_projected_key_cache,
-                                    leverage_approx_method=args.leverage_approx_method,
-                                    leverage_ridge_lambda=args.leverage_ridge_lambda,
-                                    leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
-                                    leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
-                                    leverage_ridge_jitter=args.leverage_ridge_jitter,
-                                    leverage_ridge_dim=args.leverage_ridge_dim,
-                                    rls_refresh_interval=args.rls_refresh_interval,
-                                    leverage_random_seed=args.leverage_random_seed,
-                                    leverage_eviction_selector=args.leverage_eviction_selector,
-                                    leverage_conf_gate=args.leverage_conf_gate,
-                                    leverage_conf_gate_floor=args.leverage_conf_gate_floor,
-                                    leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
-                                    leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
-                                    leverage_conf_gate_k=args.leverage_conf_gate_k,
-                                    leverage_conf_gate_transform=args.leverage_conf_gate_transform,
-                                    leverage_conf_gate_init=args.leverage_conf_gate_init,
-                                    leverage_attention_utility=args.leverage_attention_utility,
-                                    leverage_attention_beta=args.leverage_attention_beta,
-                                    leverage_attention_ema_decay=args.leverage_attention_ema_decay,
-                                    leverage_attention_freeze_updates=args.leverage_attention_freeze_updates,
-                                    leverage_attention_colsum_subsample_ratio=args.leverage_attention_colsum_subsample_ratio,
-                                    leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
-                                    layer_budget_strategy=args.layer_budget_strategy,
-                                    layer_budget_value_gamma=args.layer_budget_value_gamma,
-                                    layer_budget_value_norm_type=args.layer_budget_value_norm_type,
-                                    layer_budget_norm_source=args.layer_budget_norm_source,
-                                    layer_budget_alpha=args.layer_budget_alpha,
-                                    layer_budget_min_tokens=args.layer_budget_min_tokens,
-                                    layer_budget_eps=args.layer_budget_eps,
-                                    layer_budget_log_path=layer_budget_log_path,
-                                    profile_eviction=args.profile_eviction,
-                                    eviction_debug=args.eviction_debug,
-                                    eviction_nn_analysis_config=eviction_nn_analysis_config,
-                                    leverage_score_histogram_config=leverage_score_histogram_config,
-                                    projected_norm_histogram_config=projected_norm_histogram_config,
-                                    token_overlay_dump_config=token_overlay_dump_config,
+                            scene_label = str(batch[0]["label"][0]).rsplit("/", 1)[0]
+                            safe_scene = scene_label.replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                            scene_key = f"{int(data_idx):04d}_{safe_scene}"
+                            rank_label = f"rank_{accelerator.process_index}"
+                            eviction_nn_analysis_config = None
+                            leverage_score_histogram_config = None
+                            projected_norm_histogram_config = None
+                            token_overlay_dump_config = None
+                            layer_budget_log_path = None
+                            if args.eviction_nn_analysis_dir:
+                                nn_dir = osp.join(
+                                    args.eviction_nn_analysis_dir,
+                                    name_data,
+                                    rank_label,
+                                    scene_key,
                                 )
-                                if torch.cuda.is_available():
-                                    torch.cuda.synchronize(device)
-                                infer_time = time.perf_counter() - infer_start
-                                fps = num_input_frames / infer_time if infer_time > 0 else float("inf")
-                                time_all.append(infer_time)
-                                fps_all.append(fps)
+                                eviction_nn_analysis_config = eviction_nn_config_from_args(args, output_dir=nn_dir)
+                            if args.leverage_score_histogram_dir:
+                                hist_dir = osp.join(
+                                    args.leverage_score_histogram_dir,
+                                    name_data,
+                                    rank_label,
+                                    scene_key,
+                                )
+                                leverage_score_histogram_config = leverage_score_histogram_config_from_args(args, output_dir=hist_dir)
+                            if args.projected_norm_histogram_dir:
+                                norm_hist_dir = osp.join(
+                                    args.projected_norm_histogram_dir,
+                                    name_data,
+                                    rank_label,
+                                    scene_key,
+                                )
+                                projected_norm_histogram_config = projected_norm_histogram_config_from_args(args, output_dir=norm_hist_dir)
+                            if args.token_overlay_dump_dir:
+                                overlay_dump_dir = osp.join(
+                                    args.token_overlay_dump_dir,
+                                    name_data,
+                                    rank_label,
+                                    scene_key,
+                                )
+                                token_overlay_dump_config = token_overlay_dump_config_from_args(args, output_dir=overlay_dump_dir)
+                            if args.layer_budget_log_path:
+                                layer_budget_log_path = args.layer_budget_log_path
+                            elif args.layer_budget_log_scores:
+                                layer_budget_log_path = osp.join(
+                                    args.output_dir,
+                                    name_data,
+                                    scene_key,
+                                    "layer_budget_scores.csv",
+                                )
 
-                            preds, batch = results.ress, results.views
-
-                            if args.use_proj:
-                                pose_enc = torch.stack([preds[s]["camera_pose"] for s in range(len(preds))], dim=1)
-                                depth_map = torch.stack([preds[s]["depth"] for s in range(len(preds))], dim=1)
-                                depth_conf = torch.stack([preds[s]["depth_conf"] for s in range(len(preds))], dim=1)
-                                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc,
-                                                                                    batch[0]["img"].shape[-2:])
-
-                                if "DTU" in name_data:
-                                    depth_map = depth_map * 1000.0
-                                    extrinsic[..., :3, 3] *= 1000.0
-
-                                point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0),
-                                                                                                extrinsic.squeeze(0),
-                                                                                                intrinsic.squeeze(0))
-                            valid_length = len(preds) // args.revisit
-                            if args.revisit > 1:
-                                preds = preds[-valid_length:]
-                                batch = batch[-valid_length:]
-
-                            timing_scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
-                            timing_msg = (
-                                f"Timing before eval - Idx: {timing_scene_id}, "
-                                f"Time: {infer_time:.6f}, FPS: {fps:.3f}"
-                            )
-                            print(timing_msg)
-
-                        # Evaluation
-                        print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
-                        if args.recon_eval_mode == "voxel_icp":
-                            scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
-                            voxel_result = eval_scene_voxel_icp(
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize(device)
+                            infer_start = time.perf_counter()
+                            results = model.inference(
                                 batch,
-                                preds,
-                                scene_id=scene_id,
-                                voxel_size=args.eval_voxel_size,
-                                eval_frame_stride=args.eval_frame_stride,
-                                icp_threshold=0.1,
-                                metrics_on_voxels=args.eval_metrics_on_voxels,
+                                eviction_policy=args.eviction_policy,
+                                stream_chunk_size=args.stream_chunk_size,
+                                budget_frame_multiplier=args.budget_frame_multiplier,
+                                leverage_granularity=args.leverage_granularity,
+                                leverage_feature=args.leverage_feature,
+                                leverage_projection=args.leverage_projection,
+                                leverage_normalize_rows=args.leverage_normalize_rows,
+                                leverage_normalize_before_projection=args.leverage_normalize_before_projection,
+                                leverage_normalize_before_projection_headwise=args.leverage_normalize_before_projection_headwise,
+                                leverage_projected_key_cache=args.leverage_projected_key_cache,
+                                leverage_approx_method=args.leverage_approx_method,
+                                leverage_ridge_lambda=args.leverage_ridge_lambda,
+                                leverage_ridge_lambda_mode=args.leverage_ridge_lambda_mode,
+                                leverage_ridge_score_chunk_size=args.leverage_ridge_score_chunk_size,
+                                leverage_ridge_jitter=args.leverage_ridge_jitter,
+                                leverage_ridge_dim=args.leverage_ridge_dim,
+                                rls_refresh_interval=args.rls_refresh_interval,
+                                leverage_random_seed=args.leverage_random_seed,
+                                leverage_eviction_selector=args.leverage_eviction_selector,
+                                leverage_conf_gate=args.leverage_conf_gate,
+                                leverage_conf_gate_floor=args.leverage_conf_gate_floor,
+                                leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
+                                leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
+                                leverage_conf_gate_k=args.leverage_conf_gate_k,
+                                leverage_conf_gate_transform=args.leverage_conf_gate_transform,
+                                leverage_conf_gate_init=args.leverage_conf_gate_init,
+                                leverage_attention_utility=args.leverage_attention_utility,
+                                leverage_attention_beta=args.leverage_attention_beta,
+                                leverage_attention_ema_decay=args.leverage_attention_ema_decay,
+                                leverage_attention_freeze_updates=args.leverage_attention_freeze_updates,
+                                leverage_attention_colsum_subsample_ratio=args.leverage_attention_colsum_subsample_ratio,
+                                leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
+                                layer_budget_strategy=args.layer_budget_strategy,
+                                layer_budget_score_only=args.layer_budget_score_only,
+                                layer_budget_value_gamma=args.layer_budget_value_gamma,
+                                layer_budget_value_norm_type=args.layer_budget_value_norm_type,
+                                layer_budget_norm_source=args.layer_budget_norm_source,
+                                layer_budget_alpha=args.layer_budget_alpha,
+                                layer_budget_min_tokens=args.layer_budget_min_tokens,
+                                layer_budget_eps=args.layer_budget_eps,
+                                layer_budget_log_path=layer_budget_log_path,
+                                profile_eviction=args.profile_eviction,
+                                eviction_debug=args.eviction_debug,
+                                eviction_nn_analysis_config=eviction_nn_analysis_config,
+                                leverage_score_histogram_config=leverage_score_histogram_config,
+                                projected_norm_histogram_config=projected_norm_histogram_config,
+                                token_overlay_dump_config=token_overlay_dump_config,
                             )
-                            voxel_diag_msg = (
-                                f"Voxel ICP eval for {scene_id}: "
-                                f"voxel_size={args.eval_voxel_size}, "
-                                f"frames={voxel_result.eval_frame_count}/{len(batch)}, "
-                                f"raw_valid={voxel_result.raw_valid_points}, "
-                                f"sampled_valid={voxel_result.sampled_valid_points}, "
-                                f"removed_nonfinite={voxel_result.removed_nonfinite_points}, "
-                                f"metric_source={'voxel_centroids' if args.eval_metrics_on_voxels else 'full_points'}, "
-                                f"metric_pred_points={voxel_result.metric_pred_points}, "
-                                f"metric_gt_points={voxel_result.metric_gt_points}, "
-                                f"pred_voxels={voxel_result.pred_voxels}, "
-                                f"gt_voxels={voxel_result.gt_voxels}, "
-                                f"icp_fitness={voxel_result.icp_fitness}, "
-                                f"icp_inlier_rmse={voxel_result.icp_inlier_rmse}"
-                            )
-                            print(voxel_diag_msg)
-                            print(voxel_diag_msg, file=open(log_file, "a"))
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize(device)
+                            infer_time = time.perf_counter() - infer_start
+                            fps = num_input_frames / infer_time if infer_time > 0 else float("inf")
+                            time_all.append(infer_time)
+                            fps_all.append(fps)
 
-                            voxel_metric_msg = (
-                                f"Idx: {scene_id}, Acc: {voxel_result.acc}, "
-                                f"Comp: {voxel_result.comp}, NC1: {voxel_result.nc1}, "
-                                f"NC2: {voxel_result.nc2} - "
-                                f"Acc_med: {voxel_result.acc_med}, "
-                                f"Compc_med: {voxel_result.comp_med}, "
-                                f"NC1c_med: {voxel_result.nc1_med}, "
-                                f"NC2c_med: {voxel_result.nc2_med}, "
-                                f"Time: {infer_time}, FPS: {fps}"
-                            )
-                            print(voxel_metric_msg)
-                            print(voxel_metric_msg, file=open(log_file, "a"))
+                        preds, batch = results.ress, results.views
 
-                            acc_all += voxel_result.acc
-                            comp_all += voxel_result.comp
-                            # nc1_all += voxel_result.nc1
-                            # nc2_all += voxel_result.nc2
-                            acc_all_med += voxel_result.acc_med
-                            comp_all_med += voxel_result.comp_med
-                            # nc1_all_med += voxel_result.nc1_med
-                            # nc2_all_med += voxel_result.nc2_med
-                            torch.cuda.empty_cache()
-                            continue
+                        if args.use_proj:
+                            pose_enc = torch.stack([preds[s]["camera_pose"] for s in range(len(preds))], dim=1)
+                            depth_map = torch.stack([preds[s]["depth"] for s in range(len(preds))], dim=1)
+                            depth_conf = torch.stack([preds[s]["depth_conf"] for s in range(len(preds))], dim=1)
+                            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc,
+                                                                                batch[0]["img"].shape[-2:])
 
-                        gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = (
-                            criterion.get_all_pts3d_t(batch, preds)
+                            if "DTU" in name_data:
+                                depth_map = depth_map * 1000.0
+                                extrinsic[..., :3, 3] *= 1000.0
+
+                            point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0),
+                                                                                            extrinsic.squeeze(0),
+                                                                                            intrinsic.squeeze(0))
+                        valid_length = len(preds) // args.revisit
+                        if args.revisit > 1:
+                            preds = preds[-valid_length:]
+                            batch = batch[-valid_length:]
+
+                        timing_scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
+                        timing_msg = (
+                            f"Timing before eval - Idx: {timing_scene_id}, "
+                            f"Time: {infer_time:.6f}, FPS: {fps:.3f}"
                         )
+                        print(timing_msg)
 
-                        in_camera1 = None
-                        pts_all = []
-                        pts_gt_all = []
-                        images_all = []
-                        masks_all = []
-                        conf_all = []
-                        eval_frame_count = 0
-                        sampling_rng = np.random.default_rng(seed=42)
+                    summarize_layer_budget_log(layer_budget_log_path)
 
-                        for j, view in enumerate(batch):
-                            if j % args.eval_frame_stride != 0:
-                                continue
-                            eval_frame_count += 1
+                    # Evaluation
+                    print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
 
-                            if in_camera1 is None:
-                                in_camera1 = view["camera_pose"][0].cpu()
+                    gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = (
+                        criterion.get_all_pts3d_t(batch, preds)
+                    )
 
-                            image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
-                            mask = view["valid_mask"].cpu().numpy()[0]
+                    in_camera1 = None
+                    pts_all = []
+                    pts_gt_all = []
+                    images_all = []
+                    masks_all = []
+                    conf_all = []
+                    eval_frame_count = 0
+                    sampling_rng = np.random.default_rng(seed=42)
 
-                            if args.use_proj:
-                                pts = point_map_by_unprojection[j]
-                                conf = depth_conf[0, j].cpu().data.numpy()
-                            else:
-                                pts = pred_pts[j].cpu().numpy()[0]
-                                conf = preds[j]["conf"].cpu().data.numpy()[0]
+                    for j, view in enumerate(batch):
+                        if j % args.eval_frame_stride != 0:
+                            continue
+                        eval_frame_count += 1
 
-                            # mask = mask & (conf > 1.8)
+                        if in_camera1 is None:
+                            in_camera1 = view["camera_pose"][0].cpu()
 
-                            pts_gt = gt_pts[j].detach().cpu().numpy()[0]
+                        image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
+                        mask = view["valid_mask"].cpu().numpy()[0]
 
-                            H, W = image.shape[:2]
-                            cx = W // 2
-                            cy = H // 2
-                            l, t = cx - 112, cy - 112
-                            r, b = cx + 112, cy + 112
-                            image = image[t:b, l:r]
-                            mask = mask[t:b, l:r]
-                            pts = pts[t:b, l:r]
-                            pts_gt = pts_gt[t:b, l:r]
+                        if args.use_proj:
+                            pts = point_map_by_unprojection[j]
+                            conf = depth_conf[0, j].cpu().data.numpy()
+                        else:
+                            pts = pred_pts[j].cpu().numpy()[0]
+                            conf = preds[j]["conf"].cpu().data.numpy()[0]
 
-                            # Align predicted 3D points to the ground truth
-                            # pts = geotrf(in_camera1, pts)
-                            # pts_gt = geotrf(in_camera1, pts_gt)
+                        # mask = mask & (conf > 1.8)
 
-                            images_all.append(image[None, ...])
-                            pts_all.append(pts[None, ...])
-                            pts_gt_all.append(pts_gt[None, ...])
-                            masks_all.append(mask[None, ...])
-                            conf_all.append(conf[None, ...])
+                        pts_gt = gt_pts[j].detach().cpu().numpy()[0]
 
-                            # Uniformly sample at most 224x224 GT-valid pixels per frame.
-                            # H, W = image.shape[:2]
-                            # if (H, W) == (392, 518):
-                            #     valid_mask = mask.astype(bool, copy=False)
-                            #     valid_indices = np.flatnonzero(valid_mask)
-                            #     max_samples = 224 * 224
-                            #     if len(valid_indices) > max_samples:
-                            #         valid_indices = sampling_rng.choice(
-                            #             valid_indices,
-                            #             size=max_samples,
-                            #             replace=False,
-                            #         )
-                            #     sampling_mask = np.zeros(
-                            #         valid_mask.size, dtype=bool
-                            #     )
-                            #     sampling_mask[valid_indices] = True
-                            #     sampling_mask = sampling_mask.reshape(H, W)
-                            #     mask = sampling_mask
+                        H, W = image.shape[:2]
+                        cx = W // 2
+                        cy = H // 2
+                        l, t = cx - 112, cy - 112
+                        r, b = cx + 112, cy + 112
+                        image = image[t:b, l:r]
+                        mask = mask[t:b, l:r]
+                        pts = pts[t:b, l:r]
+                        pts_gt = pts_gt[t:b, l:r]
 
-                            # selected_mask = mask.astype(bool, copy=False)
-                            # images_all.append(
-                            #     image[selected_mask].reshape(-1, 3)
-                            # )
-                            # pts_all.append(pts[selected_mask].reshape(-1, 3))
-                            # pts_gt_all.append(
-                            #     pts_gt[selected_mask].reshape(-1, 3)
-                            # )
-                            
+                        # Align predicted 3D points to the ground truth
+                        # pts = geotrf(in_camera1, pts)
+                        # pts_gt = geotrf(in_camera1, pts_gt)
+
+                        images_all.append(image[None, ...])
+                        pts_all.append(pts[None, ...])
+                        pts_gt_all.append(pts_gt[None, ...])
+                        masks_all.append(mask[None, ...])
+                        conf_all.append(conf[None, ...])
 
                     scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
                     if args.eval_frame_stride > 1:
@@ -830,14 +777,13 @@ def main(args):
                     pcd.colors = o3d.utility.Vector3dVector(
                         images_all_masked.reshape(-1, 3)
                     )
-                    # pcd.points = o3d.utility.Vector3dVector(pts_all)
-                    # pcd.colors = o3d.utility.Vector3dVector(images_all)
                     # o3d.io.write_point_cloud(
                     #     os.path.join(
                     #         save_path, f"{scene_id.replace('/', '_')}-mask.ply"
                     #     ),
                     #     pcd,
                     # )
+                    # continue
 
                     pcd_gt = o3d.geometry.PointCloud()
                     pcd_gt.points = o3d.utility.Vector3dVector(
@@ -883,19 +829,49 @@ def main(args):
                     gt_normal = np.asarray(pcd_gt.normals)
                     pred_normal = np.asarray(pcd.normals)
 
-                    acc, acc_med, nc1, nc1_med = accuracy(
-                        pcd_gt.points, pcd.points, gt_normal, pred_normal
+                    thresholds = (0.05, 0.1, 0.25)
+
+                    acc, acc_med, nc1, nc1_med, precisions = accuracy(
+                        pcd_gt.points, pcd.points, gt_normal, pred_normal, dist_ths=thresholds
                     )
-                    comp, comp_med, nc2, nc2_med = completion(
-                        pcd_gt.points, pcd.points, gt_normal, pred_normal
+                    comp, comp_med, nc2, nc2_med, recalls = completion(
+                        pcd_gt.points, pcd.points, gt_normal, pred_normal, dist_ths=thresholds
                     )
-                    print(
-                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, Time: {infer_time}, FPS: {fps}"
+                    f1_scores = {}
+                    for th in thresholds:
+                        precision = precisions[th]
+                        recall = recalls[th]
+                        denom = precision + recall
+
+                        f1_scores[th] = (
+                            2.0 * precision * recall / denom
+                            if denom > 0
+                            else 0.0
+                        )
+                    f1_str = ", ".join(
+                        f"F1@{round(th * 100)}cm: {f1_scores[th]:.6f}"
+                        for th in thresholds
                     )
-                    print(
-                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, Time: {infer_time}, FPS: {fps}",
-                        file=open(log_file, "a"),
+
+                    metric_msg = (
+                        f"Idx: {scene_id}, "
+                        f"Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - "
+                        f"Acc_med: {acc_med}, Compc_med: {comp_med}, "
+                        f"NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, "
+                        f"{f1_str}, "
+                        f"Time: {infer_time}, FPS: {fps}, "
                     )
+
+                    print(metric_msg)
+                    with open(log_file, "a") as f:
+                        print(metric_msg, file=f)
+                    # print(
+                    #     f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, Time: {infer_time}, FPS: {fps}"
+                    # )
+                    # print(
+                    #     f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, Time: {infer_time}, FPS: {fps}",
+                    #     file=open(log_file, "a"),
+                    # )
 
                     acc_all += acc
                     comp_all += comp
@@ -934,9 +910,7 @@ def main(args):
             if accelerator.is_main_process:
                 to_write = ""
                 # Copy the error log from each process to the main error log
-                for i in range(8):
-                    if not os.path.exists(osp.join(save_path, f"logs_{i}.txt")):
-                        break
+                for i in range(accelerator.num_processes):
                     with open(osp.join(save_path, f"logs_{i}.txt"), "r") as f_sub:
                         to_write += f_sub.read()
 
@@ -984,8 +958,11 @@ pattern = r"""
     Acc_med:\s*(?P<acc_med>[^,]+),\s*
     Compc_med:\s*(?P<comp_med>[^,]+),\s*
     NC1c_med:\s*(?P<nc1_med>[^,]+),\s*
-    NC2c_med:\s*(?P<nc2_med>[^,]+)
-    (?:,\s*Time:\s*(?P<time>[^,]+),\s*FPS:\s*(?P<fps>[^,]+))?
+    NC2c_med:\s*(?P<nc2_med>[^,]+),\s*
+    F1@5cm:\s*(?P<f1_5cm>[^,]+),\s*
+    F1@10cm:\s*(?P<f1_10cm>[^,]+),\s*
+    F1@25cm:\s*(?P<f1_25cm>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*
+    (?:,?\s*Time:\s*(?P<time>[^,]+),\s*FPS:\s*(?P<fps>[^,]+))?
 """
 
 regex = re.compile(pattern, re.VERBOSE)

@@ -1,0 +1,97 @@
+{
+  "frame_count": 5,
+  "image_paths": [
+    "pipeline_images/redkitchen/F0.png",
+    "pipeline_images/redkitchen/F1-2.png",
+    "pipeline_images/redkitchen/F3.png",
+    "pipeline_images/redkitchen/F5.png",
+    "pipeline_images/redkitchen/F6.png"
+  ],
+  "preprocessed_image_hw": [
+    392,
+    518
+  ],
+  "coordinate_system": {
+    "extrinsic": "OpenCV world-to-camera",
+    "camera_to_world": "inverse of predicted extrinsic",
+    "units": "model-predicted common scene units; no GT scale/shift alignment"
+  },
+  "reconstruction": {
+    "source": "pts3d_in_other_view",
+    "vertex_count": 1015280,
+    "confidence_threshold": 0.0,
+    "point_stride": 1,
+    "voxel_size": 0.0
+  },
+  "camera_visualization": {
+    "camera_size": 0.05325640201568604,
+    "camera_thickness": 0.0007988460302352905,
+    "requested_camera_stride": 0,
+    "camera_stride": 1,
+    "camera_count": 5,
+    "displayed_camera_count": 5,
+    "vertex_count": 944,
+    "face_count": 944,
+    "show_axes": true,
+    "show_trajectory": true,
+    "type": "tube wireframe frustums with RGB axes and trajectory"
+  },
+  "depth_visualization": {
+    "normalization": "shared sequence 2nd-98th percentile over finite positive depth",
+    "min": 0.36311784327030183,
+    "max": 1.249022192955017,
+    "colormap": "turbo",
+    "invalid_color": [
+      0,
+      0,
+      0
+    ]
+  },
+  "inference_config": {
+    "frame_stride": 1,
+    "max_frames": 5,
+    "total_budget": 60000,
+    "eviction_policy": "svd_leverage",
+    "leverage_sketch_dim": 256,
+    "leverage_granularity": "layer",
+    "leverage_feature": "key",
+    "leverage_projection": "random",
+    "leverage_normalize_rows": false,
+    "leverage_normalize_before_projection": true,
+    "leverage_normalize_before_projection_headwise": true,
+    "leverage_projected_key_cache": true,
+    "leverage_approx_method": "right_sketch_ridge",
+    "leverage_ridge_lambda": 0.0,
+    "leverage_ridge_lambda_mode": "absolute",
+    "leverage_ridge_score_chunk_size": 16384,
+    "leverage_ridge_jitter": 0.0,
+    "leverage_ridge_dim": 256,
+    "rls_refresh_interval": 8,
+    "leverage_random_seed": 42,
+    "leverage_eviction_selector": "topk",
+    "leverage_conf_gate": true,
+    "leverage_conf_gate_floor": 0.0,
+    "leverage_conf_gate_depth_alpha": 1.0,
+    "leverage_conf_gate_point_beta": 0.0,
+    "leverage_conf_gate_k": 1.0,
+    "leverage_conf_gate_transform": "sigmoid",
+    "leverage_conf_gate_init": "mean",
+    "leverage_conf_gate_special_mode": "mean",
+    "layer_budget_strategy": "value_weighted_leverage_pr",
+    "layer_budget_score_only": false,
+    "layer_budget_alpha": 0.7,
+    "layer_budget_min_tokens": 0,
+    "layer_budget_eps": 0.0,
+    "layer_budget_value_gamma": 0.7,
+    "layer_budget_value_norm_type": "mean",
+    "layer_budget_norm_source": "key",
+    "stream_chunk_size": 1
+  },
+  "outputs": {
+    "reconstruction": "reconstruction.ply",
+    "cameras": "cameras.ply",
+    "poses": "poses.npz",
+    "trajectory": "trajectory.txt",
+    "depth_dir": "depth"
+  }
+}

@@ -24,7 +24,7 @@ leverage_approx_method=right_sketch_ridge
 leverage_ridge_lambda=0
 leverage_ridge_lambda_mode=absolute
 leverage_ridge_score_chunk_size=16384
-leverage_ridge_jitter=1e-6
+leverage_ridge_jitter=0
 leverage_ridge_dim=256
 leverage_random_seed=42
 
@@ -68,7 +68,7 @@ if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
 
-output_dir="${workdir}/eval_results/mv_recon/Final_dim${leverage_ridge_dim}_${layer_budget_strategy}_${budget_suffix}_chunk1_cacheRLS8_${leverage_conf_gate_transform}${attention_utility_suffix}_randomUmeyama_noVoxEval"
+output_dir="${workdir}/eval_results/mv_recon/Final_dim${leverage_ridge_dim}_${layer_budget_strategy}_${budget_suffix}_chunk1_cacheRLS8_${leverage_conf_gate_transform}${attention_utility_suffix}_F1_fullSeq_Stride5"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -115,8 +115,8 @@ accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/la
     --stream_chunk_size 1 \
     --rls_refresh_interval 8 \
     "${projected_key_cache_args[@]}" \
-    "${attention_utility_args[@]}" \
-    --recon_eval_mode voxel_icp 
+    "${attention_utility_args[@]}" 
+    # --recon_eval_mode voxel_icp 
     # --eval_voxel_size 0.005
     
 # Add --profile_eviction to the launch command above when measuring eviction latency.

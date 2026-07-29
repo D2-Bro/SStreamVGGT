@@ -25,5 +25,4 @@ accelerate launch --num_processes 2 --main_process_port 29602 ./eval/pose_evalua
     --model_name "$model_name" \
     --max_frames "$max_frames" \
     --kf_every "$kf_every" \
-    --eviction_policy "$eviction_policy" \
-    --global-attn-idx-ranges 9:
+    --eviction_policy "$eviction_policy"

@@ -107,6 +107,8 @@ class SevenScenes(BaseStereoViewDataset):
 
         self.scene_list = []
         for scene in scenes:
+            # if scene != "pumpkin":
+            #     continue
             if self.test_id is not None and scene != self.test_id:
                 continue
             # read file split
@@ -117,7 +119,7 @@ class SevenScenes(BaseStereoViewDataset):
                     # seq is string, take the int part and make it 01, 02, 03
                     # seq_id = 'seq-{:2d}'.format(int(seq_id))
                     num_part = "".join(filter(str.isdigit, seq_id))
-                    # if num_part != "6":
+                    # if num_part != "1":
                     #     continue  # Only use seq-06 for evaluation, as in SimpleRecon
                     seq_id = f"seq-{num_part.zfill(2)}"
                     if self.seq_id is not None and seq_id != self.seq_id:
@@ -157,7 +159,7 @@ class SevenScenes(BaseStereoViewDataset):
         while len(imgs_idxs) > 0:
             im_idx = imgs_idxs.popleft()
             impath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.color.png")
-            depthpath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.depth.png")
+            depthpath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.depth.proj.png")
             posepath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.pose.txt")
 
             rgb_image = imread_cv2(impath)

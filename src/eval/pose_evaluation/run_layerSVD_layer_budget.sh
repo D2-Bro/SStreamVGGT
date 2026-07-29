@@ -38,6 +38,5 @@ accelerate launch --num_processes 2 --main_process_port 29602 ./eval/pose_evalua
     --layer_budget_strategy "$layer_budget_strategy" \
     --layer_budget_alpha "$layer_budget_alpha" \
     --layer_budget_min_tokens "$layer_budget_min_tokens" \
-    --layer_budget_eps "$layer_budget_eps" \
-    --global-attn-idx-ranges 9:
+    --layer_budget_eps "$layer_budget_eps"
 # Add --profile_eviction to the launch command above when measuring eviction latency.

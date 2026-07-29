@@ -27,5 +27,4 @@ accelerate launch --num_processes 2 --main_process_port 29602 ./eval/pose_evalua
     --kf_every "$kf_every" \
     --eviction_policy "$eviction_policy" \
     --leverage_granularity layer \
-    --leverage_sketch_dim 0 \
-    --global-attn-idx-ranges 9:
+    --leverage_sketch_dim 0

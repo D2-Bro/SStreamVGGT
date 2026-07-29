@@ -1,5 +1,7 @@
 import os
+import subprocess
 import sys
+from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import math
@@ -56,7 +58,6 @@ def get_args_parser():
     )
     parser.add_argument("--size", type=int, default="224")
     parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
-    parser.add_argument("--kf_every", type=int, default=1, help="take one frame every N frames")
     parser.add_argument("--pose_eval_stride", type=int, default=1, help="stride for pose evaluation; effective stride is kf_every * pose_eval_stride")
     parser.add_argument(
         "--stream_chunk_size",
@@ -163,6 +164,13 @@ def get_args_parser():
     parser.add_argument("--leverage_attention_colsum_subsample_ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument("--leverage_conf_gate_special_mode", type=str, default="mean", choices=("mean", "one"), help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0")
     parser.add_argument("--layer_budget_strategy", type=str, default="value_weighted_leverage_pr", choices=("uniform", "leverage_pr", "key_norm", "value_weighted_leverage_pr"), help="Layer-wise KV budget allocation strategy")
+    parser.add_argument(
+        "--layer_budget_score_only",
+        "--layer-budget-score-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute value_weighted_leverage_pr every frame without removing KV cache tokens",
+    )
     parser.add_argument("--layer_budget_alpha", type=float, default=0.7)
     parser.add_argument("--layer_budget_min_tokens", type=int, default=0)
     parser.add_argument("--layer_budget_eps", type=float, default=0)
@@ -174,9 +182,25 @@ def get_args_parser():
     parser.add_argument("--eviction_debug", action="store_true", help="Print verbose eviction summaries without enabling latency profiling")
     parser.add_argument("--profile_eviction", action="store_true", help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior")
     add_leverage_score_histogram_args(parser)
-    parser.add_argument("--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)")
+    parser.add_argument("--budget", type=int, default=60000, help="Total token budget for StreamVGGT (if applicable)")
     parser.add_argument("--budget_frame_multiplier", type=float, default=None, help="Set StreamVGGT total budget to ceil(multiplier * tokens_per_frame) * num_global_layers; overrides --budget")
     return parser
+
+
+def summarize_layer_budget_log(log_path):
+    if not log_path or not os.path.exists(log_path):
+        return
+    script_path = Path(__file__).resolve().parents[3] / "tools" / "summarize_layer_budget_scores.py"
+    if not script_path.exists():
+        print(f"[LayerBudget] summary script not found: {script_path}")
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(script_path), str(log_path)],
+            check=True,
+        )
+    except Exception as exc:
+        print(f"[LayerBudget] failed to summarize {log_path}: {exc}")
 
 
 def eval_pose_estimation(args, model, save_dir=None):
@@ -247,8 +271,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         os.path.join(dir_path, name) for name in os.listdir(dir_path)
                     ]
                     filelist.sort()
-                effective_stride = args.kf_every * args.pose_eval_stride
-                filelist = filelist[::effective_stride]
+                filelist = filelist[::args.pose_eval_stride]
                 if args.max_frames is not None:
                     filelist = filelist[: args.max_frames]
                 if not filelist:
@@ -264,6 +287,12 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     }
                     frames.append(frame)
 
+                safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
+                layer_budget_log_path = None
+                if args.layer_budget_log_path:
+                    layer_budget_log_path = args.layer_budget_log_path
+                elif args.layer_budget_log_scores:
+                    layer_budget_log_path = os.path.join(save_dir, safe_seq, "layer_budget_scores.csv")
                 predictions = {}
                 with torch.no_grad():
                     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -274,7 +303,6 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 
                         leverage_score_histogram_config = None
                         if args.leverage_score_histogram_dir:
-                            safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                             hist_dir = os.path.join(
                                 args.leverage_score_histogram_dir,
                                 args.eval_dataset,
@@ -318,12 +346,14 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_attention_colsum_subsample_ratio=args.leverage_attention_colsum_subsample_ratio,
                             leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
                             layer_budget_strategy=args.layer_budget_strategy,
+                            layer_budget_score_only=args.layer_budget_score_only,
                             layer_budget_value_gamma=args.layer_budget_value_gamma,
                             layer_budget_value_norm_type=args.layer_budget_value_norm_type,
                             layer_budget_norm_source=args.layer_budget_norm_source,
                             layer_budget_alpha=args.layer_budget_alpha,
                             layer_budget_min_tokens=args.layer_budget_min_tokens,
                             layer_budget_eps=args.layer_budget_eps,
+                            layer_budget_log_path=layer_budget_log_path,
                             profile_eviction=args.profile_eviction,
                             empty_cache_interval=args.empty_cache_interval,
                             eviction_debug=args.eviction_debug,
@@ -339,6 +369,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     f"Finished pose estimation for {args.eval_dataset} {seq: <16}, "
                     f"Inference time: {infer_time:.6f}s, FPS: {fps:.2f}"
                 )
+                summarize_layer_budget_log(layer_budget_log_path)
 
                 all_camera_pose = []
                 for res in output.ress:
@@ -405,14 +436,14 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     elif args.eval_dataset == "sintel":
                         gt_traj = load_traj(
                             gt_traj_file=gt_traj_file,
-                            stride=effective_stride,
+                            stride=args.pose_eval_stride,
                             num_frames=len(filelist),
                         )
                     elif traj_format is not None:
                         gt_traj = load_traj(
                             gt_traj_file=gt_traj_file,
                             traj_format=traj_format,
-                            stride=effective_stride,
+                            stride=args.pose_eval_stride,
                             num_frames=len(filelist),
                         )
                     else:

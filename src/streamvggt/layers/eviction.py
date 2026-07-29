@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional
@@ -31,7 +32,7 @@ VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES = (
 )
 
 
-def _participation_ratio_from_values(values: Optional[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
+def _participation_ratio_from_values(values: Optional[torch.Tensor], eps: float = 0) -> torch.Tensor:
     if values is None or values.numel() == 0:
         device = values.device if values is not None else "cpu"
         return torch.tensor(0.0, device=device)
@@ -44,7 +45,7 @@ def _participation_ratio_from_values(values: Optional[torch.Tensor], eps: float 
     return torch.where(sum_values > eps, pr, torch.zeros_like(pr))
 
 
-def _layer_score_leverage_pr(lev: Optional[torch.Tensor], eps: float = 1e-12) -> torch.Tensor:
+def _layer_score_leverage_pr(lev: Optional[torch.Tensor], eps: float = 0) -> torch.Tensor:
     """Effective count from the participation ratio of QR leverage mass."""
     return _participation_ratio_from_values(lev, eps)
 
@@ -59,36 +60,11 @@ def _combine_layer_budget_pr_base(
 
     raise AssertionError(f"Unhandled layer budget strategy: {strategy}")
 
-
-def _layer_value_norm_score(
-    values: Optional[torch.Tensor],
-    norm_type: str = "rms",
-    eps: float = 1e-12,
-) -> torch.Tensor:
-    """Layer-level value magnitude score from token value rows."""
-    if values is None or values.numel() == 0:
-        device = values.device if values is not None else "cpu"
-        return torch.tensor(0.0, device=device, dtype=torch.float32)
-    if norm_type not in ("mean", "rms"):
-        raise ValueError(f"layer_budget_value_norm_type must be 'mean' or 'rms', got {norm_type!r}")
-    with torch.no_grad():
-        v = values.float()
-        v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
-        if v.numel() == 0:
-            return torch.zeros((), device=values.device, dtype=torch.float32)
-        v_norm = torch.linalg.vector_norm(v, ord=2, dim=-1)
-        if v_norm.numel() == 0:
-            return torch.zeros((), device=values.device, dtype=torch.float32)
-        if norm_type == "mean":
-            return v_norm.mean()
-        return torch.sqrt(v_norm.square().mean().clamp_min(eps))
-
-
 def _combine_value_weighted_leverage_pr_scores(
     base_scores,
     value_norms,
     gamma: float,
-    eps: float = 1e-12,
+    eps: float = 0,
     active_mask: Optional[torch.Tensor] = None,
     alpha: float = 1.0,
 ) -> torch.Tensor:
@@ -104,12 +80,15 @@ def _combine_value_weighted_leverage_pr_scores(
         active = torch.as_tensor(active_mask, device=base.device, dtype=torch.bool)
         if active.shape != base.shape:
             raise ValueError(f"active_mask shape {tuple(active.shape)} must match base_scores {tuple(base.shape)}")
-    if float(gamma) != 0.0 and active.any():
+    if float(gamma) != 0.0:
         active_values = values[active]
-        value_mean = active_values.mean() if active_values.numel() else values.new_tensor(0.0)
-        if torch.isfinite(value_mean) and float(value_mean.item()) > eps:
-            prior_active = (active_values / value_mean.clamp_min(eps)).clamp_min(0.0).pow(float(gamma))
-            prior[active] = torch.nan_to_num(prior_active, nan=1.0, posinf=1.0, neginf=1.0)
+        if active_values.numel():
+            value_mean = active_values.mean()
+            valid_mean = torch.isfinite(value_mean) & (value_mean > eps)
+            safe_mean = torch.where(valid_mean, value_mean, torch.ones_like(value_mean))
+            prior_active = (active_values / safe_mean).clamp_min(0.0).pow(float(gamma))
+            prior_active = torch.nan_to_num(prior_active, nan=1.0, posinf=1.0, neginf=1.0)
+            prior[active] = torch.where(valid_mean, prior_active, torch.ones_like(prior_active))
     return base.pow(float(alpha)) * prior
 
 
@@ -201,7 +180,7 @@ def _allocate_layer_budgets_from_scores(
     total_budget: int,
     alpha: float = 0.5,
     min_tokens: int = 0,
-    eps: float = 1e-12,
+    eps: float = 0,
     return_debug: bool = False,
 ):
     """Allocate integer layer budgets from scalar layer scores."""
@@ -328,6 +307,14 @@ class SvdLeverageBasis:
     basis_kind: str = "qr"
 
 
+@dataclass
+class LayerBudgetScoreResult:
+    """Raw scores produced without selecting or removing cache tokens."""
+
+    policy_scores: torch.Tensor
+    layer_budget_score: torch.Tensor
+
+
 class EvictionManager:
     """Dispatches head-wise cache eviction policies."""
 
@@ -384,6 +371,8 @@ class EvictionManager:
         self.leverage_ridge_jitter = float(leverage_ridge_jitter)
         self.leverage_ridge_dim = leverage_ridge_dim
         self.rls_refresh_interval = int(rls_refresh_interval)
+        if self.rls_refresh_interval < 1:
+            raise ValueError("rls_refresh_interval must be >= 1")
         self.leverage_random_seed = int(leverage_random_seed)
         self.leverage_eviction_selector = leverage_eviction_selector
         self.leverage_conf_gate = bool(leverage_conf_gate)
@@ -506,16 +495,12 @@ class EvictionManager:
             policy_scores = mean_scores
             kept = self._keep_lowest_scores(policy_scores, num_to_keep)
         elif self.policy == "svd_leverage":
-            if need_leverage_basis:
-                policy_scores, leverage_basis = self._layer_svd_leverage_scores(
-                    candidate_k,
-                    candidate_v,
-                    return_basis=True,
-                )
-            else:
-                policy_scores = self._layer_svd_leverage_scores(candidate_k, candidate_v)
-            raw_policy_scores = policy_scores
-            layer_budget_score = self._compute_layer_budget_score(raw_policy_scores, candidate_k, candidate_v)
+            raw_policy_scores, leverage_basis, layer_budget_score = self._score_svd_leverage_candidates(
+                candidate_k,
+                candidate_v,
+                need_leverage_basis=need_leverage_basis,
+            )
+            policy_scores = raw_policy_scores
             policy_scores = self._apply_confidence_gate(
                 policy_scores,
                 candidate_depth_confidence,
@@ -532,8 +517,15 @@ class EvictionManager:
                 shared_across_heads=True,
                 attention_observed=candidate_attention_observed,
             )
-            kept = self._select_svd_leverage_kept(
+            selection_scores = self._prioritize_current_frame_for_attention_only(
                 policy_scores,
+                candidate_frame_ids=candidate_frame_ids,
+                current_frame_idx=current_frame_idx,
+                attention_utility_beta=attention_utility_beta,
+                attention_utility_enabled=candidate_attention_utility is not None,
+            )
+            kept = self._select_svd_leverage_kept(
+                selection_scores,
                 num_to_keep,
                 num_heads=H,
             )
@@ -599,6 +591,88 @@ class EvictionManager:
             leverage_basis=leverage_basis,
             layer_budget_score=layer_budget_score,
         )
+
+    def score_layer_budget(
+        self,
+        k: torch.Tensor,
+        num_anchor_tokens: int,
+        *,
+        v: Optional[torch.Tensor] = None,
+        layer_id: Optional[int] = None,
+        step_idx: Optional[int] = None,
+        current_frame_idx: Optional[int] = None,
+        capture_projected_norms: bool = False,
+    ) -> LayerBudgetScoreResult:
+        """Compute the value-weighted leverage payload without selecting tokens."""
+        if self.policy != "svd_leverage":
+            raise ValueError("Layer-budget score-only mode requires policy='svd_leverage'")
+        if self.leverage_granularity != "layer":
+            raise ValueError("Layer-budget score-only mode requires leverage_granularity='layer'")
+        if self.layer_budget_strategy != "value_weighted_leverage_pr":
+            raise ValueError(
+                "Layer-budget score-only mode requires "
+                "layer_budget_strategy='value_weighted_leverage_pr'"
+            )
+
+        _, _, num_tokens, _ = k.shape
+        num_anchor_tokens = max(0, min(int(num_anchor_tokens), num_tokens))
+        candidate_k = k[:, :, num_anchor_tokens:, :]
+        candidate_v = v[:, :, num_anchor_tokens:, :] if v is not None else None
+        self._last_leverage_profile = {}
+        self._last_layer_feature_shape = None
+        self._set_rls_context(step_idx=step_idx, current_frame_idx=current_frame_idx)
+        self._last_projected_pre_norms = None
+        self._last_projected_key_features = None
+        self._last_projected_key_pre_norms = None
+        self._last_projected_key_cache_meta = None
+        self._capture_projected_norms = bool(capture_projected_norms)
+
+        policy_scores, _, layer_budget_score = self._score_svd_leverage_candidates(
+            candidate_k,
+            candidate_v,
+            need_leverage_basis=False,
+        )
+        if layer_budget_score is None:
+            raise RuntimeError("value_weighted_leverage_pr did not produce a layer-budget score")
+        self.commit_projected_key_cache_without_eviction()
+
+        if self.debug:
+            print(
+                f"[EvictionManager][score-only] layer={layer_id} step={step_idx} "
+                f"cache={num_tokens} anchors={num_anchor_tokens} "
+                f"candidates={candidate_k.shape[2]} scores={tuple(policy_scores.shape)}"
+            )
+        if self.debug or self.profile:
+            self._record_last_leverage_profile()
+        return LayerBudgetScoreResult(
+            policy_scores=policy_scores,
+            layer_budget_score=layer_budget_score,
+        )
+
+    def _score_svd_leverage_candidates(
+        self,
+        candidate_k: torch.Tensor,
+        candidate_v: Optional[torch.Tensor],
+        *,
+        need_leverage_basis: bool,
+    ) -> tuple[torch.Tensor, Optional[SvdLeverageBasis], Optional[torch.Tensor]]:
+        if need_leverage_basis:
+            policy_scores, leverage_basis = self._layer_svd_leverage_scores(
+                candidate_k,
+                candidate_v,
+                return_basis=True,
+            )
+        else:
+            policy_scores = self._layer_svd_leverage_scores(candidate_k, candidate_v)
+            leverage_basis = None
+        layer_budget_score = None
+        if self.layer_budget_strategy in LAYER_BUDGET_SCORE_STRATEGIES:
+            layer_budget_score = self._compute_layer_budget_score(
+                policy_scores,
+                candidate_k,
+                candidate_v,
+            )
+        return policy_scores, leverage_basis, layer_budget_score
 
     def _compute_layer_budget_score(
         self,
@@ -820,6 +894,34 @@ class EvictionManager:
         result = torch.where(observed, blended, normalized_scores)
         any_observed = observed.any(dim=-1, keepdim=True)
         return torch.where(any_observed, result, scores.float())
+
+    @staticmethod
+    def _prioritize_current_frame_for_attention_only(
+        scores: torch.Tensor,
+        *,
+        candidate_frame_ids: Optional[torch.Tensor],
+        current_frame_idx: Optional[int],
+        attention_utility_beta: float,
+        attention_utility_enabled: bool,
+    ) -> torch.Tensor:
+        if (
+            not attention_utility_enabled
+            or float(attention_utility_beta) != 1.0
+            or candidate_frame_ids is None
+            or current_frame_idx is None
+        ):
+            return scores
+        if scores.ndim != 2 or tuple(candidate_frame_ids.shape) != tuple(scores.shape):
+            raise ValueError(
+                "Current-frame attention-only prioritization requires scores and "
+                "candidate_frame_ids shaped [B, N], "
+                f"got scores={tuple(scores.shape)} frame_ids={tuple(candidate_frame_ids.shape)}"
+            )
+
+        current_mask = candidate_frame_ids.to(device=scores.device).eq(int(current_frame_idx))
+        prioritized = scores.float()
+        max_score = torch.finfo(prioritized.dtype).max
+        return prioritized.masked_fill(current_mask, max_score)
 
     @staticmethod
     def _confidence_gate_tensor(
@@ -1067,7 +1169,7 @@ class EvictionManager:
         next_norms = torch.gather(pre_norms, 1, row_indices)
 
         if tail_k is not None and int(tail_k.shape[2]) > 0:
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 tail = tail_k
                 omega = self._get_leverage_right_sketch(
                     H * int(meta["head_dim"]),
@@ -1085,6 +1187,20 @@ class EvictionManager:
 
         self._projected_key_cache = next_features.detach()
         self._projected_key_pre_norm_cache = next_norms.detach()
+        self._projected_key_cache_meta = dict(meta)
+
+    def commit_projected_key_cache_without_eviction(self) -> None:
+        """Promote all most-recent projected candidates into the persistent cache."""
+        if not self.leverage_projected_key_cache:
+            return
+        features = self._last_projected_key_features
+        pre_norms = self._last_projected_key_pre_norms
+        meta = self._last_projected_key_cache_meta
+        if features is None or pre_norms is None or meta is None:
+            self.reset_projected_key_cache()
+            return
+        self._projected_key_cache = features.detach()
+        self._projected_key_pre_norm_cache = pre_norms.detach()
         self._projected_key_cache_meta = dict(meta)
 
     def _get_leverage_right_sketch(
@@ -1242,7 +1358,7 @@ class EvictionManager:
         if sketch_dim is not None:
             profile["sketch_dim"] = float(sketch_dim)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             work = mat
             meta = self._rls_cache_meta_for(
                 mat,
@@ -1285,7 +1401,12 @@ class EvictionManager:
                 eye = eye.view(*((1,) * (work.ndim - 2)), feature_dim, feature_dim)
                 chol_start = time.perf_counter() if do_profile else 0.0
                 last_a = None
-                for retry_idx, jitter_multiplier in enumerate((1.0, 10.0, 100.0, 1000.0)):
+                jitter_multipliers = (
+                    (1.0,)
+                    if float(self.leverage_ridge_jitter) == 0.0
+                    else (1.0, 10.0, 100.0, 1000.0)
+                )
+                for retry_idx, jitter_multiplier in enumerate(jitter_multipliers):
                     diag_add = lam + float(self.leverage_ridge_jitter) * float(jitter_multiplier) * jitter_scale
                     last_a = gram + diag_add.unsqueeze(-1).unsqueeze(-1) * eye
                     chol, info = torch.linalg.cholesky_ex(last_a)
@@ -1303,7 +1424,9 @@ class EvictionManager:
                         f"method={basis_kind} granularity={granularity} frame={frame_idx} "
                         f"N={num_tokens} D={feature_dim} retry={retry_idx} "
                         f"jitter_multiplier={jitter_multiplier:g} diag_add_mean={diag_mean:.6g} "
-                        f"info_max={info_max}"
+                        f"info_max={info_max}",
+                        file=sys.stderr,
+                        flush=True,
                     )
                     chol = None
                     retries = retry_idx + 1
@@ -1311,7 +1434,9 @@ class EvictionManager:
                     print(
                         "[RLS][pinv_fallback] "
                         f"method={basis_kind} granularity={granularity} frame={frame_idx} "
-                        f"N={num_tokens} D={feature_dim} retries={retries}"
+                        f"N={num_tokens} D={feature_dim} retries={retries}",
+                        file=sys.stderr,
+                        flush=True,
                     )
                     try:
                         inv_a = torch.linalg.pinv(last_a)
@@ -1322,7 +1447,9 @@ class EvictionManager:
                         print(
                             "[RLS][pinv_failed] "
                             f"method={basis_kind} granularity={granularity} frame={frame_idx} "
-                            f"N={num_tokens} D={feature_dim} error={exc}"
+                            f"N={num_tokens} D={feature_dim} error={exc}",
+                            file=sys.stderr,
+                            flush=True,
                         )
                 if do_profile:
                     if chol is not None:
@@ -1401,6 +1528,13 @@ class EvictionManager:
                 fallback = 0.0
                 score_backend = "chol_solve"
             else:
+                print(
+                    "[RLS][norm_fallback] "
+                    f"method={basis_kind} granularity={granularity} frame={frame_idx} "
+                    f"N={num_tokens} D={feature_dim} reason=no_valid_cholesky_or_pinv",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 scores = work.square().sum(dim=-1)
                 fallback = max(fallback_state, 2.0)
                 score_backend = "norm_fallback"
@@ -1479,7 +1613,7 @@ class EvictionManager:
             self._sync_for_timing(candidate_k)
         total_start = time.perf_counter() if do_profile else 0.0
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast("cuda", enabled=False):
             # Right-sketched leverage / Compactor-style approximation for the
             # concatenated layer feature matrix, applied without materializing
             # the full [B, N, H * D] matrix first.

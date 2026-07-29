@@ -147,7 +147,8 @@ def plot_layer_mean_bar(
     output_path: Path,
     title: str = "Mean Layer-Budget Score by Layer",
     ylabel: str = "mean score",
-    color: str = "#4C78A8",
+    color: str = "#F8A054",
+    ymax: float | None = None,
 ) -> None:
     import matplotlib
 
@@ -163,6 +164,9 @@ def plot_layer_mean_bar(
     ax.set_xlabel("layer number")
     ax.set_ylabel(ylabel)
     ax.set_xticks(layers)
+    ax.tick_params(axis="both", labelsize=18)
+    if ymax is not None:
+        ax.set_ylim(0, ymax)
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
     fig.savefig(output_path)
@@ -199,6 +203,50 @@ def get_step_budgets(rows: list[dict[str, str]], step: int) -> list[tuple[int, f
     ]
 
 
+def plot_all_frame_layer_bars(
+    rows: list[dict[str, str]],
+    layers: list[int],
+    output_dir: Path,
+    *,
+    value_field: str,
+    filename_suffix: str,
+    title_label: str,
+    ylabel: str,
+    color: str=None,
+) -> list[Path]:
+    by_step: dict[int, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        by_step[int(row["step"])].append(row)
+
+    frame_values: list[tuple[int, str, list[tuple[int, float]]]] = []
+    global_max = 0.0
+    for step in sorted(by_step):
+        step_rows = by_step[step]
+        row_by_layer = {int(row["layer"]): row for row in step_rows}
+        values = [
+            (layer, _float_or_zero(row_by_layer.get(layer, {}).get(value_field, "0")))
+            for layer in layers
+        ]
+        global_max = max(global_max, *(value for _, value in values))
+        frame_values.append((step, step_rows[0].get("strategy", ""), values))
+
+    shared_ymax = global_max * 1.05 if global_max > 0 else 1.0
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_paths = []
+    for step, strategy, values in frame_values:
+        output_path = output_dir / f"frame_{step:06d}_{filename_suffix}_by_layer.png"
+        strategy_suffix = f" ({strategy})" if strategy else ""
+        plot_layer_mean_bar(
+            values,
+            output_path,
+            title=f"{title_label} at Frame {step}{strategy_suffix}",
+            ylabel=ylabel,
+            ymax=shared_ymax,
+        )
+        output_paths.append(output_path)
+    return output_paths
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_csv", type=Path)
@@ -232,7 +280,7 @@ def main() -> None:
     budget_layer_mean_csv = output_dir / "layer_budget_layer_mean_budgets.csv"
     budget_layer_bar = output_dir / "layer_budget_layer_mean_budget_by_layer.png"
 
-    _, layer_scores, frame_rows = write_frame_wide(rows, frame_csv)
+    layers, layer_scores, frame_rows = write_frame_wide(rows, frame_csv)
     layer_means = write_layer_means(layer_scores, layer_mean_csv)
     frame_means = [_float_or_zero(str(row["mean_score"])) for row in frame_rows]
     plot_layer_mean_bar(layer_means, layer_bar)
@@ -245,6 +293,26 @@ def main() -> None:
         title="Mean Layer Budget by Layer",
         ylabel="mean final_budget",
         color="#F58518",
+    )
+    frame_score_dir = output_dir / "layer_budget_frame_scores"
+    frame_budget_dir = output_dir / "layer_budget_frame_budgets"
+    frame_score_plots = plot_all_frame_layer_bars(
+        rows,
+        layers,
+        frame_score_dir,
+        value_field="score",
+        filename_suffix="score",
+        title_label="Layer-Budget Score by Layer",
+        ylabel="score",
+    )
+    frame_budget_plots = plot_all_frame_layer_bars(
+        rows,
+        layers,
+        frame_budget_dir,
+        value_field="final_budget",
+        filename_suffix="budget",
+        title_label="Final Layer Budget by Layer",
+        ylabel="final_budget",
     )
 
     step_plot = None
@@ -269,6 +337,8 @@ def main() -> None:
     print(f"wrote {budget_frame_csv}")
     print(f"wrote {budget_layer_mean_csv}")
     print(f"wrote {budget_layer_bar}")
+    print(f"wrote {len(frame_score_plots)} frame score plots under {frame_score_dir}")
+    print(f"wrote {len(frame_budget_plots)} frame budget plots under {frame_budget_dir}")
     if step_plot is not None:
         print(f"wrote {step_plot}")
 

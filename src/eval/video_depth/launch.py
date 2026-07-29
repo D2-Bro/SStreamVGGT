@@ -189,6 +189,13 @@ def get_args_parser():
         help="Layer-wise KV budget allocation strategy",
     )
     parser.add_argument(
+        "--layer_budget_score_only",
+        "--layer-budget-score-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compute value_weighted_leverage_pr every frame without removing KV cache tokens",
+    )
+    parser.add_argument(
         "--layer_budget_proportions_path",
         type=str,
         default=None,
@@ -461,6 +468,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_attention_freeze_updates=args.leverage_attention_freeze_updates,
                         leverage_attention_colsum_subsample_ratio=args.leverage_attention_colsum_subsample_ratio,
                         layer_budget_strategy=args.layer_budget_strategy,
+                        layer_budget_score_only=args.layer_budget_score_only,
                         layer_budget_value_gamma=args.layer_budget_value_gamma,
                         layer_budget_value_norm_type=args.layer_budget_value_norm_type,
                         layer_budget_norm_source=args.layer_budget_norm_source,
