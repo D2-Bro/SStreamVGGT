@@ -10,10 +10,22 @@ model_name="StreamVGGT"
 ckpt_name="checkpoints"
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 
+<<<<<<< Updated upstream
 eval_dataset="${POSE_EVAL_DATASET:-tum_stride2}"
 
 size="518"
 max_frames="full_seq"
+=======
+eval_dataset="${POSE_EVAL_DATASET:-TnT}"
+seq_args=()
+if [ -n "${POSE_SEQ_LIST:-}" ]; then
+    seq_args=(--seq_list "$POSE_SEQ_LIST")
+fi
+
+size="518"
+max_frames="full_seq"
+kf_every="1"
+>>>>>>> Stashed changes
 pose_eval_stride="1"
 empty_cache_interval="1"
 stream_chunk_size="${STREAM_CHUNK_SIZE:-1}"

@@ -1,5 +1,6 @@
 import os
 import glob
+import csv
 from tqdm import tqdm
 
 
@@ -341,6 +342,93 @@ def _vkitti2_clone_00_metadata():
         "skip_condition": None,
         "process_func": None,
     }
+def _liloc_root():
+    return os.environ.get("SSTREAMVGGT_LILOC_ROOT", "/home/dongjae/data/LILOCBench")
+
+
+def _liloc_manifest(root=None):
+    root = root or _liloc_root()
+    return os.path.join(
+        root,
+        "aligned_front_gt",
+        "front_gt_manifest_camera_front_color_optical_frame.csv",
+    )
+
+
+def _liloc_sequences(root=None):
+    root = root or _liloc_root()
+    if not os.path.isdir(root):
+        return []
+    manifest = _liloc_manifest(root)
+    image_dir = os.path.join(root, "camera_front", "color", "images")
+    gt_file = os.path.join(
+        root,
+        "aligned_front_gt",
+        "front_gt_poses_camera_front_color_optical_frame.txt",
+    )
+    if os.path.exists(manifest) and os.path.isdir(image_dir) and os.path.exists(gt_file):
+        return ["LILOCBench"]
+    return []
+
+
+def _liloc_manifest_image_files(dir_path):
+    root = os.path.abspath(os.path.join(dir_path, "..", "..", ".."))
+    manifest = _liloc_manifest(root)
+    if not os.path.exists(manifest):
+        return []
+
+    image_files = []
+    with open(manifest, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rel_path = row.get("front_source")
+            if rel_path:
+                image_files.append(os.path.join(root, rel_path))
+    return image_files
+
+
+def _tnt_root():
+    return os.environ.get("SSTREAMVGGT_TNT_ROOT", "/home/dongjae/data/TnT")
+
+
+def _tnt_sequences(root=None):
+    root = root or _tnt_root()
+    pose_root = os.path.join(root, "COLMAP_SfM")
+    if not os.path.isdir(root) or not os.path.isdir(pose_root):
+        return []
+
+    seqs = []
+    for seq in sorted(os.listdir(root)):
+        seq_dir = os.path.join(root, seq)
+        pose_file = os.path.join(pose_root, f"{seq}_COLMAP_SfM.log")
+        if (
+            os.path.isdir(seq_dir)
+            and os.path.exists(pose_file)
+            and _tnt_image_files(seq_dir)
+        ):
+            seqs.append(seq)
+    return seqs
+
+
+def _tnt_image_sort_key(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.isdigit():
+        return (0, int(stem))
+    return (1, stem)
+
+
+def _tnt_image_files(dir_path):
+    return sorted(
+        glob.glob(os.path.join(dir_path, "*.jpg")),
+        key=_tnt_image_sort_key,
+    )
+
+
+def _tnt_frame_id(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if not stem.isdigit():
+        raise ValueError(f"TnT image name is not numeric: {path}")
+    return int(stem) - 1
 
 
 KITTI_ODOMETRY_GT_SEQS = [f"{i:02d}" for i in range(11)]
@@ -502,6 +590,43 @@ dataset_metadata = {
     },
     "vkitti2": _vkitti2_clone_00_metadata(),
     "vkitti2_clone_00": _vkitti2_clone_00_metadata(),
+    "LILOC": {
+        "img_path": _liloc_root(),
+        "anno_path": _liloc_root(),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(
+            img_path, "camera_front", "color", "images"
+        ),
+        "filelist_func": _liloc_manifest_image_files,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
+            anno_path,
+            "aligned_front_gt",
+            "front_gt_poses_camera_front_color_optical_frame.txt",
+        ),
+        "traj_format": "tum",
+        "seq_list": _liloc_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
+    "TnT": {
+        "img_path": _tnt_root(),
+        "anno_path": os.path.join(_tnt_root(), "COLMAP_SfM"),
+        "mask_path": None,
+        "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq),
+        "filelist_func": _tnt_image_files,
+        "frame_id_func": _tnt_frame_id,
+        "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
+            anno_path, f"{seq}_COLMAP_SfM.log"
+        ),
+        "traj_format": "tnt_colmap_log",
+        "seq_list": _tnt_sequences(),
+        "full_seq": False,
+        "mask_path_seq_func": lambda mask_path, seq: None,
+        "skip_condition": None,
+        "process_func": None,
+    },
     "bonn": {
         "img_path": "data/bonn/rgbd_bonn_dataset",
         "mask_path": None,

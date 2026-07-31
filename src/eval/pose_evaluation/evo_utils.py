@@ -162,12 +162,62 @@ def load_nrgbd_traj(gt_file):
     return traj_tum, timestamps_mat
 
 
-def load_traj(gt_traj_file, traj_format="sintel", skip=0, stride=1, num_frames=None):
+def load_tnt_colmap_log_traj(gt_file, frame_ids=None):
+    with open(gt_file) as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    if len(lines) % 5 != 0:
+        raise ValueError(f"Invalid TnT COLMAP log line count in {gt_file}: {len(lines)}")
+
+    poses_by_frame_id = {}
+    for idx in range(0, len(lines), 5):
+        header = lines[idx].split()
+        if len(header) < 1:
+            raise ValueError(f"Invalid TnT COLMAP log header at line {idx + 1}: {lines[idx]}")
+        frame_id = int(header[0])
+        pose = np.array(
+            [[float(value) for value in lines[idx + row].split()] for row in range(1, 5)],
+            dtype=np.float64,
+        )
+        if pose.shape != (4, 4):
+            raise ValueError(f"Invalid TnT pose shape at frame {frame_id}: {pose.shape}")
+        poses_by_frame_id[frame_id] = pose
+
+    if frame_ids is None:
+        selected_frame_ids = sorted(poses_by_frame_id)
+    else:
+        selected_frame_ids = [int(frame_id) for frame_id in frame_ids]
+
+    missing = [frame_id for frame_id in selected_frame_ids if frame_id not in poses_by_frame_id]
+    if missing:
+        preview = ", ".join(str(frame_id) for frame_id in missing[:10])
+        suffix = "..." if len(missing) > 10 else ""
+        raise ValueError(f"TnT log {gt_file} is missing pose frame ids: {preview}{suffix}")
+
+    poses = [poses_by_frame_id[frame_id] for frame_id in selected_frame_ids]
+    pose_path = PosePath3D(poses_se3=poses)
+    timestamps_mat = np.array(selected_frame_ids, dtype=float)
+    traj = PoseTrajectory3D(poses_se3=pose_path.poses_se3, timestamps=timestamps_mat)
+    xyz = traj.positions_xyz
+    quat = traj.orientations_quat_wxyz
+    traj_tum = np.column_stack((xyz, quat))
+    return traj_tum, timestamps_mat
+
+
+def load_traj(
+    gt_traj_file,
+    traj_format="sintel",
+    skip=0,
+    stride=1,
+    num_frames=None,
+    frame_ids=None,
+):
     """Read trajectory format. Return in TUM-RGBD format.
     Returns:
         traj_tum (N, 7): camera to world poses in (x,y,z,qx,qy,qz,qw)
         timestamps_mat (N, 1): timestamps
     """
+    already_sampled = False
     if traj_format == "replica":
         traj_tum, timestamps_mat = load_replica_traj(gt_traj_file)
     elif traj_format == "sintel":
@@ -178,6 +228,9 @@ def load_traj(gt_traj_file, traj_format="sintel", skip=0, stride=1, num_frames=N
         traj_tum, timestamps_mat = load_kitti_traj(gt_traj_file)
     elif traj_format == "nrgbd":
         traj_tum, timestamps_mat = load_nrgbd_traj(gt_traj_file)
+    elif traj_format == "tnt_colmap_log":
+        traj_tum, timestamps_mat = load_tnt_colmap_log_traj(gt_traj_file, frame_ids=frame_ids)
+        already_sampled = frame_ids is not None
     elif traj_format in ["tum", "tartanair"]:
         traj = file_interface.read_tum_trajectory_file(gt_traj_file)
         xyz = traj.positions_xyz
@@ -187,8 +240,9 @@ def load_traj(gt_traj_file, traj_format="sintel", skip=0, stride=1, num_frames=N
     else:
         raise NotImplementedError
 
-    traj_tum = traj_tum[skip::stride]
-    timestamps_mat = timestamps_mat[skip::stride]
+    if not already_sampled:
+        traj_tum = traj_tum[skip::stride]
+        timestamps_mat = timestamps_mat[skip::stride]
     if num_frames is not None:
         traj_tum = traj_tum[:num_frames]
         timestamps_mat = timestamps_mat[:num_frames]

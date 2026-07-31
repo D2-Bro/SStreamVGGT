@@ -7,7 +7,7 @@ ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
 max_frames='full_seq'
-eval_dataset='NRGBD'
+eval_dataset='LILOC'
 eviction_policy='svd_leverage'
 # Switch to leverage_entropy to test the entropy effective-count allocator.
 layer_budget_strategy='leverage_pr' #[leverage_pr, uniform, leverage_entropy, value_weighted_leverage_pr]
@@ -32,7 +32,7 @@ leverage_ridge_lambda=0
 leverage_ridge_lambda_mode=relative
 leverage_ridge_score_chunk_size=4096
 leverage_ridge_jitter=1e-6
-leverage_ridge_dim=16
+leverage_ridge_dim=64
 leverage_random_seed=42
 
 history_anchor_strategy=none

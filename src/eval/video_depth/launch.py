@@ -177,11 +177,99 @@ def get_args_parser():
         default="topk",
         help="Eviction selector for svd_leverage scores: topk, shared Fast DPP, similarity top-k, or GPU head-wise Fast DPP with layer scores",
     )
+<<<<<<< Updated upstream
     parser.add_argument("--leverage_conf_gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
     parser.add_argument("--leverage_conf_gate_floor", type=float, default=0.0, help="Minimum multiplicative confidence gate value")
     parser.add_argument("--leverage_conf_gate_depth_alpha", type=float, default=1.0, help="Exponent applied to transformed depth confidence")
     parser.add_argument("--leverage_conf_gate_point_beta", type=float, default=0.0, help="Exponent applied to transformed world-points confidence")
     parser.add_argument("--leverage_conf_gate_k", type=float, default=1.0, help="Positive scale used by the ratio confidence transform")
+=======
+    parser.add_argument(
+        "--leverage_similarity_granularity",
+        "--leverage-similarity-granularity",
+        type=str,
+        default="layer",
+        choices=("layer", "head"),
+        help="Similarity feature granularity for similarity_topk: layer preserves shared layer-wise eviction, head uses head-wise cosine and head-specific eviction",
+    )
+    parser.add_argument(
+        "--leverage_similarity_feature_projection",
+        "--leverage-similarity-feature-projection",
+        type=str,
+        default="raw",
+        choices=("raw", "random"),
+        help="Feature source for similarity_topk cosine: raw key features or random projected leverage features reused from score computation",
+    )
+    parser.add_argument(
+        "--leverage_similarity_leverage_gamma",
+        "--leverage-similarity-leverage-gamma",
+        type=float,
+        default=1.0,
+        help="Exponent gamma in similarity_topk eviction score: max_cosine / leverage**gamma",
+    )
+    parser.add_argument(
+        "--leverage_eviction_risk_mode",
+        "--leverage-eviction-risk-mode",
+        type=str,
+        default="low_leverage",
+        choices=("low_leverage", "outlier_then_low"),
+        help="SVD leverage eviction risk mode: existing low-leverage eviction or direct high-outlier eviction before low-score selection",
+    )
+    parser.add_argument(
+        "--leverage_high_outlier_z",
+        "--leverage-high-outlier-z",
+        type=float,
+        default=3.0,
+        help="Robust z-score threshold for direct high-leverage outlier eviction when leverage_eviction_risk_mode=outlier_then_low",
+    )
+    parser.add_argument(
+        "--leverage_dpp_candidate_multiplier",
+        "--leverage-dpp-candidate-multiplier",
+        type=int,
+        default=2,
+        help="Fast DPP low-score candidate pool multiplier relative to eviction count",
+    )
+    parser.add_argument(
+        "--leverage_dpp_greedy_block_size",
+        "--leverage-dpp-greedy-block-size",
+        type=int,
+        default=32,
+        help="Fast DPP greedy selection block size; 1 is quality-oriented, larger values favor speed",
+    )
+    parser.add_argument(
+        "--leverage_dpp_quality_beta",
+        "--leverage-dpp-quality-beta",
+        type=float,
+        default=1.0,
+        help="Fast DPP quality log-term weight; 0 removes quality from DPP selection",
+    )
+    parser.add_argument(
+        "--leverage_dpp_diversity_beta",
+        "--leverage-dpp-diversity-beta",
+        type=float,
+        default=1.0,
+        help="Fast DPP diversity log-term weight; 1.0 preserves the default DPP balance",
+    )
+    parser.add_argument(
+        "--leverage_dpp_feature_projection",
+        "--leverage-dpp-feature-projection",
+        type=str,
+        default="raw",
+        choices=("raw", "random"),
+        help="Feature projection for Fast DPP diversity similarity; random reuses leverage_ridge_dim",
+    )
+    parser.add_argument("--leverage_dpp_recency_bonus", "--leverage-dpp-recency-bonus", action="store_true", help="Add a soft recency bonus to SVD leverage eviction scores")
+    parser.add_argument("--leverage_dpp_recency_lambda", "--leverage-dpp-recency-lambda", type=float, default=0.2, help="Strength of the eviction-score recency bonus")
+    parser.add_argument("--leverage_dpp_recency_window", "--leverage-dpp-recency-window", type=int, default=10, help="Frame window for linear eviction-score freshness")
+    parser.add_argument("--leverage_dpp_recency_gate_power", "--leverage-dpp-recency-gate-power", type=float, default=1.0, help="Power applied to the low-score gate for eviction-score recency")
+    parser.add_argument("--leverage_dpp_recency_debug", "--leverage-dpp-recency-debug", action="store_true", help="Print eviction-score recency bonus summary statistics")
+    parser.add_argument("--leverage_conf_gate", "--leverage-conf-gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
+    parser.add_argument("--leverage_conf_gate_floor", "--leverage-conf-gate-floor", type=float, default=0.2, help="Minimum multiplicative confidence gate value")
+<<<<<<< Updated upstream
+    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to transformed depth confidence")
+    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to transformed world-points confidence")
+    parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive scale used by the ratio confidence transform")
+>>>>>>> Stashed changes
     parser.add_argument(
         "--leverage_conf_gate_transform",
         type=str,
@@ -189,19 +277,41 @@ def get_args_parser():
         choices=("ratio", "sigmoid"),
         help="Confidence gate transform: ratio preserves the baseline mapping; sigmoid uses torch.sigmoid(c)",
     )
+<<<<<<< Updated upstream
     parser.add_argument("--leverage_conf_gate_init", type=str, default="mean", help="Initial current-frame confidence gate: mean or finite non-negative float")
+=======
+    parser.add_argument("--leverage_conf_gate_init", "--leverage-conf-gate-init", type=str, default="mean", help="Initial current-frame confidence gate: mean or finite non-negative float")
+=======
+    parser.add_argument("--leverage_conf_gate_depth_alpha", "--leverage-conf-gate-depth-alpha", type=float, default=1.0, help="Exponent applied to normalized depth_conf / (depth_conf + k) in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_point_beta", "--leverage-conf-gate-point-beta", type=float, default=1.0, help="Exponent applied to normalized world_points_conf / (world_points_conf + k) in the confidence gate")
+    parser.add_argument("--leverage_conf_gate_k", "--leverage-conf-gate-k", type=float, default=1.0, help="Positive k for confidence normalization c / (c + k)")
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
     parser.add_argument(
         "--leverage_conf_gate_special_mode",
         type=str,
         default="mean",
         choices=("mean", "one"),
+<<<<<<< Updated upstream
         help="Gate mode for special/prefix tokens",
     )
+<<<<<<< Updated upstream
     parser.add_argument("--leverage_attention_utility", action="store_true", help="Collect frozen early-attention utility with STAC CUDA after pre-attention eviction")
     parser.add_argument("--leverage_attention_beta", type=float, default=0.3, help="Weight of normalized frozen attention utility in the keep score")
     parser.add_argument("--leverage_attention_ema_decay", type=float, default=0.9, help="EMA decay used during each token attention observation horizon")
     parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of chunk-level attention observations accumulated before freezing token utility")
     parser.add_argument("--leverage_attention_colsum_subsample_ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
+=======
+    parser.add_argument("--leverage_attention_utility", "--leverage-attention-utility", action="store_true", help="Collect frozen early-attention utility with STAC CUDA after pre-attention eviction")
+    parser.add_argument("--leverage_attention_beta", "--leverage-attention-beta", type=float, default=0.2, help="Weight of normalized frozen attention utility in the keep score")
+    parser.add_argument("--leverage_attention_ema_decay", "--leverage-attention-ema-decay", type=float, default=0.9, help="EMA decay used during each token attention observation horizon")
+    parser.add_argument("--leverage_attention_freeze_updates", "--leverage-attention-freeze-updates", type=int, default=5, help="Number of attention observations accumulated before freezing token utility")
+    parser.add_argument("--leverage_attention_colsum_subsample_ratio", "--leverage-attention-colsum-subsample-ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
+=======
+        help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0",
+    )
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
     parser.add_argument(
         "--layer_budget_strategy",
         type=str,
@@ -480,6 +590,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_conf_gate_depth_alpha=args.leverage_conf_gate_depth_alpha,
                         leverage_conf_gate_point_beta=args.leverage_conf_gate_point_beta,
                         leverage_conf_gate_k=args.leverage_conf_gate_k,
+<<<<<<< Updated upstream
                         leverage_conf_gate_transform=args.leverage_conf_gate_transform,
                         leverage_conf_gate_init=args.leverage_conf_gate_init,
                         leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
@@ -488,6 +599,9 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_attention_ema_decay=args.leverage_attention_ema_decay,
                         leverage_attention_freeze_updates=args.leverage_attention_freeze_updates,
                         leverage_attention_colsum_subsample_ratio=args.leverage_attention_colsum_subsample_ratio,
+=======
+                        leverage_conf_gate_special_mode=args.leverage_conf_gate_special_mode,
+>>>>>>> Stashed changes
                         layer_budget_strategy=args.layer_budget_strategy,
                         layer_budget_score_only=args.layer_budget_score_only,
                         layer_budget_value_gamma=args.layer_budget_value_gamma,
@@ -558,8 +672,262 @@ if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
 
+<<<<<<< Updated upstream
     seed_everything(args.random_seed)
 
+=======
+    if args.leverage_dpp_candidate_multiplier < 1:
+        raise SystemExit(
+            "Error: --leverage_dpp_candidate_multiplier must be >= 1, "
+            f"got {args.leverage_dpp_candidate_multiplier}."
+        )
+    if args.leverage_dpp_greedy_block_size < 1:
+        raise SystemExit(
+            "Error: --leverage_dpp_greedy_block_size must be >= 1, "
+            f"got {args.leverage_dpp_greedy_block_size}."
+        )
+    if args.leverage_dpp_quality_beta < 0:
+        raise SystemExit(
+            "Error: --leverage_dpp_quality_beta must be >= 0, "
+            f"got {args.leverage_dpp_quality_beta}."
+        )
+    if args.leverage_dpp_diversity_beta < 0:
+        raise SystemExit(
+            "Error: --leverage_dpp_diversity_beta must be >= 0, "
+            f"got {args.leverage_dpp_diversity_beta}."
+        )
+    if args.leverage_dpp_feature_projection == "random" and args.leverage_ridge_dim is None:
+        raise SystemExit(
+            "Error: --leverage_dpp_feature_projection random requires "
+            "--leverage_ridge_dim >= 1."
+        )
+    if args.leverage_dpp_recency_lambda < 0:
+        raise SystemExit(
+            "Error: --leverage_dpp_recency_lambda must be >= 0, "
+            f"got {args.leverage_dpp_recency_lambda}."
+        )
+    if args.leverage_dpp_recency_window < 1:
+        raise SystemExit(
+            "Error: --leverage_dpp_recency_window must be >= 1, "
+            f"got {args.leverage_dpp_recency_window}."
+        )
+    if args.leverage_dpp_recency_gate_power < 0:
+        raise SystemExit(
+            "Error: --leverage_dpp_recency_gate_power must be >= 0, "
+            f"got {args.leverage_dpp_recency_gate_power}."
+        )
+    if not (0.0 <= args.leverage_conf_gate_floor <= 1.0):
+<<<<<<< Updated upstream
+        raise SystemExit("Error: --leverage_conf_gate_floor must be in [0, 1].")
+    if args.leverage_conf_gate_depth_alpha < 0:
+        raise SystemExit("Error: --leverage_conf_gate_depth_alpha must be >= 0.")
+    if args.leverage_conf_gate_point_beta < 0:
+        raise SystemExit("Error: --leverage_conf_gate_point_beta must be >= 0.")
+    if args.leverage_conf_gate_k <= 0:
+        raise SystemExit("Error: --leverage_conf_gate_k must be > 0.")
+    try:
+        parse_confidence_gate_init(args.leverage_conf_gate_init)
+    except ValueError as exc:
+        raise SystemExit(f"Error: --leverage_conf_gate_init {exc}.") from exc
+    if args.leverage_attention_utility:
+        if not 0.0 <= args.leverage_attention_beta <= 1.0:
+            raise SystemExit("Error: --leverage_attention_beta must be in [0, 1].")
+        if not 0.0 <= args.leverage_attention_ema_decay <= 1.0:
+            raise SystemExit("Error: --leverage_attention_ema_decay must be in [0, 1].")
+        if not 1 <= args.leverage_attention_freeze_updates <= 255:
+            raise SystemExit("Error: --leverage_attention_freeze_updates must be in [1, 255].")
+        if not 0.0 < args.leverage_attention_colsum_subsample_ratio <= 1.0:
+            raise SystemExit("Error: --leverage_attention_colsum_subsample_ratio must be in (0, 1].")
+        if args.stream_chunk_size != 1:
+            raise SystemExit("Error: --leverage_attention_utility currently requires --stream_chunk_size 1.")
+        if args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_attention_utility requires layer-wise svd_leverage.")
+        if args.leverage_eviction_selector != "topk":
+            raise SystemExit("Error: --leverage_attention_utility currently requires --leverage_eviction_selector topk.")
+        if args.eviction_protect_recent_frames != 0 or args.leverage_dpp_recency_bonus:
+            raise SystemExit("Error: attention utility requires recency protection/bonus to be disabled.")
+=======
+        raise SystemExit(
+            "Error: --leverage_conf_gate_floor must be in [0, 1], "
+            f"got {args.leverage_conf_gate_floor}."
+        )
+    if args.leverage_conf_gate_depth_alpha < 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_depth_alpha must be >= 0, "
+            f"got {args.leverage_conf_gate_depth_alpha}."
+        )
+    if args.leverage_conf_gate_point_beta < 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_point_beta must be >= 0, "
+            f"got {args.leverage_conf_gate_point_beta}."
+        )
+    if args.leverage_conf_gate_k <= 0:
+        raise SystemExit(
+            "Error: --leverage_conf_gate_k must be > 0, "
+            f"got {args.leverage_conf_gate_k}."
+        )
+>>>>>>> Stashed changes
+    if args.layer_budget_alpha < 0:
+        raise SystemExit(
+            "Error: --layer_budget_alpha must be >= 0, "
+            f"got {args.layer_budget_alpha}."
+        )
+    if args.layer_budget_min_tokens < 0:
+        raise SystemExit(
+            "Error: --layer_budget_min_tokens must be >= 0, "
+            f"got {args.layer_budget_min_tokens}."
+        )
+    if args.layer_budget_eps <= 0:
+        raise SystemExit(
+            "Error: --layer_budget_eps must be > 0, "
+            f"got {args.layer_budget_eps}."
+        )
+    if not (0.0 <= args.layer_budget_depth_mu <= 1.0):
+        raise SystemExit(
+            "Error: --layer_budget_depth_mu must be in [0, 1], "
+            f"got {args.layer_budget_depth_mu}."
+        )
+    if args.layer_budget_depth_sigma <= 0:
+        raise SystemExit(
+            "Error: --layer_budget_depth_sigma must be > 0, "
+            f"got {args.layer_budget_depth_sigma}."
+        )
+    if not (0.0 <= args.layer_budget_depth_floor <= 1.0):
+        raise SystemExit(
+            "Error: --layer_budget_depth_floor must be in [0, 1], "
+            f"got {args.layer_budget_depth_floor}."
+        )
+    if args.layer_budget_value_gamma < 0:
+        raise SystemExit(
+            "Error: --layer_budget_value_gamma must be >= 0, "
+            f"got {args.layer_budget_value_gamma}."
+        )
+    if args.leverage_ridge_lambda < 0:
+        raise SystemExit(
+            "Error: --leverage_ridge_lambda must be >= 0, "
+            f"got {args.leverage_ridge_lambda}."
+        )
+    if args.leverage_diag_interval < 0:
+        raise SystemExit(
+            "Error: --leverage_diag_interval must be >= 0, "
+            f"got {args.leverage_diag_interval}."
+        )
+    if args.leverage_ridge_jitter <= 0:
+        raise SystemExit(
+            "Error: --leverage_ridge_jitter must be > 0, "
+            f"got {args.leverage_ridge_jitter}."
+        )
+    if args.leverage_ridge_score_chunk_size < 1:
+        raise SystemExit(
+            "Error: --leverage_ridge_score_chunk_size must be >= 1, "
+            f"got {args.leverage_ridge_score_chunk_size}."
+        )
+    if args.leverage_ridge_dim is not None and args.leverage_ridge_dim < 1:
+        raise SystemExit(
+            "Error: --leverage_ridge_dim must be >= 1 when provided, "
+            f"got {args.leverage_ridge_dim}."
+        )
+    if args.rls_refresh_interval <= 0:
+        raise SystemExit(
+            "Error: --rls_refresh_interval must be >= 1, "
+            f"got {args.rls_refresh_interval}."
+        )
+    if args.leverage_approx_method == "right_sketch_ridge" and args.leverage_ridge_dim is None:
+        raise SystemExit(
+            "Error: --leverage_approx_method right_sketch_ridge requires "
+            "--leverage_ridge_dim >= 1."
+        )
+    if args.leverage_normalize_before_projection_headwise and not args.leverage_normalize_before_projection:
+        raise SystemExit(
+            "Error: --leverage_normalize_before_projection_headwise requires "
+            "--leverage_normalize_before_projection."
+        )
+    if args.leverage_normalize_before_projection:
+        if args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer":
+            raise SystemExit("Error: pre-projection normalization requires layer-wise svd_leverage.")
+        if args.leverage_feature != "key" or args.leverage_projection != "random":
+            raise SystemExit("Error: pre-projection normalization requires random-projected key features.")
+        if args.leverage_approx_method not in ("exact_qr", "right_sketch", "right_sketch_ridge"):
+            raise SystemExit("Error: unsupported approximation for pre-projection normalization.")
+    if args.leverage_projected_key_cache:
+        if args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer":
+            raise SystemExit("Error: --leverage_projected_key_cache requires layer-wise svd_leverage.")
+        if args.leverage_feature != "key" or args.leverage_projection != "random":
+            raise SystemExit("Error: --leverage_projected_key_cache requires random-projected key features.")
+        if args.leverage_approx_method not in ("right_sketch", "right_sketch_ridge"):
+            raise SystemExit("Error: --leverage_projected_key_cache requires right_sketch or right_sketch_ridge.")
+        if args.leverage_eviction_selector == "layer_head_fast_dpp" or (
+            args.leverage_eviction_selector == "similarity_topk"
+            and args.leverage_similarity_granularity == "head"
+        ):
+            raise SystemExit("Error: --leverage_projected_key_cache requires a shared layer keep set.")
+    if args.budget_frame_multiplier is not None and args.budget_frame_multiplier < 0.0:
+        raise SystemExit("Error: --budget_frame_multiplier must be >= 0 when provided.")
+    if args.stream_chunk_size < 1:
+        raise SystemExit("Error: --stream_chunk_size must be >= 1.")
+    if args.empty_cache_interval < 0:
+        raise SystemExit("Error: --empty_cache_interval must be >= 0.")
+    if args.layer_budget_strategy not in ("uniform", "cosine_precomputed") and (
+        args.eviction_policy != "svd_leverage" or args.leverage_granularity != "layer"
+    ):
+        raise SystemExit(
+            "Error: leverage/covariance-based --layer_budget_strategy requires "
+            "--eviction_policy svd_leverage and --leverage_granularity layer."
+        )
+    if args.layer_budget_strategy == "cosine_precomputed" and not args.layer_budget_proportions_path:
+        raise SystemExit(
+            "Error: --layer_budget_strategy cosine_precomputed requires "
+            "--layer_budget_proportions_path."
+        )
+    if args.eviction_protect_recent_frames < 0:
+        raise SystemExit(
+            "Error: --eviction_protect_recent_frames must be >= 0, "
+            f"got {args.eviction_protect_recent_frames}."
+        )
+    if args.eviction_protect_special_token_interval < 1:
+        raise SystemExit(
+            "Error: --eviction_protect_special_token_interval must be >= 1, "
+            f"got {args.eviction_protect_special_token_interval}."
+        )
+    if args.kf_interval < 1:
+        raise SystemExit(f"Error: --kf_interval must be >= 1, got {args.kf_interval}.")
+    if args.evict_interval < 1:
+        raise SystemExit(f"Error: --evict_interval must be >= 1, got {args.evict_interval}.")
+    if args.anchor_interval < 1:
+        raise SystemExit(f"Error: --anchor_interval must be >= 1, got {args.anchor_interval}.")
+    if args.min_anchor_interval is not None and args.min_anchor_interval < 0:
+        raise SystemExit(
+            "Error: --min_anchor_interval must be >= 0, "
+            f"got {args.min_anchor_interval}."
+        )
+    if args.window_protect_frames < 0:
+        raise SystemExit(
+            "Error: --window_protect_frames must be >= 0, "
+            f"got {args.window_protect_frames}."
+        )
+    if args.max_anchors < 0:
+        raise SystemExit(f"Error: --max_anchors must be >= 0, got {args.max_anchors}.")
+    if not (0.0 <= args.coverage_threshold <= 1.0):
+        raise SystemExit(
+            "Error: --coverage_threshold must be in [0, 1], "
+            f"got {args.coverage_threshold}."
+        )
+    if args.camera_motion_threshold < 0.0:
+        raise SystemExit(
+            "Error: --camera_motion_threshold must be >= 0, "
+            f"got {args.camera_motion_threshold}."
+        )
+    if not (0.0 <= args.anchor_keep_ratio <= 1.0):
+        raise SystemExit(
+            "Error: --anchor_keep_ratio must be in [0, 1], "
+            f"got {args.anchor_keep_ratio}."
+        )
+    if args.history_anchor_patch_topk_per_frame < 0:
+        raise SystemExit(
+            "Error: --history_anchor_patch_topk_per_frame must be >= 0, "
+            f"got {args.history_anchor_patch_topk_per_frame}."
+        )
+>>>>>>> Stashed changes
     try:
         eviction_nn_config_from_args(args, output_dir=args.eviction_nn_analysis_dir)
     except ValueError as exc:

@@ -26,14 +26,16 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "eval_results" / "mv_recon" / "SStreamVGGT_100_termProject_a0.7_SimTopK_ridge1e-5"
 MV_RECON_RUN_DATASETS = ("7scenes", "NRGBD")
-ACTIVE_DATASETS = ("7scenes", "NRGBD", "kitti_s1_500")
+ACTIVE_DATASETS = ("7scenes", "NRGBD", "kitti_s1_500", "kitti_s1_100", "bonn_500")
 DATASET_ROOTS = {
     "7scenes": Path("/home/dongjae/data/7scenes_sfm"),
     "NRGBD": Path("/home/dongjae/data/neural_rgbd_data"),
     "Replica": Path(os.environ.get("SSTREAMVGGT_REPLICA_ROOT", "/home/dongjae/data/replica/Replica")),
     "kitti": Path(os.environ.get("SSTREAMVGGT_KITTI_DEPTH_ROOT", "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/image_gathered")),
+    "bonn": Path(os.environ.get("SSTREAMVGGT_BONN_ROOT", "/home/dongjae/data/bonn/rgbd_bonn_dataset")),
 }
 _KITTI_IMAGE_CACHE: dict[tuple[str, str], list[Path]] = {}
+_BONN_IMAGE_CACHE: dict[tuple[str, str], list[Path]] = {}
 
 
 def parse_csv(value: str | None) -> list[str]:
@@ -219,12 +221,24 @@ def event_metadata_from_path(path: Path, analysis_root: Path) -> dict[str, str]:
     dataset = parts[0] if len(parts) >= 1 else "unknown"
     rank = parts[1] if len(parts) >= 2 else "rank_unknown"
     scene_key = parts[2] if len(parts) >= 3 else "unknown_scene"
-    safe_scene = scene_key.split("_", 1)[1] if "_" in scene_key else scene_key
+    if dataset == "kitti" or dataset.startswith("kitti_s1_") or is_bonn_dataset(dataset):
+        safe_scene = scene_key
+    else:
+        safe_scene = scene_key.split("_", 1)[1] if "_" in scene_key else scene_key
     return {"dataset": dataset, "rank": rank, "scene_key": scene_key, "safe_scene": safe_scene}
 
 
 def is_kitti_dataset(dataset: str) -> bool:
     return dataset == "kitti" or dataset.startswith("kitti_s1_")
+
+
+def is_bonn_dataset(dataset: str) -> bool:
+    return dataset == "bonn" or re.fullmatch(r"bonn_\d+", dataset) is not None
+
+
+def bonn_frame_count(dataset: str) -> int:
+    match = re.fullmatch(r"bonn_(?P<count>\d+)", dataset)
+    return int(match.group("count")) if match else 110
 
 
 def kitti_dataset_root(dataset: str) -> Path:
@@ -249,7 +263,7 @@ def parse_scene(dataset: str, safe_scene: str) -> str:
 def resolve_kf_every(dataset: str, kf_every: int) -> int:
     if int(kf_every) > 0:
         return int(kf_every)
-    return 1 if is_kitti_dataset(dataset) else 2
+    return 1 if is_kitti_dataset(dataset) or is_bonn_dataset(dataset) else 2
 
 
 def kitti_frame_image_path(dataset: str, scene: str, frame_id: int, kf_every: int) -> Path | None:
@@ -266,6 +280,19 @@ def kitti_frame_image_path(dataset: str, scene: str, frame_id: int, kf_every: in
     return images[frame_no]
 
 
+def bonn_frame_image_path(dataset: str, scene: str, frame_id: int, kf_every: int) -> Path | None:
+    key = (dataset, scene)
+    images = _BONN_IMAGE_CACHE.get(key)
+    if images is None:
+        rgb_dir = DATASET_ROOTS["bonn"] / f"rgbd_bonn_{scene}" / f"rgb_{bonn_frame_count(dataset)}"
+        images = sorted(rgb_dir.glob("*.png"))
+        _BONN_IMAGE_CACHE[key] = images
+    frame_no = int(frame_id) * resolve_kf_every(dataset, kf_every)
+    if frame_no < 0 or frame_no >= len(images):
+        return None
+    return images[frame_no]
+
+
 def frame_image_path(dataset: str, scene: str, frame_id: int, kf_every: int) -> Path | None:
     frame_no = int(frame_id) * resolve_kf_every(dataset, kf_every)
     if dataset == "7scenes":
@@ -276,6 +303,8 @@ def frame_image_path(dataset: str, scene: str, frame_id: int, kf_every: int) -> 
         return DATASET_ROOTS[dataset] / scene / "results" / f"frame{frame_no}.jpg"
     if is_kitti_dataset(dataset):
         return kitti_frame_image_path(dataset, scene, frame_id, kf_every)
+    if is_bonn_dataset(dataset):
+        return bonn_frame_image_path(dataset, scene, frame_id, kf_every)
     return None
 
 

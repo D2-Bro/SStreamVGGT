@@ -303,6 +303,12 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     raise FileNotFoundError(
                         f"No input images found for eval_dataset={args.eval_dataset}: {dir_path}"
                     )
+                frame_id_func = metadata.get("frame_id_func", None)
+                frame_ids = (
+                    [frame_id_func(path) for path in filelist]
+                    if frame_id_func is not None
+                    else None
+                )
 
                 images = load_and_preprocess_images(filelist)
                 frames = []
@@ -449,9 +455,26 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 print(f"Pose encoding and extrinsics saved to: {pose_save_path}")
 
 
-                gt_traj_loader = metadata.get("gt_traj_loader", None)
-                if gt_traj_loader is not None:
-                    gt_traj = gt_traj_loader(img_path, anno_path, seq, filelist)
+                gt_traj_file = metadata["gt_traj_func"](img_path, anno_path, seq)
+                traj_format = metadata.get("traj_format", None)
+
+                if gt_traj_file is None:
+                    gt_traj = None
+                elif args.eval_dataset == "sintel":
+                    gt_traj = load_traj(
+                        gt_traj_file=gt_traj_file,
+                        stride=effective_stride,
+                        num_frames=len(filelist),
+                        frame_ids=frame_ids,
+                    )
+                elif traj_format is not None:
+                    gt_traj = load_traj(
+                        gt_traj_file=gt_traj_file,
+                        traj_format=traj_format,
+                        stride=effective_stride,
+                        num_frames=len(filelist),
+                        frame_ids=frame_ids,
+                    )
                 else:
                     gt_traj_file = metadata["gt_traj_func"](img_path, anno_path, seq)
                     traj_format = metadata.get("traj_format", None)

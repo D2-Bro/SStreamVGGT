@@ -39,6 +39,7 @@ class SevenScenes(BaseStereoViewDataset):
         shuffle_seed=-1,
         kf_every=1,
         max_frames=None,
+        depth_variant="projected",
         *args,
         ROOT,
         **kwargs,
@@ -56,6 +57,13 @@ class SevenScenes(BaseStereoViewDataset):
         self.rebuttal = rebuttal
         self.shuffle_seed = shuffle_seed
         self.max_frames = max_frames
+        if depth_variant not in ("projected", "raw", "auto"):
+            raise ValueError(
+                "SevenScenes depth_variant must be 'projected', 'raw', or 'auto', "
+                f"got {depth_variant!r}"
+            )
+        self.depth_variant = depth_variant
+        self._raw_depth_warning_shown = False
 
         # load all scenes
         self.load_all_tuples(tuple_list)
@@ -159,7 +167,23 @@ class SevenScenes(BaseStereoViewDataset):
         while len(imgs_idxs) > 0:
             im_idx = imgs_idxs.popleft()
             impath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.color.png")
-            depthpath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.depth.proj.png")
+            projected_depthpath = osp.join(
+                self.ROOT, scene_id, f"frame-{im_idx}.depth.proj.png"
+            )
+            raw_depthpath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.depth.png")
+            if self.depth_variant == "raw":
+                depthpath = raw_depthpath
+            elif self.depth_variant == "auto" and not osp.isfile(projected_depthpath):
+                depthpath = raw_depthpath
+                if not self._raw_depth_warning_shown:
+                    print(
+                        "[SevenScenes] Projected depth is unavailable; falling back to "
+                        f"raw depth under {self.ROOT}. Model inference uses RGB only, "
+                        "but GT/error evaluation may differ from mv_recon final."
+                    )
+                    self._raw_depth_warning_shown = True
+            else:
+                depthpath = projected_depthpath
             posepath = osp.join(self.ROOT, scene_id, f"frame-{im_idx}.pose.txt")
 
             rgb_image = imread_cv2(impath)
