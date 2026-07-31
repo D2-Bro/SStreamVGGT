@@ -1,5 +1,7 @@
 import os
 import subprocess
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+import random
 import sys
 from pathlib import Path
 
@@ -24,6 +26,29 @@ from streamvggt.utils.cache_analysis import (
 
 from tqdm import tqdm
 import time
+
+def seed_everything(seed: int) -> int:
+    seed = int(seed)
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    cv2.setRNGSeed(seed % (2**31 - 1))
+    # o3d.utility.random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+    print(
+        f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}",
+        flush=True,
+    )
+
+    return seed
 
 def get_args_parser():
     parser = argparse.ArgumentParser()
@@ -64,7 +89,7 @@ def get_args_parser():
         "--stream-chunk-size",
         type=int,
         default=1,
-        help="Number of consecutive stream frames to process in one chunk-causal forward",
+        help="Frames per streaming chunk; chunks attend causally to past chunks while frames inside a chunk attend bidirectionally",
     )
     parser.add_argument(
         "--empty_cache_interval",
@@ -148,7 +173,7 @@ def get_args_parser():
     parser.add_argument("--leverage_ridge_jitter", type=float, default=1e-6, help="Absolute diagonal jitter added to ridge systems before Cholesky")
     parser.add_argument("--leverage_ridge_dim", type=int, default=256, help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge")
     parser.add_argument("--rls_refresh_interval", type=int, default=8, help="Refresh interval for ridge leverage K^T K and Cholesky factorization; 1 refreshes every frame")
-    parser.add_argument("--leverage_random_seed", type=int, default=42, help="Random seed for leverage sketches")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed for leverage sketches")
     parser.add_argument("--leverage_eviction_selector", type=str, default="topk", help="Eviction selector for svd_leverage scores: topk")
     parser.add_argument("--leverage_conf_gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
     parser.add_argument("--leverage_conf_gate_floor", type=float, default=0.2, help="Minimum multiplicative confidence gate value")
@@ -160,7 +185,7 @@ def get_args_parser():
     parser.add_argument("--leverage_attention_utility", action="store_true", help="Use frozen early-attention utility with STAC CUDA post-attention eviction")
     parser.add_argument("--leverage_attention_beta", type=float, default=0.3, help="Weight of normalized frozen attention utility in the keep score")
     parser.add_argument("--leverage_attention_ema_decay", type=float, default=0.9, help="EMA decay used during each token's finite attention observation horizon")
-    parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of attention observations accumulated before freezing token utility")
+    parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of chunk-level attention observations accumulated before freezing token utility")
     parser.add_argument("--leverage_attention_colsum_subsample_ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument("--leverage_conf_gate_special_mode", type=str, default="mean", choices=("mean", "one"), help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0")
     parser.add_argument("--layer_budget_strategy", type=str, default="value_weighted_leverage_pr", choices=("uniform", "leverage_pr", "key_norm", "value_weighted_leverage_pr"), help="Layer-wise KV budget allocation strategy")
@@ -330,7 +355,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             leverage_ridge_jitter=args.leverage_ridge_jitter,
                             leverage_ridge_dim=args.leverage_ridge_dim,
                             rls_refresh_interval=args.rls_refresh_interval,
-                            leverage_random_seed=args.leverage_random_seed,
+                            leverage_random_seed=args.random_seed,
                             leverage_eviction_selector=args.leverage_eviction_selector,
                             leverage_conf_gate=args.leverage_conf_gate,
                             leverage_conf_gate_floor=args.leverage_conf_gate_floor,
@@ -519,9 +544,11 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
+
+    seed_everything(args.random_seed)
+
     from streamvggt.utils.load_fn import load_and_preprocess_images 
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
-    from dust3r.utils.image import load_images_for_eval as load_images
 
     args.full_seq = False
     args.no_crop = False

@@ -131,6 +131,9 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self._perf_trace_enabled = False
+        self._perf_trace_events = []
+        self._perf_trace_cpu_totals = {}
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -356,6 +359,7 @@ class Aggregator(nn.Module):
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
 
+        embed_trace_start, embed_trace_cpu_start = self._perf_trace_start(images)
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean.to(images.device)) / self._resnet_std.to(images.device)
 
@@ -390,6 +394,8 @@ class Aggregator(nn.Module):
             pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(images.device).to(pos.dtype)
             pos = torch.cat([pos_special, pos], dim=1)
 
+        self._perf_trace_end("embed_and_position", embed_trace_start, embed_trace_cpu_start)
+
         # update P because we added special tokens
         _, P, C = tokens.shape
 
@@ -397,6 +403,7 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = []
         current_cache_token_count = S * P if cache_write_current_frame else 0
+        budget_trace_start, budget_trace_cpu_start = self._perf_trace_start(images)
         if profile_eviction:
             if images.is_cuda and torch.cuda.is_available():
                 torch.cuda.synchronize(images.device)
@@ -422,6 +429,7 @@ class Aggregator(nn.Module):
             self._dynamic_budget_profile_total += dynamic_budget_ms * 0.001
             self._dynamic_budget_profile_count += 1
         current_budget_values = current_budgets.detach().cpu().tolist()
+        self._perf_trace_end("dynamic_budget", budget_trace_start, budget_trace_cpu_start)
         scores = []
         layer_budget_scores = []
         layer_budget_base_scores = []
@@ -431,10 +439,13 @@ class Aggregator(nn.Module):
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
+                    block_trace_start, block_trace_cpu_start = self._perf_trace_start(tokens)
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
                         tokens, B, S, P, C, frame_idx, pos=pos, profile_eviction=profile_eviction
                     )
+                    self._perf_trace_end("frame_blocks", block_trace_start, block_trace_cpu_start)
                 elif attn_type == "global":
+                    block_trace_start, block_trace_cpu_start = self._perf_trace_start(tokens)
                     if use_cache:
                         tokens, global_idx, global_intermediates, new_kv, current_scores = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos,
@@ -536,6 +547,7 @@ class Aggregator(nn.Module):
                         tokens, global_idx, global_intermediates = self._process_global_attention(
                             tokens, B, S, P, C, global_idx, pos=pos
                         )
+                    self._perf_trace_end("global_blocks", block_trace_start, block_trace_cpu_start)
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
             for i in range(len(frame_intermediates)):
@@ -1392,6 +1404,80 @@ class Aggregator(nn.Module):
                 if stream_line is not None:
                     lines.append(stream_line)
 
+        return "\n".join(lines) if lines else None
+
+    def configure_perf_trace(self, enabled: bool) -> None:
+        """Enable or disable optional non-synchronizing performance tracing."""
+        self._perf_trace_enabled = bool(enabled)
+        self._perf_trace_events = []
+        self._perf_trace_cpu_totals = {}
+        for block in self.global_blocks:
+            attn = getattr(block, "attn", None)
+            reset = getattr(attn, "reset_perf_trace", None)
+            if reset is not None:
+                reset()
+            if attn is not None:
+                attn._perf_trace_enabled = bool(enabled)
+
+    def _perf_trace_start(self, tensor: torch.Tensor):
+        if not self._perf_trace_enabled or not tensor.is_cuda:
+            return None, 0.0
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event, time.perf_counter()
+
+    def _perf_trace_end(self, name: str, start_event, start_cpu: float) -> None:
+        if start_event is None:
+            return
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        self._perf_trace_events.append((name, start_event, end_event))
+        self._perf_trace_cpu_totals[name] = self._perf_trace_cpu_totals.get(name, 0.0) + (
+            time.perf_counter() - start_cpu
+        )
+
+    def format_perf_trace_summary(self) -> Optional[str]:
+        """Format CUDA-event totals collected by global-attention evictions.
+
+        The caller must synchronize once before calling this method.
+        """
+        lines = []
+        aggregator_totals = dict(self._perf_trace_cpu_totals)
+        for name, start_event, end_event in self._perf_trace_events:
+            key = f"{name}_cuda"
+            aggregator_totals[key] = aggregator_totals.get(key, 0.0) + float(start_event.elapsed_time(end_event))
+        if aggregator_totals:
+            parts = ["[PerfTraceSummary] aggregator"]
+            for name in sorted(aggregator_totals):
+                value = aggregator_totals[name]
+                if name.endswith("_cuda"):
+                    parts.append(f"{name}_total={value:.3f}ms")
+                else:
+                    parts.append(f"{name}_cpu_enqueue_total={value * 1000.0:.3f}ms")
+            lines.append(" ".join(parts))
+
+        totals = {}
+        count = 0
+        for block in self.global_blocks:
+            attn = getattr(block, "attn", None)
+            get_stats = getattr(attn, "get_perf_trace_stats", None)
+            if get_stats is None:
+                continue
+            stats = get_stats()
+            count += int(stats.get("count", 0))
+            for name, value in stats.get("totals", {}).items():
+                totals[name] = totals.get(name, 0.0) + float(value)
+        if count > 0:
+            parts = [f"[PerfTraceSummary] eviction count={count}"]
+            for name in sorted(totals):
+                value = totals[name]
+                if name.endswith("_tokens") or name in ("rls_refreshes", "rls_cache_hits"):
+                    parts.append(f"{name}_total={value:.0f}")
+                    parts.append(f"{name}_mean={value / count:.3f}")
+                else:
+                    parts.append(f"{name}_total={value:.3f}ms")
+                    parts.append(f"{name}_mean={value / count:.3f}ms")
+            lines.append(" ".join(parts))
         return "\n".join(lines) if lines else None
 
 def slice_expand_and_flatten(token_tensor, B, S):

@@ -257,6 +257,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
         profile_eviction: bool = False,
+        perf_trace: bool = False,
         empty_cache_interval: int = 1,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 256,
@@ -392,6 +393,26 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
         all_ress = []
         processed_frames = []
+        perf_trace = bool(perf_trace and torch.cuda.is_available())
+        perf_trace_events = []
+        perf_trace_cpu_totals = {}
+        self.aggregator.configure_perf_trace(perf_trace)
+
+        def _perf_trace_start():
+            if not perf_trace:
+                return None, 0.0
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return event, time.perf_counter()
+
+        def _perf_trace_end(name, start_event, start_cpu):
+            if start_event is None:
+                return
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            perf_trace_events.append((name, start_event, end_event))
+            perf_trace_cpu_totals[name] = perf_trace_cpu_totals.get(name, 0.0) + (time.perf_counter() - start_cpu)
+
         inference_profile_start = time.perf_counter() if profile_eviction else 0.0
         stream_profile_totals = {}
 
@@ -439,6 +460,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             _profile_record("input_prepare", profile_stage_start)
 
             profile_stage_start = _profile_start()
+            perf_stage_start, perf_stage_cpu_start = _perf_trace_start()
             aggregator_output = self.aggregator(
                 images,
                 past_key_values=past_key_values,
@@ -500,6 +522,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 cache_evict_current_frame=cache_evict_current_frame,
             )
             _profile_record("aggregator_forward", profile_stage_start)
+            _perf_trace_end("aggregator", perf_stage_start, perf_stage_cpu_start)
 
             if isinstance(aggregator_output, tuple) and len(aggregator_output) == 3:
                 aggregated_tokens, patch_start_idx, past_key_values = aggregator_output
@@ -507,10 +530,12 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 aggregated_tokens, patch_start_idx = aggregator_output
 
             profile_heads_start = _profile_start()
+            perf_heads_start, perf_heads_cpu_start = _perf_trace_start()
             track_all = vis_all = track_conf_all = None
             with torch.amp.autocast("cuda", enabled=False):
                 if self.camera_head is not None:
                     profile_stage_start = _profile_start()
+                    perf_stage_start, perf_stage_cpu_start = _perf_trace_start()
                     pose_enc_list, past_key_values_camera = self.camera_head(
                         aggregated_tokens,
                         past_key_values_camera=past_key_values_camera,
@@ -528,23 +553,29 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     camera_cache_frame_ids.extend(int(frame_id) for frame_id in chunk_frame_ids)
                     camera_pose_all = pose_enc_list[-1]
                     _profile_record("camera_head", profile_stage_start)
+                    _perf_trace_end("camera_head", perf_stage_start, perf_stage_cpu_start)
 
                 if self.depth_head is not None:
                     profile_stage_start = _profile_start()
+                    perf_stage_start, perf_stage_cpu_start = _perf_trace_start()
                     depth_all, depth_conf_all = self.depth_head(
                         aggregated_tokens, images=images, patch_start_idx=patch_start_idx
                     )
                     _profile_record("depth_head", profile_stage_start)
+                    _perf_trace_end("depth_head", perf_stage_start, perf_stage_cpu_start)
 
                 if self.point_head is not None:
                     profile_stage_start = _profile_start()
+                    perf_stage_start, perf_stage_cpu_start = _perf_trace_start()
                     pts3d_all, pts3d_conf_all = self.point_head(
                         aggregated_tokens, images=images, patch_start_idx=patch_start_idx
                     )
                     _profile_record("point_head", profile_stage_start)
+                    _perf_trace_end("point_head", perf_stage_start, perf_stage_cpu_start)
 
                 if self.track_head is not None and query_points is not None:
                     profile_stage_start = _profile_start()
+                    perf_stage_start, perf_stage_cpu_start = _perf_trace_start()
                     track_list, vis_all, conf_all = self.track_head(
                         aggregated_tokens, images=images, patch_start_idx=patch_start_idx, query_points=query_points
                     )
@@ -552,8 +583,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     track_conf_all = conf_all
                     query_points = track_all[:, -1]
                     _profile_record("track_head", profile_stage_start)
+                    _perf_trace_end("track_head", perf_stage_start, perf_stage_cpu_start)
 
             _profile_record("heads_total", profile_heads_start)
+            _perf_trace_end("heads", perf_heads_start, perf_heads_cpu_start)
             profile_stage_start = _profile_start()
 
             camera_pose_last = camera_pose_all[:, -1, :]
@@ -637,12 +670,14 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 }
                 _profile_record("result_pack", profile_stage_start)
                 profile_stage_start = _profile_start()
+                perf_stage_start, perf_stage_cpu_start = _perf_trace_start()
 
                 res_cpu = {
                     k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
                     for k, v in res_gpu.items()
                 }
                 _profile_record("cpu_transfer", profile_stage_start)
+                _perf_trace_end("cpu_transfer", perf_stage_start, perf_stage_cpu_start)
 
                 if frame_writer is not None:
                     profile_stage_start = _profile_start()
@@ -659,9 +694,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
                 if empty_cache_interval > 0 and int(global_frame_idx) % empty_cache_interval == 0:
                     profile_stage_start = _profile_start()
+                    perf_stage_start, perf_stage_cpu_start = _perf_trace_start()
                     del res_gpu
                     torch.cuda.empty_cache()
                     _profile_record("empty_cache", profile_stage_start)
+                    _perf_trace_end("empty_cache", perf_stage_start, perf_stage_cpu_start)
                 else:
                     del res_gpu
 
@@ -678,6 +715,28 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             )
             if profile_summary:
                 print(profile_summary)
+
+        if perf_trace:
+            torch.cuda.synchronize()
+            totals_ms = {}
+            for name, start_event, end_event in perf_trace_events:
+                totals_ms[name] = totals_ms.get(name, 0.0) + float(start_event.elapsed_time(end_event))
+            cpu_parts = [
+                f"{name}_cpu_enqueue_total={seconds * 1000.0:.3f}ms"
+                for name, seconds in sorted(perf_trace_cpu_totals.items())
+            ]
+            cuda_parts = [
+                f"{name}_cuda_total={milliseconds:.3f}ms"
+                for name, milliseconds in sorted(totals_ms.items())
+            ]
+            print(
+                "[PerfTraceSummary] stream "
+                f"frames={len(frames)} "
+                + " ".join(cpu_parts + cuda_parts)
+            )
+            eviction_summary = self.aggregator.format_perf_trace_summary()
+            if eviction_summary:
+                print(eviction_summary)
 
         return StreamVGGTOutput(
             ress=all_ress if cache_results else None,

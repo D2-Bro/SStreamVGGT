@@ -90,6 +90,9 @@ class Attention(nn.Module):
         self._eviction_profile_count = 0
         self._attention_forward_profile_totals = {}
         self._attention_forward_profile_count = 0
+        self._perf_trace_enabled = False
+        self._perf_trace_events = []
+        self._perf_trace_totals = {}
 
     def _reset_cache_state(self):
         self.num_anchor_tokens = 0
@@ -97,6 +100,7 @@ class Attention(nn.Module):
         self._eviction_profile_count = 0
         self._attention_forward_profile_totals = {}
         self._attention_forward_profile_count = 0
+        self.reset_perf_trace()
         for eviction in self._eviction_managers.values():
             reset = getattr(eviction, "reset_projected_key_cache", None)
             if reset is not None:
@@ -117,6 +121,50 @@ class Attention(nn.Module):
             reset_profile = getattr(eviction, "reset_profile_stats", None)
             if reset_profile is not None:
                 reset_profile()
+
+    def reset_perf_trace(self):
+        self._perf_trace_events = []
+        self._perf_trace_totals = {}
+        for eviction in self._eviction_managers.values():
+            reset = getattr(eviction, "reset_perf_trace", None)
+            if reset is not None:
+                reset()
+
+    def _perf_trace_start(self, tensor: torch.Tensor):
+        if not self._perf_trace_enabled or not tensor.is_cuda:
+            return None, 0.0
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event, time.perf_counter()
+
+    def _perf_trace_end(self, name: str, start_event, start_cpu: float, **counts) -> None:
+        if start_event is None:
+            return
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        self._perf_trace_events.append((name, start_event, end_event))
+        self._perf_trace_totals[f"{name}_cpu_enqueue"] = (
+            self._perf_trace_totals.get(f"{name}_cpu_enqueue", 0.0)
+            + (time.perf_counter() - start_cpu) * 1000.0
+        )
+        for key, value in counts.items():
+            self._perf_trace_totals[key] = self._perf_trace_totals.get(key, 0.0) + float(value)
+
+    def get_perf_trace_stats(self):
+        totals = dict(self._perf_trace_totals)
+        count = 0
+        for name, start_event, end_event in self._perf_trace_events:
+            totals[f"{name}_cuda"] = totals.get(f"{name}_cuda", 0.0) + float(start_event.elapsed_time(end_event))
+            if name == "select":
+                count += 1
+        for eviction in self._eviction_managers.values():
+            get_stats = getattr(eviction, "get_perf_trace_stats", None)
+            if get_stats is None:
+                continue
+            for name, value in get_stats().items():
+                key = f"manager_{name}"
+                totals[key] = totals.get(key, 0.0) + float(value)
+        return {"count": count, "totals": totals}
 
     def _profile_sync(self, tensor: Optional[torch.Tensor]) -> None:
         if tensor is not None and tensor.is_cuda and torch.cuda.is_available():
@@ -177,6 +225,7 @@ class Attention(nn.Module):
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
         current_frame_idx: Optional[int] = None,
+        current_frame_ids: Optional[Sequence[int]] = None,
         tokens_per_frame: Optional[int] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
@@ -224,6 +273,8 @@ class Attention(nn.Module):
         """
         B, H, N, D = k.shape
         num_anchor_tokens = max(0, min(int(num_anchor_tokens), N))
+        num_candidates = N - num_anchor_tokens
+        num_to_keep = max(0, min(int(cache_budget) - num_anchor_tokens, num_candidates))
 
         if not layer_budget_score_only and (N <= cache_budget or N <= num_anchor_tokens):
             if confidence_state is not None:
@@ -249,6 +300,7 @@ class Attention(nn.Module):
         select_v = v
         select_confidence_state = confidence_state
         selection_budget = cache_budget
+        select_trace_start, select_trace_cpu_start = self._perf_trace_start(k)
 
         profile_eviction = bool(profile_eviction)
         if profile_eviction and k.is_cuda and torch.cuda.is_available():
@@ -318,6 +370,11 @@ class Attention(nn.Module):
                 layer_budget_eps=layer_budget_eps,
             )
             self._eviction_managers[manager_key] = eviction
+
+        eviction._perf_trace_enabled = self._perf_trace_enabled
+
+        rls_refresh_before = eviction.rls_refresh_count
+        rls_cache_hits_before = eviction.rls_cache_hit_count
 
         if layer_budget_score_only:
             score_start = time.perf_counter() if profile_eviction else 0.0
@@ -399,6 +456,7 @@ class Attention(nn.Module):
             layer_id=layer_id,
             step_idx=step_idx,
             current_frame_idx=current_frame_idx if current_frame_idx is not None else step_idx,
+            current_frame_ids=current_frame_ids,
             candidate_frame_ids=candidate_frame_ids,
             candidate_depth_confidence=candidate_depth_confidence,
             candidate_point_confidence=candidate_point_confidence,
@@ -411,6 +469,16 @@ class Attention(nn.Module):
                 and eviction_nn_analysis_config.wants_svd_coord()
             ),
             capture_projected_norms=projected_norm_histogram_config is not None,
+        )
+        self._perf_trace_end(
+            "select",
+            select_trace_start,
+            select_trace_cpu_start,
+            cache_tokens=N,
+            candidate_tokens=num_candidates,
+            kept_candidate_tokens=num_to_keep,
+            rls_refreshes=eviction.rls_refresh_count - rls_refresh_before,
+            rls_cache_hits=eviction.rls_cache_hit_count - rls_cache_hits_before,
         )
         if profile_eviction and k.is_cuda and torch.cuda.is_available():
             torch.cuda.synchronize(k.device)
@@ -500,6 +568,7 @@ class Attention(nn.Module):
             )
 
         index_update_start = time.perf_counter() if profile_eviction else 0.0
+        update_trace_start, update_trace_cpu_start = self._perf_trace_start(k)
         anchor_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
         anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
         keep_indices = torch.cat([anchor_indices, top_indices + num_anchor_tokens,], dim=2,)
@@ -514,6 +583,14 @@ class Attention(nn.Module):
         eviction.update_projected_key_cache_after_eviction(
             top_indices,
             tail_k= None,
+        )
+        projected_cache = getattr(eviction, "_projected_key_cache", None)
+        projected_cache_tokens = int(projected_cache.shape[1]) if projected_cache is not None else 0
+        self._perf_trace_end(
+            "index_update",
+            update_trace_start,
+            update_trace_cpu_start,
+            projected_cache_tokens=projected_cache_tokens,
         )
         if profile_eviction:
             if final_k.is_cuda and torch.cuda.is_available():
@@ -656,7 +733,7 @@ class Attention(nn.Module):
             if leverage_eviction_selector != "topk":
                 raise ValueError("Frozen early-attention utility initially supports only layer-shared Top-K")
             if not cache_write_current_frame or not cache_evict_current_frame:
-                raise ValueError("Frozen early-attention utility requires cache write and eviction on every current frame")
+                raise ValueError("Frozen early-attention utility requires cache write and eviction on every current chunk")
             if not 0.0 <= float(leverage_attention_beta) <= 1.0:
                 raise ValueError("leverage_attention_beta must be in [0, 1]")
             if not 0.0 <= float(leverage_attention_ema_decay) <= 1.0:
@@ -681,7 +758,7 @@ class Attention(nn.Module):
         attention_output_dtype = q.dtype
         if leverage_attention_utility:
             attention_compute_dtype = torch.bfloat16 if q.dtype == torch.bfloat16 else torch.float16
-            # Materialize only the current-frame Q/K/V in SStream's native BHND
+            # Materialize only the current-chunk Q/K/V in SStream's native BHND
             # layout. The persistent K/V cache then stays BHND-contiguous, so
             # the full live cache never needs a transpose-contiguous copy.
             q = q.to(dtype=attention_compute_dtype).contiguous()
@@ -690,7 +767,14 @@ class Attention(nn.Module):
         self._record_forward_profile("qk_norm_rope", norm_rope_start, q, profile_forward)
 
         if use_cache and self.num_anchor_tokens == 0:
-            self.num_anchor_tokens = k.shape[2]
+            if tokens_per_frame is not None and int(tokens_per_frame) > 0:
+                # The first frame remains the permanent anchor even when the
+                # initial streaming forward contains multiple frames.
+                self.num_anchor_tokens = min(int(tokens_per_frame), int(k.shape[2]))
+            else:
+                # Preserve the legacy fallback for callers that do not provide
+                # a frame layout.
+                self.num_anchor_tokens = k.shape[2]
 
         if use_cache:
             cache_concat_start = self._profile_start(k, profile_forward)
@@ -707,11 +791,18 @@ class Attention(nn.Module):
                 resolved_current_frame_ids = [int(frame_id) for frame_id in current_frame_ids]
             if len(resolved_current_frame_ids) <= 0:
                 resolved_current_frame_ids = [step_idx if step_idx is not None else 0]
-            if leverage_attention_utility and len(resolved_current_frame_ids) != 1:
-                raise ValueError(
-                    "Frozen early-attention utility initially supports stream_chunk_size=1 "
-                    f"(got {len(resolved_current_frame_ids)} frames)"
-                )
+            if leverage_attention_utility and len(resolved_current_frame_ids) > 1:
+                if (
+                    tokens_per_frame is None
+                    or int(tokens_per_frame) <= 0
+                    or int(tokens_per_frame) * len(resolved_current_frame_ids) != int(current_k.shape[2])
+                ):
+                    raise ValueError(
+                        "Chunked early-attention utility requires current K/V to have "
+                        "tokens_per_frame * len(current_frame_ids) tokens, "
+                        f"got tokens={current_k.shape[2]}, tokens_per_frame={tokens_per_frame}, "
+                        f"frames={len(resolved_current_frame_ids)}"
+                    )
             resolved_current_frame_idx = (
                 int(current_frame_idx)
                 if current_frame_idx is not None
@@ -839,6 +930,7 @@ class Attention(nn.Module):
                     "layer_id": layer_id,
                     "step_idx": step_idx,
                     "current_frame_idx": resolved_current_frame_idx,
+                    "current_frame_ids": resolved_current_frame_ids,
                     "tokens_per_frame": tokens_per_frame,
                     "eviction_policy": eviction_policy,
                     "eviction_policy_layers": eviction_policy_layers,

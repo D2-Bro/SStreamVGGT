@@ -6,7 +6,7 @@ import math
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -395,6 +395,8 @@ class EvictionManager:
         self._last_projected_key_features: Optional[torch.Tensor] = None
         self._last_projected_key_pre_norms: Optional[torch.Tensor] = None
         self._last_projected_key_cache_meta: Optional[Dict[str, object]] = None
+        self._perf_trace_enabled = False
+        self._perf_trace_events = []
         self._rls_context: Dict[str, Optional[int]] = {
             "step_idx": None,
             "current_frame_idx": None,
@@ -404,6 +406,29 @@ class EvictionManager:
     def reset_profile_stats(self) -> None:
         self._profile_totals = {}
         self._profile_count = 0
+
+    def reset_perf_trace(self) -> None:
+        self._perf_trace_events = []
+
+    def _perf_trace_start(self, tensor: torch.Tensor):
+        if not self._perf_trace_enabled or not tensor.is_cuda:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def _perf_trace_end(self, name: str, start_event) -> None:
+        if start_event is None:
+            return
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        self._perf_trace_events.append((name, start_event, end_event))
+
+    def get_perf_trace_stats(self) -> Dict[str, float]:
+        totals: Dict[str, float] = {}
+        for name, start_event, end_event in self._perf_trace_events:
+            totals[name] = totals.get(name, 0.0) + float(start_event.elapsed_time(end_event))
+        return totals
 
     def reset_rls_cache(self) -> None:
         self.cached_ktk: Optional[torch.Tensor] = None
@@ -444,6 +469,7 @@ class EvictionManager:
         layer_id: Optional[int] = None,
         step_idx: Optional[int] = None,
         current_frame_idx: Optional[int] = None,
+        current_frame_ids: Optional[Sequence[int]] = None,
         candidate_frame_ids: Optional[torch.Tensor] = None,
         candidate_depth_confidence: Optional[torch.Tensor] = None,
         candidate_point_confidence: Optional[torch.Tensor] = None,
@@ -495,12 +521,21 @@ class EvictionManager:
             policy_scores = mean_scores
             kept = self._keep_lowest_scores(policy_scores, num_to_keep)
         elif self.policy == "svd_leverage":
+            rls_refresh_before_score = self.rls_refresh_count
+            score_trace_start = self._perf_trace_start(candidate_k)
             raw_policy_scores, leverage_basis, layer_budget_score = self._score_svd_leverage_candidates(
                 candidate_k,
                 candidate_v,
                 need_leverage_basis=need_leverage_basis,
             )
+            score_trace_name = (
+                "score_rls_refresh"
+                if self.rls_refresh_count > rls_refresh_before_score
+                else "score_rls_cache_hit"
+            )
+            self._perf_trace_end(score_trace_name, score_trace_start)
             policy_scores = raw_policy_scores
+            confidence_trace_start = self._perf_trace_start(policy_scores)
             policy_scores = self._apply_confidence_gate(
                 policy_scores,
                 candidate_depth_confidence,
@@ -510,6 +545,8 @@ class EvictionManager:
                 current_frame_idx,
                 shared_across_heads=True,
             )
+            self._perf_trace_end("confidence_gate", confidence_trace_start)
+            utility_trace_start = self._perf_trace_start(policy_scores)
             policy_scores = self._blend_attention_utility(
                 policy_scores,
                 candidate_attention_utility,
@@ -521,14 +558,18 @@ class EvictionManager:
                 policy_scores,
                 candidate_frame_ids=candidate_frame_ids,
                 current_frame_idx=current_frame_idx,
+                current_frame_ids=current_frame_ids,
                 attention_utility_beta=attention_utility_beta,
                 attention_utility_enabled=candidate_attention_utility is not None,
             )
+            self._perf_trace_end("attention_utility", utility_trace_start)
+            topk_trace_start = self._perf_trace_start(selection_scores)
             kept = self._select_svd_leverage_kept(
                 selection_scores,
                 num_to_keep,
                 num_heads=H,
             )
+            self._perf_trace_end("topk", topk_trace_start)
         else:
             raise AssertionError(f"Unhandled eviction policy: {self.policy}")
 
@@ -903,12 +944,12 @@ class EvictionManager:
         current_frame_idx: Optional[int],
         attention_utility_beta: float,
         attention_utility_enabled: bool,
+        current_frame_ids: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         if (
             not attention_utility_enabled
             or float(attention_utility_beta) != 1.0
             or candidate_frame_ids is None
-            or current_frame_idx is None
         ):
             return scores
         if scores.ndim != 2 or tuple(candidate_frame_ids.shape) != tuple(scores.shape):
@@ -918,7 +959,23 @@ class EvictionManager:
                 f"got scores={tuple(scores.shape)} frame_ids={tuple(candidate_frame_ids.shape)}"
             )
 
-        current_mask = candidate_frame_ids.to(device=scores.device).eq(int(current_frame_idx))
+        if current_frame_ids is None:
+            if current_frame_idx is None:
+                return scores
+            resolved_current_frame_ids = [int(current_frame_idx)]
+        else:
+            resolved_current_frame_ids = [int(frame_id) for frame_id in current_frame_ids]
+            if not resolved_current_frame_ids:
+                if current_frame_idx is None:
+                    return scores
+                resolved_current_frame_ids = [int(current_frame_idx)]
+
+        current_ids = torch.as_tensor(
+            resolved_current_frame_ids,
+            device=scores.device,
+            dtype=candidate_frame_ids.dtype,
+        )
+        current_mask = candidate_frame_ids.to(device=scores.device).unsqueeze(-1).eq(current_ids).any(dim=-1)
         prioritized = scores.float()
         max_score = torch.finfo(prioritized.dtype).max
         return prioritized.masked_fill(current_mask, max_score)
@@ -966,6 +1023,7 @@ class EvictionManager:
         num_heads: int,
         head_dim: int,
         sketch_dim: int,
+        projection_bypassed: bool,
         device: torch.device,
     ) -> Dict[str, object]:
         return {
@@ -973,6 +1031,7 @@ class EvictionManager:
             "num_heads": int(num_heads),
             "head_dim": int(head_dim),
             "sketch_dim": int(sketch_dim),
+            "projection_bypassed": bool(projection_bypassed),
             "device": str(device),
             "normalize_before_projection": bool(self.leverage_normalize_before_projection),
             "normalize_before_projection_headwise": bool(self.leverage_normalize_before_projection_headwise),
@@ -986,6 +1045,7 @@ class EvictionManager:
         num_tokens: int,
         head_dim: int,
         sketch_dim: int,
+        projection_bypassed: bool,
         device: torch.device,
     ) -> int:
         if not self.leverage_projected_key_cache:
@@ -998,6 +1058,7 @@ class EvictionManager:
             num_heads=num_heads,
             head_dim=head_dim,
             sketch_dim=sketch_dim,
+            projection_bypassed=projection_bypassed,
             device=device,
         )
         if cache is None or norm_cache is None or meta != expected:
@@ -1084,6 +1145,28 @@ class EvictionManager:
         )
         return layer_projected, pre_norms
 
+    def _flatten_key_without_projection(
+        self,
+        mat_k: torch.Tensor,
+        profile: Optional[Dict[str, float]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        do_profile = profile is not None and self.profile
+        prep_start = time.perf_counter() if do_profile else 0.0
+        mat_k = torch.nan_to_num(mat_k.to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        if do_profile:
+            self._sync_for_timing(mat_k)
+            self._profile_add(profile, "candidate_matrix_preparation", time.perf_counter() - prep_start)
+        mat_k = self._normalize_layer_key_before_projection(mat_k, profile)
+        B, H, N, D = mat_k.shape
+        flat_k = mat_k.permute(0, 2, 1, 3).reshape(B, N, H * D)
+        pre_norms = torch.linalg.vector_norm(flat_k.detach(), ord=2, dim=-1)
+        layer_features = self._normalize_rows(
+            flat_k,
+            profile,
+            "post_projection_normalization",
+        )
+        return layer_features, pre_norms
+
     def _capture_projected_pre_norms(self, norms: torch.Tensor) -> None:
         if getattr(self, "_capture_projected_norms", False):
             self._last_projected_pre_norms = norms.detach()
@@ -1091,7 +1174,7 @@ class EvictionManager:
     def _layer_key_projected_features(
         self,
         mat_k: torch.Tensor,
-        omega_key: torch.Tensor,
+        omega_key: Optional[torch.Tensor],
         sketch_dim: int,
         profile: Dict[str, float],
     ) -> torch.Tensor:
@@ -1101,6 +1184,7 @@ class EvictionManager:
             num_heads=H,
             head_dim=D,
             sketch_dim=sketch_dim,
+            projection_bypassed=omega_key is None,
             device=mat_k.device,
         )
         cache_len = self._projected_key_cache_length(
@@ -1109,17 +1193,24 @@ class EvictionManager:
             num_tokens=N,
             head_dim=D,
             sketch_dim=sketch_dim,
+            projection_bypassed=omega_key is None,
             device=mat_k.device,
         )
         if cache_len > 0:
             layer_parts = [self._projected_key_cache[:, :cache_len].to(device=mat_k.device)]
             norm_parts = [self._projected_key_pre_norm_cache[:, :cache_len].to(device=mat_k.device)]
             if cache_len < N:
-                suffix_layer, suffix_norms = self._project_key_with_omega(
-                    mat_k[:, :, cache_len:, :],
-                    omega_key,
-                    profile,
-                )
+                if omega_key is None:
+                    suffix_layer, suffix_norms = self._flatten_key_without_projection(
+                        mat_k[:, :, cache_len:, :],
+                        profile,
+                    )
+                else:
+                    suffix_layer, suffix_norms = self._project_key_with_omega(
+                        mat_k[:, :, cache_len:, :],
+                        omega_key,
+                        profile,
+                    )
                 layer_parts.append(suffix_layer)
                 norm_parts.append(suffix_norms)
             leverage_matrix = torch.cat(layer_parts, dim=1)
@@ -1127,11 +1218,17 @@ class EvictionManager:
             profile["projection_cache_hits"] = float(cache_len)
             profile["projection_cache_misses"] = float(N - cache_len)
         else:
-            leverage_matrix, pre_norms = self._project_key_with_omega(
-                mat_k,
-                omega_key,
-                profile,
-            )
+            if omega_key is None:
+                leverage_matrix, pre_norms = self._flatten_key_without_projection(
+                    mat_k,
+                    profile,
+                )
+            else:
+                leverage_matrix, pre_norms = self._project_key_with_omega(
+                    mat_k,
+                    omega_key,
+                    profile,
+                )
             profile["projection_cache_hits"] = 0.0
             profile["projection_cache_misses"] = float(N)
 
@@ -1171,17 +1268,22 @@ class EvictionManager:
         if tail_k is not None and int(tail_k.shape[2]) > 0:
             with torch.amp.autocast("cuda", enabled=False):
                 tail = tail_k
-                omega = self._get_leverage_right_sketch(
-                    H * int(meta["head_dim"]),
-                    int(meta["sketch_dim"]),
-                    device=tail.device,
-                    seed=self.leverage_random_seed,
-                )
-                omega_key = omega[: H * int(meta["head_dim"])].view(H, int(meta["head_dim"]), int(meta["sketch_dim"]))
-                tail_features, tail_norms = self._project_key_with_omega(
-                    tail,
-                    omega_key,
-                )
+                feature_dim = H * int(meta["head_dim"])
+                sketch_dim = int(meta["sketch_dim"])
+                if bool(meta.get("projection_bypassed", False)):
+                    tail_features, tail_norms = self._flatten_key_without_projection(tail)
+                else:
+                    omega = self._get_leverage_right_sketch(
+                        feature_dim,
+                        sketch_dim,
+                        device=tail.device,
+                        seed=self.leverage_random_seed,
+                    )
+                    omega_key = omega.view(H, int(meta["head_dim"]), sketch_dim)
+                    tail_features, tail_norms = self._project_key_with_omega(
+                        tail,
+                        omega_key,
+                    )
             next_features = torch.cat([next_features, tail_features.detach()], dim=1)
             next_norms = torch.cat([next_norms, tail_norms.detach()], dim=1)
 
@@ -1614,21 +1716,28 @@ class EvictionManager:
         total_start = time.perf_counter() if do_profile else 0.0
 
         with torch.amp.autocast("cuda", enabled=False):
+            bypass_projection = sketch_dim == feature_dim == H * D
             # Right-sketched leverage / Compactor-style approximation for the
             # concatenated layer feature matrix, applied without materializing
             # the full [B, N, H * D] matrix first.
-            sketch_retrieval_start = time.perf_counter() if do_profile else 0.0
-            omega = self._get_leverage_right_sketch(
-                feature_dim,
-                sketch_dim,
-                device=candidate_k.device,
-                seed=self.leverage_random_seed,
-            )
-            if do_profile:
-                sync_tensor = omega
-                self._sync_for_timing(sync_tensor)
-                profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
-            omega_key = omega[: H * D].view(H, D, sketch_dim)
+            omega_key = None
+            if bypass_projection:
+                profile["sketch_matrix_retrieval"] = 0.0
+                profile["projection_matmul"] = 0.0
+                profile["projection_bypassed"] = 1.0
+            else:
+                sketch_retrieval_start = time.perf_counter() if do_profile else 0.0
+                omega = self._get_leverage_right_sketch(
+                    feature_dim,
+                    sketch_dim,
+                    device=candidate_k.device,
+                    seed=self.leverage_random_seed,
+                )
+                if do_profile:
+                    self._sync_for_timing(omega)
+                    profile["sketch_matrix_retrieval"] = time.perf_counter() - sketch_retrieval_start
+                omega_key = omega[: H * D].view(H, D, sketch_dim)
+                profile["projection_bypassed"] = 0.0
             if self.leverage_projected_key_cache:
                 projection_start = time.perf_counter() if do_profile else 0.0
                 leverage_matrix = self._layer_key_projected_features(
@@ -1641,11 +1750,17 @@ class EvictionManager:
                     self._sync_for_timing(leverage_matrix)
                     profile["projection_matmul"] = time.perf_counter() - projection_start
             else:
-                leverage_matrix, pre_norms = self._project_key_with_omega(
-                    candidate_k,
-                    omega_key,
-                    profile if do_profile else None,
-                )
+                if bypass_projection:
+                    leverage_matrix, pre_norms = self._flatten_key_without_projection(
+                        candidate_k,
+                        profile if do_profile else None,
+                    )
+                else:
+                    leverage_matrix, pre_norms = self._project_key_with_omega(
+                        candidate_k,
+                        omega_key,
+                        profile if do_profile else None,
+                    )
                 self._capture_projected_pre_norms(pre_norms)
 
             if do_profile:

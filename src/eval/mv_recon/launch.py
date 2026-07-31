@@ -1,4 +1,8 @@
 import os
+
+# os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import random
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -36,6 +40,29 @@ from streamvggt.utils.cache_analysis import (
 import hashlib
 from pathlib import Path
 import attn_cuda._ext as attn_ext
+
+def seed_everything(seed: int) -> int:
+    seed = int(seed)
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    # cv2.setRNGSeed(seed % (2**31 - 1))
+    o3d.utility.random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+    print(
+        f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}",
+        flush=True,
+    )
+
+    return seed
 
 _attn_ext_path = Path(attn_ext.__file__).resolve()
 print(
@@ -160,7 +187,7 @@ def get_args_parser():
     parser.add_argument("--revisit", type=int, default=1, help="revisit times")
     parser.add_argument("--freeze", action="store_true")
     parser.add_argument("--max_frames", default=None, help="max frames limit")
-    parser.add_argument("--stream_chunk_size", type=int, default=1, help="Number of consecutive stream frames to process in one chunk-causal forward")
+    parser.add_argument("--stream_chunk_size", type=int, default=1, help="Frames per streaming chunk; chunks attend causally to past chunks while frames inside a chunk attend bidirectionally")
     parser.add_argument("--use_proj", action="store_true")
     parser.add_argument("--eviction_policy", type=str, default="svd_leverage", help="Cache eviction policy: mean, baseline_mean, svd_leverage")
     parser.add_argument("--eviction_policy_layers", type=str, default="svd_leverage", help="Comma-separated zero-based global layer selectors that use --eviction_policy; other layers use FIFO. Example: 4:12,18,20:24",)
@@ -178,7 +205,7 @@ def get_args_parser():
     parser.add_argument("--leverage_ridge_jitter", type=float, default=1e-6, help="Absolute diagonal jitter added to ridge systems before Cholesky")
     parser.add_argument("--leverage_ridge_dim", type=int, default=256, help="Projection dimension for right_sketch_ridge; required for right_sketch_ridge")
     parser.add_argument("--rls_refresh_interval", type=int, default=8, help="Refresh interval for ridge leverage K^T K and Cholesky factorization; 1 refreshes every frame")
-    parser.add_argument("--leverage_random_seed", type=int, default=42, help="Random seed for leverage sketches")
+    parser.add_argument("--random_seed", type=int, default=42, help="Random seed for leverage sketches")
     parser.add_argument("--leverage_eviction_selector", type=str, default="topk", help="Eviction selector for svd_leverage scores: topk")
     parser.add_argument("--leverage_conf_gate", action="store_true", help="Apply normalized depth/world-point confidence gate to SVD leverage keep scores")
     parser.add_argument("--leverage_conf_gate_floor", type=float, default=0.2, help="Minimum multiplicative confidence gate value")
@@ -190,7 +217,7 @@ def get_args_parser():
     parser.add_argument("--leverage_attention_utility", action="store_true", help="Use frozen early-attention utility with STAC CUDA post-attention eviction")
     parser.add_argument("--leverage_attention_beta", type=float, default=0.3, help="Weight of normalized frozen attention utility in the keep score")
     parser.add_argument("--leverage_attention_ema_decay", type=float, default=0.9, help="EMA decay used during each token's finite attention observation horizon")
-    parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of attention observations accumulated before freezing token utility")
+    parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of chunk-level attention observations accumulated before freezing token utility")
     parser.add_argument("--leverage_attention_colsum_subsample_ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument("--leverage_conf_gate_special_mode", type=str, default="mean", choices=("mean", "one"), help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0")
     parser.add_argument("--layer_budget_strategy", type=str, default="value_weighted_leverage_pr", choices=("uniform", "leverage_pr", "key_norm", "value_weighted_leverage_pr"), help="Layer-wise KV budget allocation strategy")
@@ -211,6 +238,11 @@ def get_args_parser():
     parser.add_argument("--layer_budget_log_path", type=str, default=None, help="Optional explicit CSV path for layer budget score logs")
     parser.add_argument("--eviction_debug", action="store_true", help="Print verbose eviction summaries without enabling latency profiling")
     parser.add_argument("--profile_eviction", action="store_true", help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior")
+    parser.add_argument(
+        "--perf_trace",
+        action="store_true",
+        help="Collect non-synchronizing CUDA-event performance totals and print one summary per inference",
+    )
     add_eviction_nn_analysis_args(parser)
     add_leverage_score_histogram_args(parser)
     add_projected_norm_histogram_args(parser)
@@ -234,8 +266,9 @@ def get_args_parser():
         action="store_true",
         help="Compute reconstruction metrics on voxel centroids instead of full-resolution points",
     )
-    parser.add_argument("--budget", type=int, default=200000, help="Total token budget for StreamVGGT (if applicable)")
+    parser.add_argument("--budget", type=int, default=60000, help="Total token budget for StreamVGGT (if applicable)")
     parser.add_argument("--budget_frame_multiplier", type=float, default=None, help="Set StreamVGGT total budget to ceil(multiplier * tokens_per_frame) * num_global_layers; overrides --budget")
+    parser.add_argument("--kf_every", type=int, default=2)
     return parser
 
 
@@ -316,7 +349,7 @@ def main(args):
             resolution=resolution,
             num_seq=1,
             full_video=True,
-            kf_every=5,
+            kf_every=args.kf_every,
             # max_frames=100
         ),
         "NRGBD": NRGBD(
@@ -325,7 +358,7 @@ def main(args):
             resolution=resolution,
             num_seq=1,
             full_video=True,
-            kf_every=5,
+            kf_every=args.kf_every,
             # test_id=[ "whiteroom"]
             # max_frames=100
         ),
@@ -560,7 +593,7 @@ def main(args):
                                 leverage_ridge_jitter=args.leverage_ridge_jitter,
                                 leverage_ridge_dim=args.leverage_ridge_dim,
                                 rls_refresh_interval=args.rls_refresh_interval,
-                                leverage_random_seed=args.leverage_random_seed,
+                                leverage_random_seed=args.random_seed,
                                 leverage_eviction_selector=args.leverage_eviction_selector,
                                 leverage_conf_gate=args.leverage_conf_gate,
                                 leverage_conf_gate_floor=args.leverage_conf_gate_floor,
@@ -585,6 +618,7 @@ def main(args):
                                 layer_budget_eps=args.layer_budget_eps,
                                 layer_budget_log_path=layer_budget_log_path,
                                 profile_eviction=args.profile_eviction,
+                                perf_trace=args.perf_trace,
                                 eviction_debug=args.eviction_debug,
                                 eviction_nn_analysis_config=eviction_nn_analysis_config,
                                 leverage_score_histogram_config=leverage_score_histogram_config,
@@ -642,7 +676,6 @@ def main(args):
                     masks_all = []
                     conf_all = []
                     eval_frame_count = 0
-                    sampling_rng = np.random.default_rng(seed=42)
 
                     for j, view in enumerate(batch):
                         if j % args.eval_frame_stride != 0:
@@ -971,5 +1004,7 @@ regex = re.compile(pattern, re.VERBOSE)
 if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
+
+    # seed_everything(args.random_seed)
 
     main(args)

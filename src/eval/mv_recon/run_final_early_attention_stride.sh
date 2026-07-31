@@ -1,0 +1,14 @@
+#!/bin/bash
+
+set -e
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LEVERAGE_ATTENTION_UTILITY=true
+export LEVERAGE_ATTENTION_BETA="${LEVERAGE_ATTENTION_BETA:-0.5}"
+export LEVERAGE_ATTENTION_EMA_DECAY="${LEVERAGE_ATTENTION_EMA_DECAY:-0.9}"
+export LEVERAGE_ATTENTION_FREEZE_UPDATES="${LEVERAGE_ATTENTION_FREEZE_UPDATES:-5}"
+export LEVERAGE_ATTENTION_COLSUM_SUBSAMPLE_RATIO="${LEVERAGE_ATTENTION_COLSUM_SUBSAMPLE_RATIO:-1.0}"
+
+cd "${script_dir}/../.."
+# exec bash "${script_dir}/run_final_ablation.sh"
+exec bash "${script_dir}/run_final_supple_stride.sh"

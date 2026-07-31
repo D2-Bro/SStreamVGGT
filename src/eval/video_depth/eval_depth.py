@@ -28,54 +28,54 @@ def get_args_parser():
     parser.add_argument(
         "--align",
         type=str,
-        default="scale",
+        default="scale&shift",
         choices=["scale&shift", "scale", "metric"],
     )
     return parser
 
-def timestamp_from_path(path):
-    return float(os.path.splitext(os.path.basename(path))[0])
+# def timestamp_from_path(path):
+#     return float(os.path.splitext(os.path.basename(path))[0])
 
 
-def align_bonn_paths_by_timestamp(pred_paths, gt_paths, image_paths, sequence, max_time_diff=0.02):
-    if image_paths is None:
-        return pred_paths, gt_paths, image_paths
+# def align_bonn_paths_by_timestamp(pred_paths, gt_paths, image_paths, sequence, max_time_diff=0.02):
+#     if image_paths is None:
+#         return pred_paths, gt_paths, image_paths
 
-    count = min(len(pred_paths), len(image_paths))
-    pred_paths = pred_paths[:count]
-    image_paths = image_paths[:count]
-    gt_times = [timestamp_from_path(path) for path in gt_paths]
-    matched_pred_paths = []
-    matched_gt_paths = []
-    matched_image_paths = []
-    last_gt_idx = -1
-    gt_idx = 0
+#     count = min(len(pred_paths), len(image_paths))
+#     pred_paths = pred_paths[:count]
+#     image_paths = image_paths[:count]
+#     gt_times = [timestamp_from_path(path) for path in gt_paths]
+#     matched_pred_paths = []
+#     matched_gt_paths = []
+#     matched_image_paths = []
+#     last_gt_idx = -1
+#     gt_idx = 0
 
-    for pred_path, image_path in zip(pred_paths, image_paths):
-        image_time = timestamp_from_path(image_path)
-        while (
-            gt_idx + 1 < len(gt_times)
-            and abs(gt_times[gt_idx + 1] - image_time) < abs(gt_times[gt_idx] - image_time)
-        ):
-            gt_idx += 1
-        if gt_idx <= last_gt_idx:
-            continue
-        if abs(gt_times[gt_idx] - image_time) > max_time_diff:
-            continue
-        matched_pred_paths.append(pred_path)
-        matched_gt_paths.append(gt_paths[gt_idx])
-        matched_image_paths.append(image_path)
-        last_gt_idx = gt_idx
+#     for pred_path, image_path in zip(pred_paths, image_paths):
+#         image_time = timestamp_from_path(image_path)
+#         while (
+#             gt_idx + 1 < len(gt_times)
+#             and abs(gt_times[gt_idx + 1] - image_time) < abs(gt_times[gt_idx] - image_time)
+#         ):
+#             gt_idx += 1
+#         if gt_idx <= last_gt_idx:
+#             continue
+#         if abs(gt_times[gt_idx] - image_time) > max_time_diff:
+#             continue
+#         matched_pred_paths.append(pred_path)
+#         matched_gt_paths.append(gt_paths[gt_idx])
+#         matched_image_paths.append(image_path)
+#         last_gt_idx = gt_idx
 
-    if len(matched_pred_paths) != min(len(pred_paths), len(gt_paths)):
-        print(
-            f"WARN: Bonn {sequence}: timestamp-aligned "
-            f"pred={len(pred_paths)} gt={len(gt_paths)} rgb={len(image_paths)} "
-            f"-> {len(matched_pred_paths)} frames"
-        )
-    if not matched_pred_paths:
-        raise RuntimeError(f"No timestamp-aligned Bonn frames found for sequence {sequence!r}")
-    return matched_pred_paths, matched_gt_paths, matched_image_paths
+#     if len(matched_pred_paths) != min(len(pred_paths), len(gt_paths)):
+#         print(
+#             f"WARN: Bonn {sequence}: timestamp-aligned "
+#             f"pred={len(pred_paths)} gt={len(gt_paths)} rgb={len(image_paths)} "
+#             f"-> {len(matched_pred_paths)} frames"
+#         )
+#     if not matched_pred_paths:
+#         raise RuntimeError(f"No timestamp-aligned Bonn frames found for sequence {sequence!r}")
+#     return matched_pred_paths, matched_gt_paths, matched_image_paths
 
 def main(args):
     if args.eval_dataset == "sintel":
@@ -259,21 +259,10 @@ def main(args):
         def get_video_results():
             grouped_pred_depth = group_by_directory(pred_pathes)
             grouped_gt_depth = group_by_directory(depth_pathes, idx=-2)
-            grouped_images = group_by_directory(img_pathes, idx=-2)
             gathered_depth_metrics = []
             for key in tqdm(grouped_gt_depth.keys()):
-                pred_key = key[10:]
-
-                pd_pathes = grouped_pred_depth[pred_key]
+                pd_pathes = grouped_pred_depth[key[10:]]
                 gt_pathes = grouped_gt_depth[key]
-                image_pathes = grouped_images[key]
-
-                pd_pathes, gt_pathes, image_pathes = align_bonn_paths_by_timestamp(
-                    pd_pathes,
-                    gt_pathes,
-                    image_pathes,
-                    pred_key,
-                )
                 gt_depth = np.stack(
                     [depth_read(gt_path) for gt_path in gt_pathes], axis=0
                 )
@@ -342,7 +331,8 @@ def main(args):
                 f.write(json.dumps(average_metrics))
 
         get_video_results()
-    elif args.eval_dataset == "kitti":
+    # elif args.eval_dataset == "kitti":
+    elif (args.eval_dataset == "kitti" or args.eval_dataset.startswith("kitti_s1_")):
 
         def depth_read(filename):
             # loads depth map D from png file
@@ -356,15 +346,23 @@ def main(args):
             depth = depth_png.astype(float) / 256.0
             depth[depth_png == 0] = -1.0
             return depth
+        
+        metadata = dataset_metadata[args.eval_dataset]
+        gt_root = metadata["gt_path"]
 
-        depth_pathes = glob.glob(
-            "../data/eval/kitti/depth_selection/val_selection_cropped/groundtruth_depth_gathered/*/*.png"
+        depth_pathes = sorted(glob.glob(f"{gt_root}/*/*.png"))
+        pred_pathes = sorted(
+            glob.glob(f"{args.output_dir}/*/frame_*.npy")
         )
-        depth_pathes = sorted(depth_pathes)
-        pred_pathes = glob.glob(
-            f"{args.output_dir}/*/frame_*.npy"
-        )  # TODO: update the path to your prediction
-        pred_pathes = sorted(pred_pathes)
+
+        # depth_pathes = glob.glob(
+        #     "/home/dongjae/data/kitti_depth/depth_selection/val_selection_cropped/groundtruth_depth_gathered/*/*.png"
+        # )
+        # depth_pathes = sorted(depth_pathes)
+        # pred_pathes = glob.glob(
+        #     f"{args.output_dir}/*/frame_*.npy"
+        # )  # TODO: update the path to your prediction
+        # pred_pathes = sorted(pred_pathes)
 
         def get_video_results():
             grouped_pred_depth = group_by_directory(pred_pathes)

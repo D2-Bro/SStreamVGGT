@@ -429,7 +429,7 @@ if __name__ == "__main__":
         "--stream-chunk-size",
         type=int,
         default=1,
-        help="Number of consecutive stream frames to process in one chunk-causal forward",
+        help="Frames per streaming chunk; chunks attend causally to past chunks while frames inside a chunk attend bidirectionally",
     )
     parser.add_argument(
         "--frame_stride",

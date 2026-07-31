@@ -204,6 +204,61 @@ def test_beta_one_preserves_all_current_frame_tokens() -> None:
     )
 
 
+def test_beta_one_preserves_all_current_chunk_tokens() -> None:
+    raw_scores = torch.tensor([[0.9, 0.8, 0.7, 0.2, 0.1, 0.0]])
+
+    def fixed_scores(self, candidate_k, candidate_v=None, return_basis=False):
+        out = raw_scores.to(candidate_k.device)
+        return (out, None) if return_basis else out
+
+    manager = EvictionManager(
+        policy="svd_leverage",
+        leverage_granularity="layer",
+        leverage_eviction_selector="topk",
+    )
+    manager._layer_svd_leverage_scores = MethodType(fixed_scores, manager)
+    k = torch.randn(1, 2, 6, 4)
+    v = torch.randn_like(k)
+    result = manager.select(
+        k,
+        4,
+        0,
+        v=v,
+        candidate_frame_ids=torch.tensor([[0, 0, 1, 1, 2, 2]], dtype=torch.int32),
+        current_frame_idx=2,
+        current_frame_ids=[1, 2],
+        candidate_attention_utility=torch.tensor([[2.0, 1.0, 0.0, 0.0, 0.0, 0.0]]),
+        candidate_attention_observed=torch.tensor([[True, True, False, False, False, False]]),
+        attention_utility_beta=1.0,
+    )
+    assert torch.equal(
+        result.kept_candidate_indices,
+        torch.tensor([[[2, 3, 4, 5], [2, 3, 4, 5]]]),
+    )
+
+
+def test_first_frame_only_is_anchor_for_initial_chunk() -> None:
+    torch.manual_seed(9)
+    attention = Attention(dim=8, num_heads=2, rope=None, qk_norm=False).eval()
+    chunk_x = torch.randn(1, 6, 8)
+    _, cache, _ = attention(
+        chunk_x,
+        use_cache=True,
+        cache_budget=20,
+        step_idx=0,
+        current_frame_ids=[0, 1],
+        current_frame_idx=1,
+        tokens_per_frame=3,
+        eviction_policy="mean",
+        leverage_conf_gate=True,
+    )
+    _, _, state = unpack_kv_cache(cache)
+    assert attention.num_anchor_tokens == 3
+    assert state is not None
+    assert torch.equal(state.frame_ids[:, :attention.num_anchor_tokens], torch.zeros((1, 3), dtype=torch.int32))
+    assert torch.equal(state.frame_ids[:, attention.num_anchor_tokens:], torch.ones((1, 3), dtype=torch.int32))
+
+
 def test_cuda_attention_reference_if_available() -> None:
     if not torch.cuda.is_available():
         return
@@ -360,6 +415,78 @@ def test_cuda_pre_attention_eviction_if_available() -> None:
     assert torch.all((state.attention_count >= 1) & (state.attention_count <= 5))
 
 
+def test_cuda_chunked_attention_updates_once_per_chunk_if_available() -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        import attn_cuda
+    except (ImportError, OSError):
+        return
+    if not attn_cuda.is_available():
+        return
+
+    for chunk_size in (2, 4):
+        torch.manual_seed(100 + chunk_size)
+        attention = Attention(dim=128, num_heads=2, rope=None).cuda().eval()
+        cache = None
+        tokens_per_frame = 8
+        first_anchor_accum_after_freeze = None
+
+        for chunk_idx in range(6):
+            start_frame = chunk_idx * chunk_size
+            frame_ids = list(range(start_frame, start_frame + chunk_size))
+            chunk_x = torch.randn(
+                1,
+                chunk_size * tokens_per_frame,
+                128,
+                device="cuda",
+                dtype=torch.float32,
+            )
+            out, cache, _ = attention(
+                chunk_x,
+                past_key_values=cache,
+                use_cache=True,
+                cache_budget=512,
+                step_idx=start_frame,
+                current_frame_ids=frame_ids,
+                current_frame_idx=frame_ids[-1],
+                tokens_per_frame=tokens_per_frame,
+                eviction_policy="svd_leverage",
+                leverage_granularity="layer",
+                leverage_approx_method="right_sketch_ridge",
+                leverage_ridge_dim=4,
+                leverage_eviction_selector="topk",
+                leverage_conf_gate=True,
+                leverage_attention_utility=True,
+                leverage_attention_beta=0.2,
+                leverage_attention_ema_decay=0.9,
+                leverage_attention_freeze_updates=5,
+                leverage_attention_colsum_subsample_ratio=1.0,
+            )
+            k, _, state = unpack_kv_cache(cache)
+            assert out.shape == chunk_x.shape
+            assert state is not None and state.attention_count is not None
+            assert state.attention_accum is not None
+            assert attention.num_anchor_tokens == tokens_per_frame
+            assert k.shape[2] == (chunk_idx + 1) * chunk_size * tokens_per_frame
+
+            current_mask = torch.zeros_like(state.frame_ids, dtype=torch.bool)
+            for frame_id in frame_ids:
+                current_mask |= state.frame_ids.eq(frame_id)
+            assert torch.all(state.attention_count[current_mask] == 1)
+
+            expected_anchor_count = min(chunk_idx + 1, 5)
+            assert torch.all(state.attention_count[:, :tokens_per_frame] == expected_anchor_count)
+            if chunk_idx == 4:
+                first_anchor_accum_after_freeze = state.attention_accum[:, :tokens_per_frame].clone()
+            elif chunk_idx == 5:
+                assert first_anchor_accum_after_freeze is not None
+                assert torch.equal(
+                    state.attention_accum[:, :tokens_per_frame],
+                    first_anchor_accum_after_freeze,
+                )
+
+
 def test_frame_gate_vectorized_layouts() -> None:
     devices = [torch.device("cpu")]
     if torch.cuda.is_available():
@@ -406,10 +533,13 @@ def main() -> None:
     test_mean_normalization_preserves_score_ratios()
     test_unobserved_tokens_keep_full_leverage_score()
     test_beta_one_preserves_all_current_frame_tokens()
+    test_beta_one_preserves_all_current_chunk_tokens()
+    test_first_frame_only_is_anchor_for_initial_chunk()
     test_frame_gate_vectorized_layouts()
     test_cuda_attention_reference_if_available()
     test_cuda_beta_zero_pre_eviction_cache_parity_if_available()
     test_cuda_pre_attention_eviction_if_available()
+    test_cuda_chunked_attention_updates_once_per_chunk_if_available()
     print("frozen early-attention utility tests passed")
 
 

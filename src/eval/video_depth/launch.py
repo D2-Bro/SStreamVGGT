@@ -1,4 +1,8 @@
 import os
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import random
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
@@ -27,6 +31,23 @@ from streamvggt.utils.cache_analysis import (
     token_overlay_dump_config_from_args,
 )
 
+def seed_everything(seed: int) -> int:
+    seed = int(seed)
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    cv2.setRNGSeed(seed % (2**31 - 1))
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+    return seed
+
 def get_args_parser():
     parser = argparse.ArgumentParser()
 
@@ -51,7 +72,7 @@ def get_args_parser():
     parser.add_argument(
         "--eval_dataset",
         type=str,
-        default="sintel",
+        default="bonn",
         choices=list(dataset_metadata.keys()),
     )
     parser.add_argument("--stride", type=int, default=1, help="frame stride for evaluation")
@@ -149,7 +170,7 @@ def get_args_parser():
         default=8,
         help="Refresh interval for ridge leverage K^T K and Cholesky factorization; 1 refreshes every frame",
     )
-    parser.add_argument("--leverage_random_seed", type=int, default=42)
+    parser.add_argument("--random_seed", type=int, default=42)
     parser.add_argument(
         "--leverage_eviction_selector",
         type=str,
@@ -179,7 +200,7 @@ def get_args_parser():
     parser.add_argument("--leverage_attention_utility", action="store_true", help="Collect frozen early-attention utility with STAC CUDA after pre-attention eviction")
     parser.add_argument("--leverage_attention_beta", type=float, default=0.3, help="Weight of normalized frozen attention utility in the keep score")
     parser.add_argument("--leverage_attention_ema_decay", type=float, default=0.9, help="EMA decay used during each token attention observation horizon")
-    parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of attention observations accumulated before freezing token utility")
+    parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of chunk-level attention observations accumulated before freezing token utility")
     parser.add_argument("--leverage_attention_colsum_subsample_ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument(
         "--layer_budget_strategy",
@@ -253,7 +274,7 @@ def get_args_parser():
         default=None,
         help="Set the token budget from the per-frame token count times this multiplier",
     )
-    parser.add_argument("--stream_chunk_size", "--stream-chunk-size", type=int, default=1)
+    parser.add_argument("--stream_chunk_size", "--stream-chunk-size", type=int, default=1, help="Frames per streaming chunk; chunks attend causally to past chunks while frames inside a chunk attend bidirectionally")
     parser.add_argument("--empty_cache_interval", "--empty-cache-interval", type=int, default=1)
     parser.add_argument(
         "--full_seq",
@@ -452,7 +473,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_ridge_jitter=args.leverage_ridge_jitter,
                         leverage_ridge_dim=args.leverage_ridge_dim,
                         rls_refresh_interval=args.rls_refresh_interval,
-                        leverage_random_seed=args.leverage_random_seed,
+                        leverage_random_seed=args.random_seed,
                         leverage_eviction_selector=args.leverage_eviction_selector,
                         leverage_conf_gate=args.leverage_conf_gate,
                         leverage_conf_gate_floor=args.leverage_conf_gate_floor,
@@ -536,6 +557,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
+
+    seed_everything(args.random_seed)
 
     try:
         eviction_nn_config_from_args(args, output_dir=args.eviction_nn_analysis_dir)

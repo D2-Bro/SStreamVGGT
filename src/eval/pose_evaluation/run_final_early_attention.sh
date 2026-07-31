@@ -13,9 +13,10 @@ model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 eval_dataset="${POSE_EVAL_DATASET:-tum_stride2}"
 
 size="518"
-max_frames="100"
+max_frames="full_seq"
 pose_eval_stride="1"
 empty_cache_interval="1"
+stream_chunk_size="${STREAM_CHUNK_SIZE:-1}"
 eviction_policy="svd_leverage"
 layer_budget_strategy="value_weighted_leverage_pr" #value_weighted_leverage_pr
 layer_budget_alpha="0.7"
@@ -35,10 +36,10 @@ leverage_ridge_lambda_mode="absolute"
 leverage_ridge_score_chunk_size="16384"
 leverage_ridge_jitter="0"
 leverage_ridge_dim="256"
-leverage_random_seed="42"
+random_seed="${RANDOM_SEED:-42}"
 
 leverage_conf_gate_floor="0.0"
-leverage_conf_gate_depth_alpha="1.0"
+leverage_conf_gate_depth_alpha="0.0"
 leverage_conf_gate_point_beta="0.0"
 leverage_conf_gate_k="1.0"
 leverage_conf_gate_transform="${LEVERAGE_CONF_GATE_TRANSFORM:-sigmoid}"
@@ -69,7 +70,7 @@ projected_key_cache_args=()
 if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
-output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_Final_B0.5_${total_budget}_100f"
+output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_Final_B0.5_${total_budget}_FullSeq_chunk${stream_chunk_size}_NoConf"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -83,7 +84,6 @@ accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evalua
     --model_name "$model_name" \
     --eval_dataset "$eval_dataset" \
     --size "$size" \
-    --max_frames "$max_frames" \
     --pose_eval_stride "$pose_eval_stride" \
     --eviction_policy "$eviction_policy" \
     --leverage_granularity layer \
@@ -102,7 +102,7 @@ accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evalua
     --leverage_ridge_score_chunk_size "$leverage_ridge_score_chunk_size" \
     --leverage_ridge_jitter "$leverage_ridge_jitter" \
     --leverage_ridge_dim "$leverage_ridge_dim" \
-    --leverage_random_seed "$leverage_random_seed" \
+    --random_seed "$random_seed" \
     --layer_budget_value_gamma "$layer_budget_value_gamma" \
     --layer_budget_value_norm_type "$layer_budget_value_norm_type" \
     --layer_budget_norm_source "$layer_budget_norm_source" \
@@ -115,7 +115,7 @@ accelerate launch --num_processes 1 --main_process_port 29302 ./eval/pose_evalua
     --leverage_conf_gate_transform "$leverage_conf_gate_transform" \
     --leverage_conf_gate_special_mode "$leverage_conf_gate_special_mode" \
     --leverage_conf_gate_init "$leverage_conf_gate_init" \
-    --stream_chunk_size 1 \
+    --stream_chunk_size "$stream_chunk_size" \
     --empty_cache_interval "$empty_cache_interval" \
     --rls_refresh_interval 8 \
     "${projected_key_cache_args[@]}" \

@@ -39,6 +39,8 @@ leverage_conf_gate_special_mode=mean    #[one, mean]
 leverage_conf_gate_init=mean
 leverage_projected_key_cache="true"
 
+kf_every=5
+
 eval_frame_stride=1
 stream_chunk_size="${STREAM_CHUNK_SIZE:-1}"
 if ! [[ "$num_processes" =~ ^[1-9][0-9]*$ ]]; then
@@ -73,12 +75,8 @@ projected_key_cache_args=()
 if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
-perf_trace_args=()
-if [ "${PERF_TRACE:-0}" = 1 ]; then
-    perf_trace_args=(--perf_trace)
-fi
 
-default_output_dir="${workdir}/eval_results/mv_recon/Final_dim${leverage_ridge_dim}_${layer_budget_strategy}_${budget_suffix}_chunk${stream_chunk_size}_${attention_utility_suffix}_F1_fullSeq_supple"
+default_output_dir="${workdir}/eval_results/mv_recon/Final_dim${leverage_ridge_dim}_${layer_budget_strategy}_${budget_suffix}_chunk${stream_chunk_size}_${attention_utility_suffix}_F1_fullSeq_supple_stride${kf_every}"
 output_dir="${OUTPUT_DIR:-$default_output_dir}"
 if [ -n "${RUN_SUFFIX:-}" ]; then
     output_dir="${output_dir}_${RUN_SUFFIX}"
@@ -91,11 +89,12 @@ export OPENBLAS_NUM_THREADS=16
 export MKL_NUM_THREADS=16
 export NUMEXPR_NUM_THREADS=16
 
-accelerate launch --num_processes "$num_processes" --main_process_port "${MAIN_PROCESS_PORT:-29502}" ./eval/mv_recon/launch.py \
+accelerate launch --num_processes "$num_processes" --main_process_port "${MAIN_PROCESS_PORT:-29302}" ./eval/mv_recon/launch.py \
     --weights "$model_weights" \
     --output_dir "$output_dir" \
     --model_name "$model_name" \
     --max_frames "$max_frames" \
+    --kf_every "$kf_every" \
     --eval_frame_stride "$eval_frame_stride" \
     --eviction_policy "$eviction_policy" \
     --leverage_granularity layer \
@@ -130,12 +129,10 @@ accelerate launch --num_processes "$num_processes" --main_process_port "${MAIN_P
     --stream_chunk_size "$stream_chunk_size" \
     --rls_refresh_interval 8 \
     "${projected_key_cache_args[@]}" \
-    "${attention_utility_args[@]}" \
-    "${perf_trace_args[@]}"
+    "${attention_utility_args[@]}" 
     # --recon_eval_mode voxel_icp 
     # --eval_voxel_size 0.005
     
-# Set PERF_TRACE=1 to print non-synchronizing CUDA-event trace totals.
 # Add --profile_eviction to the launch command above when measuring eviction latency.
 
 # --layer_budget_log_scores \

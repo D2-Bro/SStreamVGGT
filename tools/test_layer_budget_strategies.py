@@ -215,6 +215,8 @@ def test_batched_budget_conversion_matches_item_reference():
             past_key_values=past_key_values,
         )
         assert actual.tolist() == [expected[idx] for idx in range(4)], strategy
+
+
 def test_layer_budget_payload_stays_tensor():
     devices = [torch.device("cpu")]
     if torch.cuda.is_available():
@@ -254,6 +256,57 @@ def _score_only_manager(*, projected_key_cache=False):
         layer_budget_value_norm_type="mean",
         layer_budget_norm_source="key",
     )
+
+
+def test_matching_ridge_dim_bypasses_random_projection():
+    torch.manual_seed(3)
+    k = torch.randn(1, 2, 12, 4)
+    ridge_lambda = 0.1
+    flat_k = k.float().permute(0, 2, 1, 3).reshape(1, 12, 8)
+    gram = flat_k.transpose(-2, -1) @ flat_k
+    regularized = gram + ridge_lambda * torch.eye(8).unsqueeze(0)
+    expected = ((flat_k @ torch.linalg.inv(regularized)) * flat_k).sum(dim=-1)
+
+    for projected_key_cache in (False, True):
+        manager = EvictionManager(
+            policy="svd_leverage",
+            profile=True,
+            leverage_granularity="layer",
+            leverage_approx_method="right_sketch_ridge",
+            leverage_ridge_lambda=ridge_lambda,
+            leverage_ridge_lambda_mode="absolute",
+            leverage_ridge_jitter=0.0,
+            leverage_ridge_dim=8,
+            leverage_projected_key_cache=projected_key_cache,
+        )
+
+        scores = manager._layer_svd_leverage_scores(k)
+
+        assert torch.allclose(scores, expected, atol=1e-5, rtol=1e-5)
+        if projected_key_cache:
+            assert torch.equal(manager._last_projected_key_features, flat_k)
+        assert manager._leverage_right_sketch_cache == {}
+        assert manager._last_leverage_profile["projection_bypassed"] == 1.0
+        assert manager._last_leverage_profile["projection_matmul"] == 0.0
+
+
+def test_smaller_ridge_dim_keeps_random_projection():
+    k = torch.randn(1, 2, 12, 4)
+    manager = EvictionManager(
+        policy="svd_leverage",
+        profile=True,
+        leverage_granularity="layer",
+        leverage_approx_method="right_sketch_ridge",
+        leverage_ridge_lambda=0.1,
+        leverage_ridge_lambda_mode="absolute",
+        leverage_ridge_dim=4,
+    )
+
+    manager._layer_svd_leverage_scores(k)
+
+    assert len(manager._leverage_right_sketch_cache) == 1
+    assert manager._last_leverage_profile["projection_bypassed"] == 0.0
+    assert manager._last_leverage_profile["projection_matmul"] > 0.0
 
 
 def test_score_only_matches_eviction_raw_payload():
