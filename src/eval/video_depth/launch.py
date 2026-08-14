@@ -8,6 +8,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import math
 import cv2
+import csv
 import numpy as np
 import torch
 import argparse
@@ -44,7 +45,7 @@ def seed_everything(seed: int) -> int:
 
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
+    # torch.use_deterministic_algorithms(True)
 
     return seed
 
@@ -363,6 +364,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
     distributed_state = PartialState()
     model.to(distributed_state.device)
     device = distributed_state.device
+    os.makedirs(save_dir, exist_ok=True)
 
     with distributed_state.split_between_processes(seq_list) as seqs:
         ate_list = []
@@ -371,6 +373,13 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
         load_img_size = args.size
         assert load_img_size == 518
         error_log_path = f"{save_dir}/_error_log_{distributed_state.process_index}.txt"  # Unique log file per process
+        timing_log_path = os.path.join(
+            save_dir, f"_inference_timing_{distributed_state.process_index}.csv"
+        )
+        with open(timing_log_path, "w", newline="") as timing_file:
+            csv.writer(timing_file).writerow(
+                ["dataset", "sequence", "num_frames", "inference_seconds", "fps"]
+            )
         bug = False
         for seq in tqdm(seqs):
             try:
@@ -406,7 +415,6 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 )
                 for view in views:
                     view["img"] = (view["img"] + 1.0) / 2.0
-                start = time.time()
                 safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                 rank_label = f"rank_{distributed_state.process_index}"
                 eviction_nn_analysis_config = None
@@ -450,6 +458,9 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 
                 dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
                 with torch.cuda.amp.autocast(dtype=dtype):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(device)
+                    infer_start = time.perf_counter()
                     output = model.inference(
                         views,
                         frame_writer=frame_writer,
@@ -502,11 +513,27 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         leverage_score_histogram_config=leverage_score_histogram_config,
                         token_overlay_dump_config=token_overlay_dump_config,
                     )
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize(device)
+                    infer_time = time.perf_counter() - infer_start
                     outputs = dict(views=output.views, pred=output.ress)
+                fps = len(filelist) / infer_time if infer_time > 0 else float("inf")
+                print(
+                    f"Finished depth estimation for {args.eval_dataset} {seq: <16}, "
+                    f"Inference time: {infer_time:.6f}s, FPS: {fps:.2f}"
+                )
+                with open(timing_log_path, "a", newline="") as timing_file:
+                    csv.writer(timing_file).writerow(
+                        [
+                            args.eval_dataset,
+                            seq,
+                            len(filelist),
+                            f"{infer_time:.9f}",
+                            f"{fps:.9f}",
+                        ]
+                    )
                 if leverage_score_histogram_config is not None:
                     leverage_score_histogram_config.flush()
-                end = time.time()
-                # fps = len(filelist) / (end - start)
                 if args.stream_depth_save:
                     summarize_layer_budget_log(layer_budget_log_path)
                 else:
@@ -551,6 +578,35 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     print(f"Traj evaluation error in sequence {seq}, skipping.")
                 else:
                     raise e  # Rethrow if it's not an expected exception
+    distributed_state.wait_for_everyone()
+    if distributed_state.is_main_process:
+        timing_rows = []
+        for rank in range(distributed_state.num_processes):
+            rank_timing_log_path = os.path.join(save_dir, f"_inference_timing_{rank}.csv")
+            if not os.path.exists(rank_timing_log_path):
+                continue
+            with open(rank_timing_log_path, newline="") as timing_file:
+                timing_rows.extend(csv.DictReader(timing_file))
+
+        total_frames = sum(int(row["num_frames"]) for row in timing_rows)
+        total_inference_seconds = sum(float(row["inference_seconds"]) for row in timing_rows)
+        overall_fps = (
+            total_frames / total_inference_seconds
+            if total_inference_seconds > 0.0 else float("inf")
+        )
+        timing_summary = (
+            f"Inference timing: {total_frames} frames, "
+            f"{total_inference_seconds:.6f}s, overall FPS: {overall_fps:.2f}"
+        )
+        print(timing_summary)
+        with open(os.path.join(save_dir, "inference_timing.csv"), "w", newline="") as timing_file:
+            writer = csv.DictWriter(
+                timing_file, fieldnames=["dataset", "sequence", "num_frames", "inference_seconds", "fps"]
+            )
+            writer.writeheader()
+            writer.writerows(timing_rows)
+        with open(os.path.join(save_dir, "inference_timing_summary.txt"), "w") as timing_file:
+            timing_file.write(timing_summary + "\n")
     return None, None, None
 
 

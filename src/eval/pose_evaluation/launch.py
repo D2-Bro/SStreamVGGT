@@ -1,5 +1,6 @@
 import os
 import subprocess
+import csv
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import random
 import sys
@@ -41,7 +42,7 @@ def seed_everything(seed: int) -> int:
 
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
+    # torch.use_deterministic_algorithms(True)
 
     print(
         f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}",
@@ -263,6 +264,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
     model.to(distributed_state.device)
     device = distributed_state.device
 
+    os.makedirs(save_dir, exist_ok=True)
     with distributed_state.split_between_processes(seq_list) as seqs:
         ate_list = []
         rpe_trans_list = []
@@ -270,6 +272,13 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
         load_img_size = args.size
         error_log_path = f"{save_dir}/_error_log_{distributed_state.process_index}.txt"  # Unique log file per process
         bug = False
+        timing_log_path = os.path.join(
+            save_dir, f"_inference_timing_{distributed_state.process_index}.csv"
+        )
+        with open(timing_log_path, "w", newline="") as timing_file:
+            csv.writer(timing_file).writerow(
+                ["dataset", "sequence", "num_frames", "inference_seconds", "fps"]
+            )
         for seq in tqdm(seqs):
             try:
                 dir_path = metadata["dir_path_func"](img_path, seq)
@@ -395,6 +404,16 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     f"Inference time: {infer_time:.6f}s, FPS: {fps:.2f}"
                 )
                 summarize_layer_budget_log(layer_budget_log_path)
+                with open(timing_log_path, "a", newline="") as timing_file:
+                    csv.writer(timing_file).writerow(
+                        [
+                            args.eval_dataset,
+                            seq,
+                            len(filelist),
+                            f"{infer_time:.9f}",
+                            f"{fps:.9f}",
+                        ]
+                    )
 
                 all_camera_pose = []
                 for res in output.ress:
@@ -527,8 +546,39 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 
     # Write the averages to the error log (only on the main process)
     if distributed_state.is_main_process:
+        timing_rows = []
+        for rank in range(distributed_state.num_processes):
+            timing_log_path = os.path.join(save_dir, f"_inference_timing_{rank}.csv")
+            if not os.path.exists(timing_log_path):
+                continue
+            with open(timing_log_path, newline="") as timing_file:
+                timing_rows.extend(csv.DictReader(timing_file))
+
+        total_frames = sum(int(row["num_frames"]) for row in timing_rows)
+        total_inference_seconds = sum(
+            float(row["inference_seconds"]) for row in timing_rows
+        )
+        overall_fps = (
+            total_frames / total_inference_seconds
+            if total_inference_seconds > 0.0
+            else float("inf")
+        )
+        timing_summary = (
+            f"Inference timing: {total_frames} frames, "
+            f"{total_inference_seconds:.6f}s, overall FPS: {overall_fps:.2f}"
+        )
+        with open(os.path.join(save_dir, "inference_timing.csv"), "w", newline="") as timing_file:
+            writer = csv.DictWriter(
+                timing_file,
+                fieldnames=["dataset", "sequence", "num_frames", "inference_seconds", "fps"],
+            )
+            writer.writeheader()
+            writer.writerows(timing_rows)
+        with open(os.path.join(save_dir, "inference_timing_summary.txt"), "w") as f:
+            f.write(timing_summary + "\n")
+
+        # Copy the error log from each process to the main error log
         with open(f"{save_dir}/_error_log.txt", "a") as f:
-            # Copy the error log from each process to the main error log
             for i in range(distributed_state.num_processes):
                 if not os.path.exists(f"{save_dir}/_error_log_{i}.txt"):
                     break
@@ -538,6 +588,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 f"Average ATE: {avg_ate:.5f}, Average RPE trans: {avg_rpe_trans:.5f}, Average RPE rot: {avg_rpe_rot:.5f}\n"
             )
 
+            f.write(timing_summary + "\n")
     return avg_ate, avg_rpe_trans, avg_rpe_rot
 
 

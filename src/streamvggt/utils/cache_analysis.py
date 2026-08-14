@@ -614,28 +614,59 @@ def dump_token_overlay_event(
         if scores.ndim not in (2, 3):
             return
 
-        B = int(metadata.frame_ids.shape[0])
-        H = int(metadata.frame_ids.shape[1])
+        metadata_frame_ids = metadata.frame_ids
+        metadata_token_indices = metadata.token_indices
+        if metadata_frame_ids.ndim not in (2, 3):
+            raise ValueError(
+                "token overlay metadata frame_ids must be [B, N] or [B, H, N], "
+                f"got {tuple(metadata_frame_ids.shape)}"
+            )
+        if tuple(metadata_token_indices.shape) != tuple(metadata_frame_ids.shape):
+            raise ValueError(
+                "token overlay frame_ids/token_indices shape mismatch: "
+                f"frame_ids={tuple(metadata_frame_ids.shape)} "
+                f"token_indices={tuple(metadata_token_indices.shape)}"
+            )
+
+        B = int(scores.shape[0])
+        H = int(scores.shape[1]) if scores.ndim == 3 else 1
         candidate_count = int(scores.shape[-1])
         if candidate_count <= 0:
             return
+        required_metadata_tokens = int(num_anchor_tokens) + candidate_count
+        if int(metadata_frame_ids.shape[0]) != B or int(metadata_frame_ids.shape[-1]) < required_metadata_tokens:
+            raise ValueError(
+                "token overlay metadata does not align with policy scores: "
+                f"metadata={tuple(metadata_frame_ids.shape)} scores={tuple(scores.shape)} "
+                f"num_anchor_tokens={num_anchor_tokens}"
+            )
         active_selection_granularity = leverage_granularity if selection_granularity is None else selection_granularity
         all_candidates_cpu = torch.arange(candidate_count, dtype=torch.long)
         all_candidates_device = all_candidates_cpu.to(device=kept_candidate_indices.device)
 
-        def candidate_metadata(batch_id: int, head_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        def metadata_row(values: torch.Tensor, batch_id: int, head_id: Optional[int]) -> torch.Tensor:
+            if values.ndim == 2:
+                return values[batch_id]
+            resolved_head_id = 0 if head_id is None else int(head_id)
+            if resolved_head_id >= int(values.shape[1]):
+                raise ValueError(
+                    f"token overlay metadata has {values.shape[1]} heads, requested head {resolved_head_id}"
+                )
+            return values[batch_id, resolved_head_id]
+
+        def candidate_metadata(batch_id: int, head_id: Optional[int]) -> tuple[torch.Tensor, torch.Tensor]:
             start = int(num_anchor_tokens)
             end = start + candidate_count
-            frame_ids = metadata.frame_ids[batch_id, head_id, start:end]
-            token_indices = metadata.token_indices[batch_id, head_id, start:end]
+            frame_ids = metadata_row(metadata_frame_ids, batch_id, head_id)[start:end]
+            token_indices = metadata_row(metadata_token_indices, batch_id, head_id)[start:end]
             return frame_ids.detach().cpu().long(), token_indices.detach().cpu().long()
 
-        def anchor_metadata(batch_id: int, head_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        def anchor_metadata(batch_id: int, head_id: Optional[int]) -> tuple[torch.Tensor, torch.Tensor]:
             if int(num_anchor_tokens) <= 0:
                 empty = torch.empty(0, dtype=torch.long)
                 return empty, empty
-            frame_ids = metadata.frame_ids[batch_id, head_id, :int(num_anchor_tokens)]
-            token_indices = metadata.token_indices[batch_id, head_id, :int(num_anchor_tokens)]
+            frame_ids = metadata_row(metadata_frame_ids, batch_id, head_id)[:int(num_anchor_tokens)]
+            token_indices = metadata_row(metadata_token_indices, batch_id, head_id)[:int(num_anchor_tokens)]
             return frame_ids.detach().cpu().long(), token_indices.detach().cpu().long()
 
         if active_selection_granularity == "layer" or scores.ndim == 2:
@@ -652,8 +683,8 @@ def dump_token_overlay_event(
                 kept_local = kept_local.detach().cpu().long()
                 evicted_local = evicted_local.detach().cpu().long()
                 candidate_scores = _scores_for_batch(scores, batch_id, None).detach().cpu().float()
-                candidate_frame_ids, candidate_token_indices = candidate_metadata(batch_id, 0)
-                anchor_frame_ids, anchor_token_indices = anchor_metadata(batch_id, 0)
+                candidate_frame_ids, candidate_token_indices = candidate_metadata(batch_id, None)
+                anchor_frame_ids, anchor_token_indices = anchor_metadata(batch_id, None)
                 _write_token_overlay_payload(
                     config,
                     batch_id=batch_id,

@@ -1342,7 +1342,8 @@ class EvictionManager:
         requested = self.leverage_ridge_dim
         if requested is None or int(requested) < 1:
             raise ValueError("right_sketch_ridge requires leverage_ridge_dim >= 1")
-        return min(int(requested), int(feature_dim), int(num_tokens))
+        # return min(int(requested), int(feature_dim), int(num_tokens))
+        return int(requested)
 
     def _empty_leverage_basis(self, mat: torch.Tensor, granularity: str, *, basis_kind: str) -> SvdLeverageBasis:
         prefix = mat.shape[:-2]

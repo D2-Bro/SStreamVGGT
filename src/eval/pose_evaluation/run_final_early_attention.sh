@@ -10,11 +10,11 @@ model_name="StreamVGGT"
 ckpt_name="checkpoints"
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 
-eval_dataset="${POSE_EVAL_DATASET:-tum_stride2}"
+eval_dataset="${POSE_EVAL_DATASET:-replica}"
 
 size="518"
 max_frames="full_seq"
-pose_eval_stride="1"
+pose_eval_stride="2"
 empty_cache_interval="1"
 stream_chunk_size="${STREAM_CHUNK_SIZE:-1}"
 eviction_policy="svd_leverage"
@@ -35,11 +35,11 @@ leverage_ridge_lambda="0"
 leverage_ridge_lambda_mode="absolute"
 leverage_ridge_score_chunk_size="16384"
 leverage_ridge_jitter="0"
-leverage_ridge_dim="256"
+leverage_ridge_dim="1024"
 random_seed="${RANDOM_SEED:-42}"
 
 leverage_conf_gate_floor="0.0"
-leverage_conf_gate_depth_alpha="0.0"
+leverage_conf_gate_depth_alpha="1.0"
 leverage_conf_gate_point_beta="0.0"
 leverage_conf_gate_k="1.0"
 leverage_conf_gate_transform="${LEVERAGE_CONF_GATE_TRANSFORM:-sigmoid}"
@@ -70,7 +70,7 @@ projected_key_cache_args=()
 if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
-output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_Final_B0.5_${total_budget}_FullSeq_chunk${stream_chunk_size}_NoConf"
+output_dir="${workdir}/eval_results/pose_evaluation/${eval_dataset}_Final_B0.5_${total_budget}_FullSeq_chunk${stream_chunk_size}_supple_dim1024_full_NoMin_interval4"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16

@@ -9,10 +9,10 @@ model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 max_frames='full_seq'
 eviction_policy='svd_leverage'
 layer_budget_strategy='value_weighted_leverage_pr' #[spectral_pr, leverage_pr, uniform, leverage_entropy, depth_weighted_leverage_pr, value_weighted_leverage_pr]
-layer_budget_alpha="${LAYER_BUDGET_ALPHA:-0.7}"
+layer_budget_alpha="${LAYER_BUDGET_ALPHA:-0.0}"
 layer_budget_min_tokens=0
 layer_budget_eps=0
-layer_budget_value_gamma="${LAYER_BUDGET_VALUE_GAMMA:-0.7}"
+layer_budget_value_gamma="${LAYER_BUDGET_VALUE_GAMMA:-0.0}"
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
 total_budget="${TOTAL_BUDGET:-60000}"
@@ -27,7 +27,7 @@ leverage_ridge_score_chunk_size=16384
 leverage_ridge_jitter=0
 leverage_ridge_dim="${DIMENSION:-256}"
 random_seed="${RANDOM_SEED:-42}"
-num_processes="${NUM_PROCESSES:-1}"
+num_processes="${NUM_PROCESSES:-3}"
 
 
 leverage_conf_gate_floor=0.0
@@ -78,7 +78,7 @@ if [ "${PERF_TRACE:-0}" = 1 ]; then
     perf_trace_args=(--perf_trace)
 fi
 
-default_output_dir="${workdir}/eval_results/mv_recon/Final_dim${leverage_ridge_dim}_${layer_budget_strategy}_${budget_suffix}_chunk${stream_chunk_size}_${attention_utility_suffix}_F1_fullSeq_supple"
+default_output_dir="${workdir}/eval_results/mv_recon/Final_dim${leverage_ridge_dim}_${layer_budget_strategy}_${budget_suffix}_chunk${stream_chunk_size}_${attention_utility_suffix}_F1_fullSeq_supple_alloc0.0"
 output_dir="${OUTPUT_DIR:-$default_output_dir}"
 if [ -n "${RUN_SUFFIX:-}" ]; then
     output_dir="${output_dir}_${RUN_SUFFIX}"

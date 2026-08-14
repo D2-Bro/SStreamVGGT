@@ -54,8 +54,8 @@ def seed_everything(seed: int) -> int:
         torch.cuda.manual_seed_all(seed)
 
     torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
+    # torch.backends.cudnn.deterministic = True
+    # torch.use_deterministic_algorithms(True)
 
     print(
         f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}",
@@ -63,6 +63,24 @@ def seed_everything(seed: int) -> int:
     )
 
     return seed
+
+
+def parse_max_frames(value):
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("", "none", "all", "full", "full_seq"):
+        return None
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"max_frames must be a positive integer or full_seq, got {value!r}"
+        ) from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"max_frames must be >= 1, got {parsed}")
+    return parsed
+
 
 _attn_ext_path = Path(attn_ext.__file__).resolve()
 print(
@@ -186,7 +204,12 @@ def get_args_parser():
     parser.add_argument("--size", type=int, default=518)
     parser.add_argument("--revisit", type=int, default=1, help="revisit times")
     parser.add_argument("--freeze", action="store_true")
-    parser.add_argument("--max_frames", default=None, help="max frames limit")
+    parser.add_argument(
+        "--max_frames",
+        type=parse_max_frames,
+        default=None,
+        help="Maximum sampled frames per sequence; use full_seq for no limit",
+    )
     parser.add_argument("--stream_chunk_size", type=int, default=1, help="Frames per streaming chunk; chunks attend causally to past chunks while frames inside a chunk attend bidirectionally")
     parser.add_argument("--use_proj", action="store_true")
     parser.add_argument("--eviction_policy", type=str, default="svd_leverage", help="Cache eviction policy: mean, baseline_mean, svd_leverage")
@@ -329,7 +352,6 @@ def main(args):
         )
     add_path_to_dust3r(args.weights)
     from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D, ETH3D_undistort
-    from eval.mv_recon.eval_scene_voxel_icp import eval_scene_voxel_icp
     from eval.mv_recon.utils import accuracy, completion
 
     if args.size == 512:
@@ -350,7 +372,7 @@ def main(args):
             num_seq=1,
             full_video=True,
             kf_every=args.kf_every,
-            # max_frames=100
+            max_frames=args.max_frames,
         ),
         "NRGBD": NRGBD(
             split="test",
@@ -359,8 +381,8 @@ def main(args):
             num_seq=1,
             full_video=True,
             kf_every=args.kf_every,
+            max_frames=args.max_frames,
             # test_id=[ "whiteroom"]
-            # max_frames=100
         ),
         # "ETH3D": ETH3D(
         #     ROOT="/home/dongjae/data/eth3d",
@@ -1005,6 +1027,6 @@ if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
 
-    # seed_everything(args.random_seed)
+    seed_everything(args.random_seed)
 
     main(args)

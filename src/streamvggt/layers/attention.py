@@ -522,7 +522,7 @@ class Attention(nn.Module):
                 token_overlay_dump_config,
                 kept_candidate_indices=top_indices,
                 policy_scores=eviction_result.policy_scores,
-                metadata=None,
+                metadata=select_confidence_state,
                 layer_id=layer_id,
                 step_idx=step_idx,
                 cache_budget=cache_budget,
@@ -784,7 +784,11 @@ class Attention(nn.Module):
             current_k = k
             current_v = v
             confidence_state = None
-            confidence_needed = bool(leverage_conf_gate) or leverage_attention_utility
+            confidence_needed = (
+                bool(leverage_conf_gate)
+                or leverage_attention_utility
+                or token_overlay_dump_config is not None
+            )
             if current_frame_ids is None:
                 resolved_current_frame_ids = [step_idx if step_idx is not None else 0]
             else:

@@ -24,7 +24,12 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "eval_results" / "mv_recon" / "SStreamVGGT_100_termProject_a0.7_SimTopK_ridge1e-5"
+DEFAULT_OUTPUT_DIR = (
+    REPO_ROOT
+    / "eval_results"
+    / "mv_recon"
+    / "Final_dim256_value_weighted_leverage_pr_budget60000_chunk1__EarlyAttnK5_g0.9_b0.5_sub1_PreEvict_MeanNorm_F1_fullSeq_supple"
+)
 MV_RECON_RUN_DATASETS = ("7scenes", "NRGBD")
 ACTIVE_DATASETS = ("7scenes", "NRGBD", "kitti_s1_500")
 DATASET_ROOTS = {
@@ -83,66 +88,75 @@ def build_run_command(args: argparse.Namespace) -> list[str]:
         "svd_leverage",
         "--leverage_granularity",
         "layer",
+        "--leverage_feature",
+        "key",
         "--leverage_projection",
         "random",
+        "--leverage_normalize_before_projection",
+        "--leverage_normalize_before_projection_headwise",
         "--leverage_eviction_selector",
-        "similarity_topk",
-        "--leverage_similarity_granularity",
-        "layer",
-        "--leverage_similarity_feature_projection",
-        "raw",
-        "--leverage_eviction_risk_mode",
-        "low_leverage",
-        "--leverage_high_outlier_z",
-        "3.0",
-        "--leverage_dpp_candidate_multiplier",
-        "3",
-        "--leverage_dpp_greedy_block_size",
-        "128",
-        "--leverage_dpp_quality_beta",
-        "0.0",
-        "--leverage_dpp_diversity_beta",
-        "1.0",
-        "--leverage_dpp_feature_projection",
-        "random",
+        "topk",
         "--layer_budget_strategy",
         "value_weighted_leverage_pr",
         "--layer_budget_alpha",
-        "0.7",
+        str(args.layer_budget_alpha),
         "--layer_budget_min_tokens",
         "0",
         "--layer_budget_eps",
-        "1e-12",
+        "0",
         "--leverage_approx_method",
         "right_sketch_ridge",
         "--leverage_ridge_lambda",
-        "1e-5",
+        "0",
         "--leverage_ridge_lambda_mode",
-        "relative",
+        "absolute",
         "--leverage_ridge_score_chunk_size",
-        "4096",
+        "16384",
         "--leverage_ridge_jitter",
-        "1e-6",
+        "0",
         "--leverage_ridge_dim",
-        "128",
-        "--leverage_random_seed",
-        "42",
+        str(args.ridge_dim),
+        "--random_seed",
+        str(args.random_seed),
         "--layer_budget_value_gamma",
-        "0.7",
+        str(args.layer_budget_value_gamma),
         "--layer_budget_value_norm_type",
         "mean",
         "--layer_budget_norm_source",
         "key",
         "--budget",
-        "200000",
-        "--history_anchor_strategy",
-        "none",
-        "--camera_motion_threshold",
-        "0.2",
-        "--max_anchors",
-        "10",
-        "--min_anchor_interval",
-        "5",
+        str(args.total_budget),
+        "--eval_frame_stride",
+        "1",
+        "--leverage_conf_gate",
+        "--leverage_conf_gate_floor",
+        "0.0",
+        "--leverage_conf_gate_depth_alpha",
+        "1.0",
+        "--leverage_conf_gate_point_beta",
+        "0.0",
+        "--leverage_conf_gate_k",
+        "1.0",
+        "--leverage_conf_gate_transform",
+        "sigmoid",
+        "--leverage_conf_gate_special_mode",
+        "mean",
+        "--leverage_conf_gate_init",
+        "mean",
+        "--stream_chunk_size",
+        str(args.stream_chunk_size),
+        "--rls_refresh_interval",
+        "8",
+        "--leverage_projected_key_cache",
+        "--leverage_attention_utility",
+        "--leverage_attention_beta",
+        str(args.attention_beta),
+        "--leverage_attention_ema_decay",
+        str(args.attention_ema_decay),
+        "--leverage_attention_freeze_updates",
+        str(args.attention_freeze_updates),
+        "--leverage_attention_colsum_subsample_ratio",
+        str(args.attention_colsum_subsample_ratio),
         "--leverage_score_histogram_dir",
         str(hist_dir),
         "--leverage_score_histogram_bins",
@@ -200,7 +214,11 @@ def run_command(args: argparse.Namespace) -> int:
     if args.dry_run or args.skip_run:
         return 0
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    completed = subprocess.run(command, cwd=str(SRC_DIR), check=False)
+    run_env = os.environ.copy()
+    run_env["PYTHONHASHSEED"] = str(args.random_seed)
+    for variable in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        run_env[variable] = "16"
+    completed = subprocess.run(command, cwd=str(SRC_DIR), check=False, env=run_env)
     return int(completed.returncode)
 
 
@@ -653,9 +671,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run mv_recon with leverage diagnostics enabled")
     add_common_paths(run_parser, default_datasets=MV_RECON_RUN_DATASETS)
     run_parser.add_argument("--weights", type=str, default="../ckpt/checkpoints.pth")
-    run_parser.add_argument("--max_frames", type=int, default=100)
-    run_parser.add_argument("--num_processes", type=int, default=3)
-    run_parser.add_argument("--main_process_port", type=int, default=29402)
+    run_parser.add_argument("--max_frames", type=str, default="full_seq")
+    run_parser.add_argument("--num_processes", type=int, default=1)
+    run_parser.add_argument("--main_process_port", type=int, default=29502)
+    run_parser.add_argument("--layer_budget_alpha", type=float, default=0.7)
+    run_parser.add_argument("--layer_budget_value_gamma", type=float, default=0.7)
+    run_parser.add_argument("--total_budget", type=int, default=60000)
+    run_parser.add_argument("--ridge_dim", type=int, default=256)
+    run_parser.add_argument("--random_seed", type=int, default=42)
+    run_parser.add_argument("--stream_chunk_size", type=int, default=1)
+    run_parser.add_argument("--attention_beta", type=float, default=0.5)
+    run_parser.add_argument("--attention_ema_decay", type=float, default=0.9)
+    run_parser.add_argument("--attention_freeze_updates", type=int, default=5)
+    run_parser.add_argument("--attention_colsum_subsample_ratio", type=float, default=1.0)
     run_parser.add_argument("--analysis_layers", type=str, default="23")
     run_parser.add_argument("--analysis_steps", type=str, default="all")
     run_parser.add_argument("--analysis_heads", type=str, default="all")
