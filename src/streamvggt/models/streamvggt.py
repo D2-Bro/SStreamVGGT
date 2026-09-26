@@ -301,6 +301,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 0,
         layer_budget_log_path: Optional[str] = None,
+        anchor_budget_overage_log_path: Optional[str] = None,
         layer_budget_score_only: bool = False,
     ):
         anchor_manager = None
@@ -517,6 +518,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 layer_budget_min_tokens=layer_budget_min_tokens,
                 layer_budget_eps=layer_budget_eps,
                 layer_budget_log_path=layer_budget_log_path,
+                anchor_budget_overage_log_path=anchor_budget_overage_log_path,
                 layer_budget_score_only=layer_budget_score_only,
                 cache_write_current_frame=cache_write_current_frame,
                 cache_evict_current_frame=cache_evict_current_frame,

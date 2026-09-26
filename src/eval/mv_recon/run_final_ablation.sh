@@ -6,16 +6,16 @@ model_name='StreamVGGT'
 ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
-max_frames='full_seq'
+max_frames='full'
 eviction_policy='svd_leverage'
-layer_budget_strategy='uniform' #[leverage_pr, uniform, key_norm, value_weighted_leverage_pr]
+layer_budget_strategy='value_weighted_leverage_pr' #[leverage_pr, uniform, key_norm, value_weighted_leverage_pr]
 layer_budget_alpha=0.7
 layer_budget_min_tokens=0
 layer_budget_eps=0
 layer_budget_value_gamma=0.7
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
-total_budget=30000
+total_budget=60000
 budget_frame_multiplier=''
 leverage_feature=key # [key, key_value, key_value_lowdim_concat]
 leverage_eviction_selector=topk # [topk, fast_dpp, layer_head_fast_dpp, similarity_topk]
@@ -26,7 +26,8 @@ leverage_ridge_lambda_mode=absolute
 leverage_ridge_score_chunk_size=16384
 leverage_ridge_jitter=0
 leverage_ridge_dim=256
-leverage_random_seed=42
+
+random_seed=42
 
 
 leverage_conf_gate_floor=0.0
@@ -43,7 +44,7 @@ eval_frame_stride=1
 attention_utility_args=()
 attention_utility_suffix=""
 if [ "${LEVERAGE_ATTENTION_UTILITY:-false}" = true ]; then
-    attention_beta="${LEVERAGE_ATTENTION_BETA:-0.3}"
+    attention_beta="${LEVERAGE_ATTENTION_BETA:-0.5}"
     attention_ema_decay="${LEVERAGE_ATTENTION_EMA_DECAY:-0.9}"
     attention_freeze_updates="${LEVERAGE_ATTENTION_FREEZE_UPDATES:-5}"
     attention_colsum_subsample_ratio="${LEVERAGE_ATTENTION_COLSUM_SUBSAMPLE_RATIO:-1.0}"
@@ -68,7 +69,7 @@ if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
 
-output_dir="${workdir}/eval_results/mv_recon/Final_beta0.5_wo_KABA_30000"
+output_dir="${workdir}/eval_results/mv_recon/Rebuttal_beta0.5_wo_none_60000_FullSeq"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -99,7 +100,7 @@ accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/la
     --leverage_ridge_score_chunk_size "$leverage_ridge_score_chunk_size" \
     --leverage_ridge_jitter "$leverage_ridge_jitter" \
     --leverage_ridge_dim "$leverage_ridge_dim" \
-    --leverage_random_seed "$leverage_random_seed" \
+    --random_seed "$random_seed" \
     --layer_budget_value_gamma "$layer_budget_value_gamma" \
     --layer_budget_value_norm_type "$layer_budget_value_norm_type" \
     --layer_budget_norm_source "$layer_budget_norm_source" \
@@ -114,10 +115,8 @@ accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/la
     --leverage_conf_gate_init "$leverage_conf_gate_init" \
     --stream_chunk_size 1 \
     --rls_refresh_interval 8 \
-    "${projected_key_cache_args[@]}" 
-    # "${attention_utility_args[@]}" 
-    # --recon_eval_mode voxel_icp 
-    # --eval_voxel_size 0.005
+    "${projected_key_cache_args[@]}" \
+    "${attention_utility_args[@]}" 
     
 # Add --profile_eviction to the launch command above when measuring eviction latency.
 

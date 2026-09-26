@@ -204,6 +204,7 @@ def get_args_parser():
     parser.add_argument("--layer_budget_value_norm_type", type=str, default="mean", choices=("mean", "rms"), help="Layer value-norm prior type for value_weighted_leverage_pr budget allocation")
     parser.add_argument("--layer_budget_norm_source", type=str, default="key", help="Tensor source for value_weighted_leverage_pr norm prior: value cache or key cache")
     parser.add_argument("--layer_budget_log_scores", action="store_true", help="Write per-step layer budget scores to layer_budget_scores.csv under each scene output directory")
+    parser.add_argument("--log-anchor-budget-overage", action="store_true", help="Write per-step anchor-floor global budget overage to anchor_budget_overage.csv per sequence")
     parser.add_argument("--layer_budget_log_path", type=str, default=None, help="Optional explicit CSV path for layer budget score logs")
     parser.add_argument("--eviction_debug", action="store_true", help="Print verbose eviction summaries without enabling latency profiling")
     parser.add_argument("--profile_eviction", action="store_true", help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior")
@@ -323,6 +324,14 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 
                 safe_seq = str(seq).replace("/", "_").replace(os.sep, "_").replace(" ", "_")
                 layer_budget_log_path = None
+                anchor_budget_overage_log_path = None
+                if args.log_anchor_budget_overage:
+                    anchor_budget_overage_log_path = os.path.join(
+                        save_dir, safe_seq, "anchor_budget_overage.csv"
+                    )
+                    os.makedirs(os.path.dirname(anchor_budget_overage_log_path), exist_ok=True)
+                    with open(anchor_budget_overage_log_path, "w", encoding="utf-8"):
+                        pass
                 if args.layer_budget_log_path:
                     layer_budget_log_path = args.layer_budget_log_path
                 elif args.layer_budget_log_scores:
@@ -388,6 +397,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             layer_budget_min_tokens=args.layer_budget_min_tokens,
                             layer_budget_eps=args.layer_budget_eps,
                             layer_budget_log_path=layer_budget_log_path,
+                            anchor_budget_overage_log_path=anchor_budget_overage_log_path,
                             profile_eviction=args.profile_eviction,
                             empty_cache_interval=args.empty_cache_interval,
                             eviction_debug=args.eviction_debug,

@@ -169,6 +169,8 @@ class Aggregator(nn.Module):
         self.last_layer_budget_value_norms = torch.zeros(self.depth)
         self._dynamic_budget_profile_total = 0.0
         self._dynamic_budget_profile_count = 0
+        self._anchor_budget_overage_cumulative = 0
+        self._anchor_budget_overage_peak = 0
         self.register_buffer("layer_budget_proportions", None, persistent=False)
 
     def reset_stream_state(self) -> None:
@@ -179,6 +181,8 @@ class Aggregator(nn.Module):
         self.last_layer_budget_value_norms.zero_()
         self._dynamic_budget_profile_total = 0.0
         self._dynamic_budget_profile_count = 0
+        self._anchor_budget_overage_cumulative = 0
+        self._anchor_budget_overage_peak = 0
         for block in list(self.frame_blocks) + list(self.global_blocks):
             reset_block_profile = getattr(block, "reset_profile_stats", None)
             if reset_block_profile is not None:
@@ -285,6 +289,7 @@ class Aggregator(nn.Module):
         layer_budget_min_tokens: int = 0,
         layer_budget_eps: float = 0,
         layer_budget_log_path: Optional[str] = None,
+        anchor_budget_overage_log_path: Optional[str] = None,
         layer_budget_score_only: bool = False,
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
@@ -429,6 +434,10 @@ class Aggregator(nn.Module):
             self._dynamic_budget_profile_total += dynamic_budget_ms * 0.001
             self._dynamic_budget_profile_count += 1
         current_budget_values = current_budgets.detach().cpu().tolist()
+        anchor_budget_capacities = (
+            self._layer_budget_capacities(past_key_values, current_cache_token_count)
+            if anchor_budget_overage_log_path else None
+        )
         self._perf_trace_end("dynamic_budget", budget_trace_start, budget_trace_cpu_start)
         scores = []
         layer_budget_scores = []
@@ -555,6 +564,15 @@ class Aggregator(nn.Module):
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
         assert len(output_list) == self.depth, f"Expected {self.depth} outputs, got {len(output_list)}"
+        if anchor_budget_overage_log_path:
+            self._append_anchor_budget_overage_log(
+                anchor_budget_overage_log_path,
+                past_frame_idx,
+                total_budget,
+                current_budget_values,
+                anchor_budget_capacities,
+                layer_budget_score_only,
+            )
         if scores: # update scores
             collected_scores = torch.stack(
                 (
@@ -1090,6 +1108,38 @@ class Aggregator(nn.Module):
                     f"{details.get('raw_budgets', {}).get(layer, 0.0):.9g},"
                     f"{budgets.get(layer, 0)},{events}\n"
                 )
+
+    def _append_anchor_budget_overage_log(
+        self, log_path, step_idx, total_budget, budgets, capacities, score_only
+    ):
+        anchor_deficit = 0
+        for layer, block in enumerate(self.global_blocks):
+            capacity = max(int(capacities.get(layer, 0)), 0)
+            anchor_tokens = min(max(int(block.attn.num_anchor_tokens), 0), capacity)
+            anchor_deficit += max(0, anchor_tokens - int(budgets[layer]))
+
+        assigned_budget = sum(int(budget) for budget in budgets)
+        total_budget = max(int(total_budget), 0)
+        global_overage = max(0, assigned_budget + anchor_deficit - total_budget)
+        self._anchor_budget_overage_cumulative += global_overage
+        self._anchor_budget_overage_peak = max(self._anchor_budget_overage_peak, global_overage)
+
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+        with open(log_path, "a", encoding="utf-8") as f:
+            if write_header:
+                f.write(
+                    "step,total_budget,assigned_budget,anchor_deficit_tokens,"
+                    "global_overage_tokens,cumulative_global_overage_tokens,"
+                    "peak_global_overage_tokens,score_only\n"
+                )
+            f.write(
+                f"{int(step_idx)},{total_budget},{assigned_budget},{anchor_deficit},"
+                f"{global_overage},{self._anchor_budget_overage_cumulative},"
+                f"{self._anchor_budget_overage_peak},{int(bool(score_only))}\n"
+            )
 
     def _calculate_dynamic_budgets(
         self,

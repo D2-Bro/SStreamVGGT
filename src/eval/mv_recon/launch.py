@@ -1,6 +1,6 @@
 import os
 
-# os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import random
 import sys
@@ -54,8 +54,8 @@ def seed_everything(seed: int) -> int:
         torch.cuda.manual_seed_all(seed)
 
     torch.backends.cudnn.benchmark = False
-    # torch.backends.cudnn.deterministic = True
-    # torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
 
     print(
         f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}",
@@ -258,6 +258,7 @@ def get_args_parser():
     parser.add_argument("--layer_budget_value_norm_type", type=str, default="mean", choices=("mean", "rms"), help="Layer value-norm prior type for value_weighted_leverage_pr budget allocation")
     parser.add_argument("--layer_budget_norm_source", type=str, default="key", help="Tensor source for value_weighted_leverage_pr norm prior: value cache or key cache")
     parser.add_argument("--layer_budget_log_scores", action="store_true", help="Write per-step layer budget scores to layer_budget_scores.csv under each scene output directory")
+    parser.add_argument("--log-anchor-budget-overage", action="store_true", help="Write per-step anchor-floor global budget overage to anchor_budget_overage.csv per sequence")
     parser.add_argument("--layer_budget_log_path", type=str, default=None, help="Optional explicit CSV path for layer budget score logs")
     parser.add_argument("--eviction_debug", action="store_true", help="Print verbose eviction summaries without enabling latency profiling")
     parser.add_argument("--profile_eviction", action="store_true", help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior")
@@ -382,7 +383,7 @@ def main(args):
             full_video=True,
             kf_every=args.kf_every,
             max_frames=args.max_frames,
-            # test_id=[ "whiteroom"]
+            # test_id=[ "kitchen", "morning_apartment", "staircase", "thin_geometry", "whiteroom"]
         ),
         # "ETH3D": ETH3D(
         #     ROOT="/home/dongjae/data/eth3d",
@@ -551,6 +552,14 @@ def main(args):
                             projected_norm_histogram_config = None
                             token_overlay_dump_config = None
                             layer_budget_log_path = None
+                            anchor_budget_overage_log_path = None
+                            if args.log_anchor_budget_overage:
+                                anchor_budget_overage_log_path = osp.join(
+                                    args.output_dir, name_data, scene_key, "anchor_budget_overage.csv"
+                                )
+                                os.makedirs(osp.dirname(anchor_budget_overage_log_path), exist_ok=True)
+                                with open(anchor_budget_overage_log_path, "w", encoding="utf-8"):
+                                    pass
                             if args.eviction_nn_analysis_dir:
                                 nn_dir = osp.join(
                                     args.eviction_nn_analysis_dir,
@@ -639,6 +648,7 @@ def main(args):
                                 layer_budget_min_tokens=args.layer_budget_min_tokens,
                                 layer_budget_eps=args.layer_budget_eps,
                                 layer_budget_log_path=layer_budget_log_path,
+                                anchor_budget_overage_log_path=anchor_budget_overage_log_path,
                                 profile_eviction=args.profile_eviction,
                                 perf_trace=args.perf_trace,
                                 eviction_debug=args.eviction_debug,

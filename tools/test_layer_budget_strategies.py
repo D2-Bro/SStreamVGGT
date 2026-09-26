@@ -1,5 +1,7 @@
+import csv
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -492,6 +494,50 @@ def test_score_only_shadow_budget_log_event():
         assert "score_only_shadow" in log_path.read_text(encoding="utf-8")
 
 
+def test_anchor_budget_overage_log():
+    aggregator = _make_budget_aggregator(2)
+    aggregator.frame_blocks = []
+    aggregator.global_blocks = [
+        SimpleNamespace(attn=SimpleNamespace(num_anchor_tokens=5)),
+        SimpleNamespace(attn=SimpleNamespace(num_anchor_tokens=9)),
+    ]
+    aggregator._anchor_budget_overage_cumulative = 0
+    aggregator._anchor_budget_overage_peak = 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        first_path = Path(tmp) / "first" / "anchor_budget_overage.csv"
+        second_path = Path(tmp) / "second" / "anchor_budget_overage.csv"
+        assert not first_path.exists()
+        aggregator._append_anchor_budget_overage_log(
+            str(first_path), 0, 14, [3, 7], {0: 10, 1: 10}, False
+        )
+        aggregator._append_anchor_budget_overage_log(
+            str(first_path), 1, 10, [3, 7], {0: 10, 1: 10}, False
+        )
+        aggregator._append_anchor_budget_overage_log(
+            str(first_path), 2, 10, [8, 2], {0: 10, 1: 10}, True
+        )
+        with first_path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert [int(row["anchor_deficit_tokens"]) for row in rows] == [4, 4, 7]
+        assert [int(row["global_overage_tokens"]) for row in rows] == [0, 4, 7]
+        assert [int(row["cumulative_global_overage_tokens"]) for row in rows] == [0, 4, 11]
+        assert [int(row["peak_global_overage_tokens"]) for row in rows] == [0, 4, 7]
+        assert [int(row["score_only"]) for row in rows] == [0, 0, 1]
+
+        aggregator.reset_stream_state()
+        aggregator._append_anchor_budget_overage_log(
+            str(second_path), 0, 10, [8, 2], {0: 10, 1: 8}, False
+        )
+        with second_path.open(newline="", encoding="utf-8") as f:
+            second_rows = list(csv.DictReader(f))
+        assert len(second_rows) == 1
+        assert int(second_rows[0]["anchor_deficit_tokens"]) == 6
+        assert int(second_rows[0]["global_overage_tokens"]) == 6
+        assert int(second_rows[0]["cumulative_global_overage_tokens"]) == 6
+        assert len(rows) == 3
+
+
 if __name__ == "__main__":
     test_leverage_participation_ratio()
     test_value_weighted_scores()
@@ -510,4 +556,5 @@ if __name__ == "__main__":
     test_score_only_multiframe_forward_grows_cache()
     test_score_only_rejects_invalid_combinations()
     test_score_only_shadow_budget_log_event()
+    test_anchor_budget_overage_log()
     print("active layer budget strategy sanity checks passed")
