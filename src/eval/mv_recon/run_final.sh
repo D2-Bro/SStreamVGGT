@@ -40,6 +40,7 @@ leverage_conf_gate_init=mean
 leverage_projected_key_cache="true"
 
 eval_frame_stride=1
+eval_stage="${EVAL_STAGE:-all}"
 stream_chunk_size="${STREAM_CHUNK_SIZE:-1}"
 if ! [[ "$num_processes" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: NUM_PROCESSES must be a positive integer: $num_processes" >&2
@@ -97,6 +98,7 @@ accelerate launch --num_processes "$num_processes" --main_process_port "${MAIN_P
     --model_name "$model_name" \
     --max_frames "$max_frames" \
     --eval_frame_stride "$eval_frame_stride" \
+    --eval_stage "$eval_stage" \
     --eviction_policy "$eviction_policy" \
     --leverage_granularity layer \
     --leverage_feature "$leverage_feature" \

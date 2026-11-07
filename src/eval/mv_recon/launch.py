@@ -272,6 +272,7 @@ def get_args_parser():
     add_projected_norm_histogram_args(parser)
     add_token_overlay_dump_args(parser)
     parser.add_argument("--eval_frame_stride", type=int, default=1, help="Use every Nth frame only when building eval point clouds; inference still uses all frames")
+    parser.add_argument("--eval_stage", choices=("all", "infer"), default="all", help="all runs CPU metrics inline; infer saves point clouds for evaluate_saved.py")
     parser.add_argument(
         "--recon_eval_mode",
         type=str,
@@ -297,6 +298,8 @@ def get_args_parser():
 
 
 def main(args):
+    if args.eval_frame_stride < 1:
+        raise SystemExit("Error: --eval_frame_stride must be >= 1")
     if args.recon_eval_mode == "voxel_icp":
         if args.use_proj:
             raise SystemExit(
@@ -315,6 +318,8 @@ def main(args):
             "points=direct_predicted_3d, "
             f"metrics={'voxel_centroids' if args.eval_metrics_on_voxels else 'full_points'}"
         )
+    if args.eval_stage == "infer" and args.recon_eval_mode != "legacy":
+        raise SystemExit("Error: deferred evaluation currently supports --recon_eval_mode legacy only")
     if args.eviction_policy == "svd_leverage":
         print(
             "Using SVD leverage eviction: "
@@ -353,7 +358,7 @@ def main(args):
         )
     add_path_to_dust3r(args.weights)
     from eval.mv_recon.data import SevenScenes, NRGBD, ETH3D, ETH3D_undistort
-    from eval.mv_recon.utils import accuracy, completion
+    from eval.mv_recon.cpu_evaluation import evaluate_arrays, save_eval_inputs, format_metric
 
     if args.size == 512:
         resolution = (512, 384)
@@ -365,16 +370,16 @@ def main(args):
     else:
         raise NotImplementedError
     datasets_all = {
-        "7scenes": SevenScenes(
-            split="test",
-            ROOT="/home/dongjae/data/7scenes",
-            # ROOT="/data2/dongjae/datasets/7scenes_sfm",
-            resolution=resolution,
-            num_seq=1,
-            full_video=True,
-            kf_every=args.kf_every,
-            max_frames=args.max_frames,
-        ),
+        # "7scenes": SevenScenes(
+        #     split="test",
+        #     ROOT="/home/dongjae/data/7scenes",
+        #     # ROOT="/data2/dongjae/datasets/7scenes_sfm",
+        #     resolution=resolution,
+        #     num_seq=1,
+        #     full_video=True,
+        #     kf_every=args.kf_every,
+        #     max_frames=args.max_frames,
+        # ),
         "NRGBD": NRGBD(
             split="test",
             ROOT="/home/dongjae/data/neural_rgbd_data",
@@ -455,6 +460,10 @@ def main(args):
         for name_data, dataset in datasets_all.items():
             save_path = osp.join(args.output_dir, name_data)
             os.makedirs(save_path, exist_ok=True)
+            if args.eval_stage == "infer" and accelerator.is_main_process:
+                manifest_path = osp.join(save_path, "inference_manifest.json")
+                if osp.exists(manifest_path):
+                    os.remove(manifest_path)
             log_file = osp.join(save_path, f"logs_{accelerator.process_index}.txt")
             # Each rank owns its log file. Start a fresh file for every run so
             # metrics left by an earlier run cannot be included in this run's mean.
@@ -701,12 +710,9 @@ def main(args):
                         criterion.get_all_pts3d_t(batch, preds)
                     )
 
-                    in_camera1 = None
                     pts_all = []
                     pts_gt_all = []
-                    images_all = []
                     masks_all = []
-                    conf_all = []
                     eval_frame_count = 0
 
                     for j, view in enumerate(batch):
@@ -714,42 +720,27 @@ def main(args):
                             continue
                         eval_frame_count += 1
 
-                        if in_camera1 is None:
-                            in_camera1 = view["camera_pose"][0].cpu()
-
-                        image = view["img"].permute(0, 2, 3, 1).cpu().numpy()[0]
                         mask = view["valid_mask"].cpu().numpy()[0]
-
                         if args.use_proj:
                             pts = point_map_by_unprojection[j]
-                            conf = depth_conf[0, j].cpu().data.numpy()
+                            if torch.is_tensor(pts):
+                                pts = pts.detach().cpu().numpy()
                         else:
                             pts = pred_pts[j].cpu().numpy()[0]
-                            conf = preds[j]["conf"].cpu().data.numpy()[0]
-
-                        # mask = mask & (conf > 1.8)
-
                         pts_gt = gt_pts[j].detach().cpu().numpy()[0]
 
-                        H, W = image.shape[:2]
+                        H, W = mask.shape[:2]
                         cx = W // 2
                         cy = H // 2
                         l, t = cx - 112, cy - 112
                         r, b = cx + 112, cy + 112
-                        image = image[t:b, l:r]
                         mask = mask[t:b, l:r]
                         pts = pts[t:b, l:r]
                         pts_gt = pts_gt[t:b, l:r]
 
-                        # Align predicted 3D points to the ground truth
-                        # pts = geotrf(in_camera1, pts)
-                        # pts_gt = geotrf(in_camera1, pts_gt)
-
-                        images_all.append(image[None, ...])
                         pts_all.append(pts[None, ...])
                         pts_gt_all.append(pts_gt[None, ...])
                         masks_all.append(mask[None, ...])
-                        conf_all.append(conf[None, ...])
 
                     scene_id = batch[0]["label"][0].rsplit("/", 1)[0]
                     if args.eval_frame_stride > 1:
@@ -760,193 +751,26 @@ def main(args):
                         print(eval_stride_msg)
                         print(eval_stride_msg, file=open(log_file, "a"))
 
-                    images_all = np.concatenate(images_all, axis=0)
                     pts_all = np.concatenate(pts_all, axis=0)
                     pts_gt_all = np.concatenate(pts_gt_all, axis=0)
                     masks_all = np.concatenate(masks_all, axis=0)
 
-                    save_params = {}
-
-                    save_params["images_all"] = images_all
-                    save_params["pts_all"] = pts_all
-                    save_params["pts_gt_all"] = pts_gt_all
-                    save_params["masks_all"] = masks_all
-
-                    # np.save(
-                    #     os.path.join(save_path, f"{scene_id.replace('/', '_')}.npy"),
-                    #     save_params,
-                    # )
-
-                    if "DTU" in name_data:
-                        threshold = 100
-                    else:
-                        threshold = 0.1
-
-                    pts_all_masked = pts_all[masks_all > 0]
-                    pts_gt_all_masked = pts_gt_all[masks_all > 0]
-                    images_all_masked = images_all[masks_all > 0]
-
-                    mask = np.isfinite(pts_all_masked)  
-                    pts_all_masked = pts_all_masked[mask]
-
-                    mask_gt = np.isfinite(pts_gt_all_masked)
-                    pts_gt_all_masked = pts_gt_all_masked[mask]
-
-                    # pred_finite_mask = np.isfinite(pts_all).all(axis=-1)
-                    # gt_finite_mask = np.isfinite(pts_gt_all).all(axis=-1)
-                    # finite_mask = pred_finite_mask & gt_finite_mask
-
-                    # pts_all = pts_all[finite_mask]
-                    # pts_gt_all = pts_gt_all[finite_mask]
-                    # images_all = images_all[finite_mask]
-
-                    if args.use_proj:
-                        def umeyama_alignment(src: np.ndarray, dst: np.ndarray, with_scale: bool = True):
-                            assert src.shape == dst.shape
-                            N, dim = src.shape
-
-                            mu_src = src.mean(axis=0)
-                            mu_dst = dst.mean(axis=0)
-                            src_c = src - mu_src
-                            dst_c = dst - mu_dst
-
-                            Sigma = dst_c.T @ src_c / N  # (3,3)
-
-                            U, D, Vt = np.linalg.svd(Sigma)
-
-                            S = np.eye(dim)
-                            if np.linalg.det(U) * np.linalg.det(Vt) < 0:
-                                S[-1, -1] = -1
-
-                            R = U @ S @ Vt
-
-                            if with_scale:
-                                var_src = (src_c ** 2).sum() / N
-                                s = (D * S.diagonal()).sum() / var_src
-                            else:
-                                s = 1.0
-
-                            t = mu_dst - s * R @ mu_src
-
-                            return s, R, t
-
-                        s, R, t = umeyama_alignment(
-                            pts_all, pts_gt_all, with_scale=True
+                    if args.eval_stage == "infer":
+                        input_path = osp.join(save_path, "eval_inputs", f"{int(data_idx):06d}.npz")
+                        save_eval_inputs(
+                            input_path, pts_all, pts_gt_all, masks_all,
+                            scene_id=scene_id, dataset=name_data, rank=accelerator.process_index,
+                            infer_time=infer_time, fps=fps, use_proj=args.use_proj,
                         )
-                        pts_all = (s * (R @ pts_all.T)).T + t  # (N,3)
+                        print(f"Saved CPU evaluation input: {input_path}")
+                        torch.cuda.empty_cache()
+                        continue
 
-                    pcd = o3d.geometry.PointCloud()
-                    pcd.points = o3d.utility.Vector3dVector(
-                        pts_all_masked.reshape(-1, 3)
-                    )
-                    pcd.colors = o3d.utility.Vector3dVector(
-                        images_all_masked.reshape(-1, 3)
-                    )
-                    # o3d.io.write_point_cloud(
-                    #     os.path.join(
-                    #         save_path, f"{scene_id.replace('/', '_')}-mask.ply"
-                    #     ),
-                    #     pcd,
-                    # )
-                    # continue
-
-                    pcd_gt = o3d.geometry.PointCloud()
-                    pcd_gt.points = o3d.utility.Vector3dVector(
-                        pts_gt_all_masked.reshape(-1, 3)
-                    )
-                    pcd_gt.colors = o3d.utility.Vector3dVector(
-                        images_all_masked.reshape(-1, 3)
-                    )
-                    # pcd_gt.points = o3d.utility.Vector3dVector(pts_gt_all)
-                    # pcd_gt.colors = o3d.utility.Vector3dVector(images_all)
-                    # o3d.io.write_point_cloud(
-                    #     os.path.join(save_path, f"{scene_id.replace('/', '_')}-gt.ply"),
-                    #     pcd_gt,
-                    # )
-
-                    trans_init = np.eye(4)
-
-                    icp_source = pcd
-                    icp_target = pcd_gt
-
-                    reg_p2p = o3d.pipelines.registration.registration_icp(
-                        icp_source,
-                        icp_target,
-                        threshold,
-                        trans_init,
-                        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                    )
-
-                    transformation = reg_p2p.transformation
-
-                    pcd = pcd.transform(transformation)
-
-                    # o3d.io.write_point_cloud(
-                    #     os.path.join(
-                    #         save_path, f"{scene_id.replace('/', '_')}-mask_align.ply"
-                    #     ),
-                    #     pcd,
-                    # )
-
-                    # pcd.estimate_normals()
-                    # pcd_gt.estimate_normals()
-
-                    gt_normal = np.asarray(pcd_gt.normals)
-                    pred_normal = np.asarray(pcd.normals)
-
-                    thresholds = (0.05, 0.1, 0.25)
-
-                    acc, acc_med, nc1, nc1_med, precisions = accuracy(
-                        pcd_gt.points, pcd.points, gt_normal, pred_normal, dist_ths=thresholds
-                    )
-                    comp, comp_med, nc2, nc2_med, recalls = completion(
-                        pcd_gt.points, pcd.points, gt_normal, pred_normal, dist_ths=thresholds
-                    )
-                    f1_scores = {}
-                    for th in thresholds:
-                        precision = precisions[th]
-                        recall = recalls[th]
-                        denom = precision + recall
-
-                        f1_scores[th] = (
-                            2.0 * precision * recall / denom
-                            if denom > 0
-                            else 0.0
-                        )
-                    f1_str = ", ".join(
-                        f"F1@{round(th * 100)}cm: {f1_scores[th]:.6f}"
-                        for th in thresholds
-                    )
-
-                    metric_msg = (
-                        f"Idx: {scene_id}, "
-                        f"Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - "
-                        f"Acc_med: {acc_med}, Compc_med: {comp_med}, "
-                        f"NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, "
-                        f"{f1_str}, "
-                        f"Time: {infer_time}, FPS: {fps}, "
-                    )
-
+                    metrics = evaluate_arrays(pts_all, pts_gt_all, masks_all, name_data, args.use_proj)
+                    metric_msg = format_metric(scene_id, metrics, infer_time, fps)
                     print(metric_msg)
                     with open(log_file, "a") as f:
                         print(metric_msg, file=f)
-                    # print(
-                    #     f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, Time: {infer_time}, FPS: {fps}"
-                    # )
-                    # print(
-                    #     f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}, Time: {infer_time}, FPS: {fps}",
-                    #     file=open(log_file, "a"),
-                    # )
-
-                    acc_all += acc
-                    comp_all += comp
-                    nc1_all += nc1
-                    nc2_all += nc2
-
-                    acc_all_med += acc_med
-                    comp_all_med += comp_med
-                    nc1_all_med += nc1_med
-                    nc2_all_med += nc2_med
 
                     # release cuda memory
                     torch.cuda.empty_cache()
@@ -971,6 +795,21 @@ def main(args):
                     min_mtime=run_started_at,
                     timeout_s=6000,
                 )
+            if accelerator.is_main_process and args.eval_stage == "infer":
+                manifest = {
+                    "dataset": name_data,
+                    "scene_count": len(dataset),
+                    "num_processes": accelerator.num_processes,
+                    "eval_frame_stride": args.eval_frame_stride,
+                    "recon_eval_mode": args.recon_eval_mode,
+                }
+                manifest_path = osp.join(save_path, "inference_manifest.json")
+                with open(manifest_path + ".tmp", "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, indent=2)
+                os.replace(manifest_path + ".tmp", manifest_path)
+                print(f"Inference complete. Run: python eval/mv_recon/evaluate_saved.py --output_dir {args.output_dir}")
+            if args.eval_stage == "infer":
+                continue
             # Get depth from pcd and run TSDFusion
             if accelerator.is_main_process:
                 to_write = ""

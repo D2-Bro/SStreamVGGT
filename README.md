@@ -148,6 +148,21 @@ accelerate launch --num_processes 1 --main_process_port 29602 ./eval/mv_recon/la
     --max_frames 300
 ```
 
+To run CPU reconstruction metrics separately, add `--eval_stage infer` to the
+inference command (or set `EVAL_STAGE=infer` with `run_final.sh` or
+`run_final_supple_stride.sh`). Once inference finishes, run from `src/`:
+
+```bash
+python eval/mv_recon/evaluate_saved.py --output_dir path/to/output_dir --workers 1
+```
+
+The inference stage writes one `eval_inputs/*.npz` file per scene and a
+completion manifest. The CPU command writes `logs_*.txt` and `logs_all.txt` in
+the same dataset output directory. `--workers` can process scenes in parallel;
+set OpenMP thread counts accordingly. Saved point maps can occupy substantial
+disk space for long sequences. The default `--eval_stage all` retains inline
+evaluation.
+
 ## 🚀 Run Demo
 We provide demo code based on the [NRGBD](https://github.com/dazinovic/neural-rgbd-surface-reconstruction) dataset. You can run it using the following command:
 
