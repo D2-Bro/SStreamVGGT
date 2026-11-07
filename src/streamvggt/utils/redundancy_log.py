@@ -99,11 +99,23 @@ def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096) ->
     return out
 
 
+_WARNED_PER_HEAD = [False]
+
+
 @torch.no_grad()
 def record(k: torch.Tensor, num_anchor_tokens: int, kept_candidate_indices: torch.Tensor,
-           layer_id: Optional[int], step_idx: Optional[int]):
-    """k: pre-eviction cache [B, H, N, D]; kept_candidate_indices: [B, H, K] indices into the candidates."""
+           layer_id: Optional[int], step_idx: Optional[int], per_head_cache: bool = False):
+    """k: pre-eviction cache [B, H, N, D]; kept_candidate_indices: [B, H, K] indices into the candidates.
+
+    Skipped for per-head caches (compactor policy): there, the same cache position holds a different token in
+    each head, so the head-concatenated representation is not defined.
+    """
     if not enabled(step_idx):
+        return
+    if per_head_cache:
+        if not _WARNED_PER_HEAD[0]:
+            print("[redundancy_log] per-head cache (compactor policy): redundancy statistics are not logged")
+            _WARNED_PER_HEAD[0] = True
         return
     cand = k[0, :, int(num_anchor_tokens):, :]
     kept = kept_candidate_indices[0]

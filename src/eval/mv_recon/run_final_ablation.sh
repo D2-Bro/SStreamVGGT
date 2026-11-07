@@ -37,7 +37,8 @@ leverage_conf_gate_k=1.0
 leverage_conf_gate_transform="sigmoid"  # [ratio, sigmoid]
 leverage_conf_gate_special_mode=mean    #[one, mean]
 leverage_conf_gate_init=mean
-leverage_projected_key_cache="true"
+leverage_projected_key_cache="${LEVERAGE_PROJECTED_KEY_CACHE:-true}"
+conf_gate="${CONF_GATE:-true}"
 
 eval_frame_stride=1
 kf_every="${KF_EVERY:-2}"
@@ -69,6 +70,23 @@ if [ -n "$budget_frame_multiplier" ]; then
     budget_args=(--budget_frame_multiplier "$budget_frame_multiplier")
     budget_suffix="budgetFrameMult${budget_frame_multiplier}"
 fi
+key_norm_args=()
+if [ "${HEADWISE_NORM:-true}" = true ]; then
+    key_norm_args=(--leverage_normalize_before_projection --leverage_normalize_before_projection_headwise)
+fi
+conf_gate_args=()
+if [ "$conf_gate" = true ]; then
+    conf_gate_args=(
+        --leverage_conf_gate
+        --leverage_conf_gate_floor "$leverage_conf_gate_floor"
+        --leverage_conf_gate_depth_alpha "$leverage_conf_gate_depth_alpha"
+        --leverage_conf_gate_point_beta "$leverage_conf_gate_point_beta"
+        --leverage_conf_gate_k "$leverage_conf_gate_k"
+        --leverage_conf_gate_transform "$leverage_conf_gate_transform"
+        --leverage_conf_gate_special_mode "$leverage_conf_gate_special_mode"
+        --leverage_conf_gate_init "$leverage_conf_gate_init"
+    )
+fi
 projected_key_cache_args=()
 if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
@@ -94,8 +112,7 @@ accelerate launch --num_processes "$num_processes" --main_process_port "${MAIN_P
     --leverage_granularity layer \
     --leverage_feature "$leverage_feature" \
     --leverage_projection random \
-    --leverage_normalize_before_projection \
-    --leverage_normalize_before_projection_headwise \
+    "${key_norm_args[@]}" \
     --leverage_eviction_selector "$leverage_eviction_selector" \
     --layer_budget_strategy "$layer_budget_strategy" \
     --layer_budget_alpha "$layer_budget_alpha" \
@@ -112,14 +129,7 @@ accelerate launch --num_processes "$num_processes" --main_process_port "${MAIN_P
     --layer_budget_value_norm_type "$layer_budget_value_norm_type" \
     --layer_budget_norm_source "$layer_budget_norm_source" \
     "${budget_args[@]}" \
-    --leverage_conf_gate \
-    --leverage_conf_gate_floor "$leverage_conf_gate_floor" \
-    --leverage_conf_gate_depth_alpha "$leverage_conf_gate_depth_alpha" \
-    --leverage_conf_gate_point_beta "$leverage_conf_gate_point_beta" \
-    --leverage_conf_gate_k "$leverage_conf_gate_k" \
-    --leverage_conf_gate_transform "$leverage_conf_gate_transform" \
-    --leverage_conf_gate_special_mode "$leverage_conf_gate_special_mode" \
-    --leverage_conf_gate_init "$leverage_conf_gate_init" \
+    "${conf_gate_args[@]}" \
     --stream_chunk_size 1 \
     --rls_refresh_interval 8 \
     "${projected_key_cache_args[@]}" \

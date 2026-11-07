@@ -255,6 +255,13 @@ def get_args_parser():
     parser.add_argument("--layer_budget_min_tokens", type=int, default=0)
     parser.add_argument("--redundancy_log", action="store_true", help="Write cache redundancy statistics (cosine, effective rank, psi) per scene/step/layer, before and after eviction, to <output_dir>/<dataset>/redundancy/<scene>.csv")
     parser.add_argument("--redundancy_log_every", type=int, default=10, help="Log redundancy statistics every N steps")
+    parser.add_argument("--leverage_attention_source", choices=("causal_history", "noncausal_current"), default="causal_history", help="IDC importance: attention accumulated from later frames (causal_history) or, at each eviction, the current frame's queries over all live keys with no history (noncausal_current, Compactor-style)")
+    parser.add_argument("--leverage_score_norm", choices=("mean", "zscore"), default="mean", help="Combine leverage and importance by mean normalisation (IDC) or z(util) + lambda*z(lev) (Compactor)")
+    parser.add_argument("--leverage_compactor_lambda", type=float, default=0.5, help="Leverage weight lambda for --leverage_score_norm zscore and the compactor policy")
+    parser.add_argument("--leverage_unobserved_lev_multiplier", type=float, default=None, help="Score of tokens with no attention yet = m * leverage weight * normalised leverage (2 = paper rule, 1 = no doubling); unset keeps the legacy score")
+    parser.add_argument("--compactor_ridge", type=float, default=5e-3, help="Ridge on each head's key Gram matrix in the compactor policy")
+    parser.add_argument("--compactor_headwise_norm", action="store_true", help="Compactor policy: unit-normalise each head's keys before leverage")
+    parser.add_argument("--max_scenes", type=int, default=None, help="Evaluate only the first N scenes of each dataset (smoke tests)")
     parser.add_argument("--strict_budget", action="store_true", help="Reserve the first-frame anchor in every layer before splitting the rest of --budget, so the total cache never exceeds --budget (default: the anchor floor may exceed it)")
     parser.add_argument("--layer_budget_eps", type=float, default=0)
     parser.add_argument("--layer_budget_value_gamma", type=float, default=0.7)
@@ -488,7 +495,10 @@ def main(args):
             fps_all = []
             time_all = []
 
-            with accelerator.split_between_processes(list(range(len(dataset)))) as idxs:
+            scene_indices = list(range(len(dataset)))
+            if args.max_scenes is not None:
+                scene_indices = scene_indices[: args.max_scenes]
+            with accelerator.split_between_processes(scene_indices) as idxs:
                 for data_idx in tqdm(idxs):
                     batch = default_collate([dataset[data_idx]])
                     ignore_keys = set(
@@ -819,7 +829,7 @@ def main(args):
             if accelerator.is_main_process and args.eval_stage == "infer":
                 manifest = {
                     "dataset": name_data,
-                    "scene_count": len(dataset),
+                    "scene_count": len(scene_indices),
                     "num_processes": accelerator.num_processes,
                     "eval_frame_stride": args.eval_frame_stride,
                     "recon_eval_mode": args.recon_eval_mode,
@@ -899,5 +909,17 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     seed_everything(args.random_seed)
+    from streamvggt.utils import ablation_config
+    ablation_config.configure(
+        attention_source=args.leverage_attention_source,
+        score_norm=args.leverage_score_norm,
+        compactor_lambda=args.leverage_compactor_lambda,
+        unobserved_lev_multiplier=args.leverage_unobserved_lev_multiplier,
+        compactor_ridge=args.compactor_ridge,
+        compactor_headwise_norm=args.compactor_headwise_norm,
+    )
+    if args.eviction_policy == "compactor" and (args.leverage_conf_gate or args.leverage_attention_utility):
+        raise SystemExit("Error: --eviction_policy compactor keeps different tokens per head; "
+                         "run it without --leverage_conf_gate and --leverage_attention_utility")
 
     main(args)

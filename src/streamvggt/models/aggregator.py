@@ -339,12 +339,13 @@ class Aggregator(nn.Module):
                     "Layer-budget score-only mode does not produce kept/evicted indices and is "
                     f"incompatible with: {', '.join(incompatible_outputs)}"
                 )
-        if layer_budget_strategy in LAYER_BUDGET_SCORE_STRATEGIES and (
-            eviction_policy != "svd_leverage" or leverage_granularity != "layer"
+        if layer_budget_strategy in LAYER_BUDGET_SCORE_STRATEGIES and not (
+            (eviction_policy == "svd_leverage" and leverage_granularity == "layer")
+            or eviction_policy == "compactor"  # per-head leverage; KABA uses the head-averaged PR
         ):
             raise ValueError(
-                "leverage-based layer_budget_strategy requires "
-                "eviction_policy='svd_leverage' and leverage_granularity='layer'"
+                "leverage-based layer_budget_strategy requires eviction_policy='svd_leverage' with "
+                "leverage_granularity='layer', or eviction_policy='compactor'"
             )
         has_past_cache = False
         if use_cache and past_key_values is not None:

@@ -318,7 +318,7 @@ class LayerBudgetScoreResult:
 class EvictionManager:
     """Dispatches head-wise cache eviction policies."""
 
-    VALID_POLICIES = ("mean", "baseline_mean", "svd_leverage", "random")
+    VALID_POLICIES = ("mean", "baseline_mean", "svd_leverage", "random", "compactor")
     VALID_LEVERAGE_EVICTION_RISK_MODES = ("low_leverage")
     VALID_LEVERAGE_APPROX_METHODS = ("right_sketch_ridge",)
     VALID_LEVERAGE_EVICTION_SELECTORS = ("topk")
@@ -479,6 +479,7 @@ class EvictionManager:
         attention_utility_beta: float = 0.0,
         need_leverage_basis: bool = False,
         capture_projected_norms: bool = False,
+        query: Optional[torch.Tensor] = None,
     ) -> EvictionResult:
         """Select candidate-local indices to retain.
 
@@ -529,6 +530,18 @@ class EvictionManager:
             random_scores = torch.rand(B, num_candidates, generator=self._random_policy_generator).to(k.device)
             policy_scores = random_scores.unsqueeze(1).expand(B, H, num_candidates)
             kept = self._select_svd_leverage_kept(random_scores, num_to_keep, num_heads=H)
+        elif self.policy == "compactor":
+            if query is None:
+                raise ValueError("The compactor policy needs the current queries (query=...)")
+            policy_scores, compactor_leverage = self._compactor_scores(k, query, num_anchor_tokens)
+            if self.layer_budget_strategy in LAYER_BUDGET_SCORE_STRATEGIES:
+                # KABA on per-head leverage: the participation ratio of each head, averaged over heads.
+                layer_budget_score = self._compute_layer_budget_score(
+                    compactor_leverage.reshape(B * H, num_candidates), candidate_k, candidate_v
+                )
+            # Per-head top-k: every head keeps the same number of tokens, but its own tokens.
+            _, kept = torch.topk(policy_scores, k=int(num_to_keep), dim=-1, sorted=False)
+            kept = kept.sort(dim=-1).values
         elif self.policy == "svd_leverage":
             rls_refresh_before_score = self.rls_refresh_count
             score_trace_start = self._perf_trace_start(candidate_k)
@@ -787,6 +800,73 @@ class EvictionManager:
             return base_score.detach()
 
     @staticmethod
+    def noncausal_attention_colsum(
+        query: torch.Tensor,
+        keys: torch.Tensor,
+        query_chunk: int = 256,
+    ) -> torch.Tensor:
+        """Per-head column sum of softmax(Q K^T / sqrt(D)) over the queries, without a causal mask.
+
+        query [B, H, Nq, D], keys [B, H, N, D] -> [B, H, N] float32 (the softmax runs over all N keys).
+        """
+        B, H, Nq, D = query.shape
+        scale = float(D) ** -0.5
+        keys_t = keys.float().transpose(-1, -2)
+        colsum = torch.zeros(B, H, keys.shape[2], device=keys.device, dtype=torch.float32)
+        for start in range(0, Nq, int(query_chunk)):
+            logits = (query[:, :, start:start + int(query_chunk)].float() @ keys_t) * scale
+            colsum += torch.softmax(logits, dim=-1).sum(dim=2)
+        return colsum
+
+    @staticmethod
+    def _zscore(values: torch.Tensor, dims, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """(x - mean) / std with population std over ``dims`` (optionally only where ``mask``)."""
+        values = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if mask is None:
+            mean = values.mean(dim=dims, keepdim=True)
+            var = (values - mean).square().mean(dim=dims, keepdim=True)
+        else:
+            weight = mask.to(values.dtype)
+            count = weight.sum(dim=dims, keepdim=True).clamp_min(1.0)
+            mean = (values * weight).sum(dim=dims, keepdim=True) / count
+            var = ((values - mean).square() * weight).sum(dim=dims, keepdim=True) / count
+        return (values - mean) / var.sqrt().clamp_min(1e-12)
+
+    def _compactor_scores(
+        self,
+        k: torch.Tensor,
+        query: torch.Tensor,
+        num_anchor_tokens: int,
+    ):
+        """Compactor (Chari & Van Durme 2025, official compactor-vllm code) ported to the streaming cache.
+
+        - attention: current-frame queries attend to all live keys (anchor + candidates) without a causal mask;
+          per-head column sum over the queries, softmax scaled by 1/sqrt(D).
+        - leverage: per head, keys mean-centred over the candidates (optionally unit-normalised per head first),
+          ridge leverage x_i (X^T X + r I)^-1 x_i^T. The head dim (64) is below any useful sketch size, so the
+          leverage is exact (what the right sketch approximates).
+        - score: z(attention) + lambda * z(leverage), z with population mean/std pooled over the heads and
+          candidates of the layer (as the official kernel does). The caller keeps the top-k per head.
+        Returns (scores [B, H, Nc], leverage [B, H, Nc]).
+        """
+        from streamvggt.utils.ablation_config import CONFIG
+
+        candidate_k = k[:, :, int(num_anchor_tokens):, :]
+        attention = self.noncausal_attention_colsum(query, k)[:, :, int(num_anchor_tokens):]
+        x = candidate_k.double()
+        if CONFIG.compactor_headwise_norm:
+            x = F.normalize(x, p=2, dim=-1)
+        x = x - x.mean(dim=2, keepdim=True)
+        D = x.shape[-1]
+        gram = x.transpose(-1, -2) @ x + float(CONFIG.compactor_ridge) * torch.eye(D, device=x.device, dtype=x.dtype)
+        solved = torch.linalg.solve(gram, x.transpose(-1, -2))  # [B, H, D, Nc]
+        leverage = (x * solved.transpose(-1, -2)).sum(dim=-1).clamp_min(0.0).float()
+        scores = self._zscore(attention, dims=(1, 2)) + float(CONFIG.compactor_lambda) * self._zscore(
+            leverage, dims=(1, 2)
+        )
+        return scores, leverage
+
+    @staticmethod
     def _mean_scores(candidate_k: torch.Tensor) -> torch.Tensor:
         candidate_k_norm = F.normalize(candidate_k, p=2, dim=-1)
         mean_vector = torch.mean(candidate_k_norm, dim=2, keepdim=True)
@@ -938,10 +1018,26 @@ class EvictionManager:
             normalized = clean / value_mean.clamp_min(1e-12)
             return torch.where(value_mean > 1e-12, normalized, torch.zeros_like(normalized))
 
-        normalized_scores = mean_normalize(scores)
-        normalized_utility = mean_normalize(utility, observed)
-        blended = (1.0 - beta) * normalized_scores + beta * normalized_utility
-        result = torch.where(observed, blended, normalized_scores)
+        from streamvggt.utils.ablation_config import CONFIG
+
+        if CONFIG.score_norm == "zscore":
+            # Compactor-style: z(util) + lambda * z(lev), population std over the candidates.
+            lev_weight = float(CONFIG.compactor_lambda)
+            normalized_scores = EvictionManager._zscore(scores, dims=-1)
+            normalized_utility = EvictionManager._zscore(utility, dims=-1, mask=observed)
+            blended = normalized_utility + lev_weight * normalized_scores
+            unobserved = normalized_scores if CONFIG.unobserved_lev_multiplier is None else (
+                float(CONFIG.unobserved_lev_multiplier) * lev_weight * normalized_scores
+            )
+        else:
+            lev_weight = 1.0 - beta
+            normalized_scores = mean_normalize(scores)
+            normalized_utility = mean_normalize(utility, observed)
+            blended = lev_weight * normalized_scores + beta * normalized_utility
+            unobserved = normalized_scores if CONFIG.unobserved_lev_multiplier is None else (
+                float(CONFIG.unobserved_lev_multiplier) * lev_weight * normalized_scores
+            )
+        result = torch.where(observed, blended, unobserved)
         any_observed = observed.any(dim=-1, keepdim=True)
         return torch.where(any_observed, result, scores.float())
 

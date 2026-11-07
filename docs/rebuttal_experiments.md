@@ -151,6 +151,56 @@ Outputs: `summary.csv` (medians, p90, share of degenerate cases: erank < 2 or me
 
 ## Experiment 3: Compactor
 
-Not implemented yet. See the plan (`Compactor` section): port of Chari & Van Durme 2025 and the six differences
-(causal attention history, head-wise normalization, head concatenation, frozen importance, mean normalization,
-2x leverage for new tokens) as on/off flags.
+Compactor (Chari & Van Durme 2025; official code github.com/vnchari/compactor-vllm) ported as
+`--eviction_policy compactor` (`EvictionManager._compactor_scores`, `src/streamvggt/layers/eviction.py`):
+
+| Part | Official code | Port here |
+|---|---|---|
+| attention | non-causal softmax column sum inside 128-token blocks, raw q·k | current-frame queries over all live keys (anchor + candidates, before eviction), softmax with 1/sqrt(D) |
+| leverage | per KV head, pre-RoPE keys mean-centred, sketch 48, ridge 5e-3 | per head, post-RoPE keys mean-centred, exact (head dim 64 < sketch 256), ridge 5e-3 (`--compactor_ridge`) |
+| combination | z(attn) + 0.5·z(lev), population std pooled over heads and tokens | same (`--leverage_compactor_lambda 0.5`) |
+| selection | top-k over (token, head) pairs; protected first 16 / last 64 tokens | top-k per head, same count per head; the first-frame anchor is protected |
+| cache | per-head token sets | per-head token sets (`_materialize_kv_by_keep_indices(head_shared=False)`) |
+
+The compactor policy needs no per-token state, so it runs without the confidence gate and attention utility
+(`launch.py` rejects the combination). With KABA, the layer statistic is the per-head leverage participation
+ratio averaged over heads.
+
+The six differences, as switches (defaults = DiaStream):
+
+| # | Difference | DiaStream | Compactor | Switch |
+|---|---|---|---|---|
+| 1 | causal attention history | utility accumulated from later frames | current-frame queries, recomputed each eviction | `--leverage_attention_source causal_history / noncausal_current` |
+| 2 | head-wise normalization | unit norm per head | raw keys | `HEADWISE_NORM=true/false` (IDC path), `--compactor_headwise_norm` (compactor) |
+| 3 | concatenation | heads concatenated, one token set per layer | per-head leverage and token sets | `--eviction_policy svd_leverage` (layer) / `compactor` |
+| 4 | freezing importance | frozen after T=5 | never frozen | `LEVERAGE_ATTENTION_FREEZE_UPDATES=5 / 0` (0 = never) |
+| 5 | mean-normalization | lev/mean + util/mean, equal weights | z(util) + 0.5·z(lev) | `--leverage_score_norm mean / zscore`, `--leverage_compactor_lambda` |
+| 6 | 2x leverage for new tokens | 2x | 1x | `--leverage_unobserved_lev_multiplier 2 / 1` (unset = legacy = 2x at beta 0.5) |
+
+Process-wide switches live in `src/streamvggt/utils/ablation_config.py`; unit tests in
+`tools/test_compactor_ablation.py` (compactor scores vs a numpy reference, per-head selection and cache
+materialisation, blend modes, freeze 0).
+
+```bash
+cd src/eval/mv_recon/rebuttal
+bash compactor.sh A        # full sequence: compactor_uniform, compactor_kaba, ours
+bash compactor.sh B        # first 100 frames: C0..C7 and ours_wo_*
+DRY_RUN=1 bash compactor.sh B   # print the commands only
+```
+
+Table B, cumulative (KABA throughout):
+
+| Step | Adds | Config |
+|---|---|---|
+| C0 | Compactor | `C0_compactor` |
+| C1 | (2) head-wise normalization | `C1_headnorm` |
+| C2 | (3) concatenation (also switches to IDC's leverage: layer sketch 256, ridge 0, no centring) | `C2_concat` |
+| C3 | (1) causal attention history (never frozen, 1x new tokens) | `C3_history` |
+| C4 | (4) freezing T=5 | `C4_freeze` |
+| C5 | (5) mean-normalization, equal weights | `C5_meannorm` |
+| C6 | (6) 2x leverage for new tokens | `C6_double` |
+| C7 | confidence gate (= ours) | `C7_ours` |
+
+Leave-one-out from ours: `ours_wo_history`, `ours_wo_headnorm`, `ours_wo_freeze`, `ours_wo_meannorm`
+(z-score with lambda 1, so only the normalisation changes), `ours_wo_double`. Removing (3) alone is not possible:
+per-head token sets would need per-head confidence/attention state; C1 → C2 measures it instead.

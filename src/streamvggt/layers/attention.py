@@ -4,7 +4,7 @@ import time
 import warnings
 
 import torch
-from streamvggt.utils import redundancy_log
+from streamvggt.utils import ablation_config, redundancy_log
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -230,6 +230,7 @@ class Attention(nn.Module):
         tokens_per_frame: Optional[int] = None,
         eviction_policy: str = "mean",
         eviction_policy_layers: Optional[Set[int]] = None,
+        query: Optional[torch.Tensor] = None,
         profile_eviction: bool = False,
         eviction_debug: bool = False,
         leverage_granularity: str = "layer",
@@ -448,6 +449,16 @@ class Attention(nn.Module):
         )
         candidate_depth_confidence = None
         candidate_point_confidence = None
+        if ablation_config.CONFIG.attention_source == "noncausal_current" and eviction_policy == "svd_leverage":
+            # No attention history: the current frame's queries attend to every live key (before eviction);
+            # every candidate, current-frame tokens included, gets a fresh importance score.
+            if query is None:
+                raise RuntimeError("attention_source=noncausal_current needs the current queries")
+            colsum = EvictionManager.noncausal_attention_colsum(query, select_k)
+            candidate_attention_utility = scale_stac_colsum(
+                colsum, live_tokens=select_k.shape[2], query_tokens=query.shape[2]
+            )[:, num_anchor_tokens:]
+            candidate_attention_observed = torch.ones_like(candidate_attention_utility, dtype=torch.bool)
         eviction_result = eviction.select(
             select_k,
             selection_budget,
@@ -470,6 +481,7 @@ class Attention(nn.Module):
                 and eviction_nn_analysis_config.wants_svd_coord()
             ),
             capture_projected_norms=projected_norm_histogram_config is not None,
+            query=query,
         )
         self._perf_trace_end(
             "select",
@@ -573,10 +585,16 @@ class Attention(nn.Module):
         anchor_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
         anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
         keep_indices = torch.cat([anchor_indices, top_indices + num_anchor_tokens,], dim=2,)
+        per_head_cache = eviction_policy == "compactor"
+        if per_head_cache and confidence_state is not None:
+            raise RuntimeError(
+                "The compactor policy keeps different tokens per head; run it without the confidence gate and "
+                "attention utility (their per-token state assumes one token set per layer)"
+            )
         if redundancy_log.enabled(step_idx):
-            redundancy_log.record(k, num_anchor_tokens, top_indices, layer_id, step_idx)
+            redundancy_log.record(k, num_anchor_tokens, top_indices, layer_id, step_idx, per_head_cache=per_head_cache)
         final_k, final_v = _materialize_kv_by_keep_indices(
-            k, v, keep_indices, head_shared=True
+            k, v, keep_indices, head_shared=not per_head_cache
         )
         final_confidence_state = (
             confidence_state.gather(keep_indices)
@@ -741,8 +759,8 @@ class Attention(nn.Module):
                 raise ValueError("leverage_attention_beta must be in [0, 1]")
             if not 0.0 <= float(leverage_attention_ema_decay) <= 1.0:
                 raise ValueError("leverage_attention_ema_decay must be in [0, 1]")
-            if not 1 <= int(leverage_attention_freeze_updates) <= 255:
-                raise ValueError("leverage_attention_freeze_updates must be in [1, 255]")
+            if not 0 <= int(leverage_attention_freeze_updates) <= 255:
+                raise ValueError("leverage_attention_freeze_updates must be in [0, 255] (0 = never freeze)")
             if not 0.0 < float(leverage_attention_colsum_subsample_ratio) <= 1.0:
                 raise ValueError("leverage_attention_colsum_subsample_ratio must be in (0, 1]")
         profile_forward = bool(profile_eviction)
@@ -941,6 +959,7 @@ class Attention(nn.Module):
                     "tokens_per_frame": tokens_per_frame,
                     "eviction_policy": eviction_policy,
                     "eviction_policy_layers": eviction_policy_layers,
+                    "query": q,
                     "profile_eviction": profile_eviction,
                     "eviction_debug": eviction_debug,
                     "leverage_granularity": leverage_granularity,

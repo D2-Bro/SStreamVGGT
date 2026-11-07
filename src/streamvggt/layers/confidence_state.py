@@ -193,14 +193,18 @@ class KVConfidenceState:
             )
         if not 0.0 <= float(ema_decay) <= 1.0:
             raise ValueError(f"ema_decay must be in [0, 1], got {ema_decay}")
-        if not 1 <= int(freeze_updates) <= 255:
-            raise ValueError(f"freeze_updates must be in [1, 255], got {freeze_updates}")
-        active = self.attention_count < int(freeze_updates)
+        if not 0 <= int(freeze_updates) <= 255:
+            raise ValueError(f"freeze_updates must be in [0, 255], got {freeze_updates}")
+        if int(freeze_updates) == 0:
+            # 0 = never freeze: keep updating every observed token (the uint8 counter saturates at 255).
+            active = torch.ones_like(self.attention_count, dtype=torch.bool)
+        else:
+            active = self.attention_count < int(freeze_updates)
         clean_score = torch.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)
         decay = float(ema_decay)
         self.attention_accum[active] = decay * self.attention_accum[active] + clean_score[active]
         self.attention_normalizer[active] = decay * self.attention_normalizer[active] + 1.0
-        self.attention_count[active] += 1
+        self.attention_count[active] = (self.attention_count[active].to(torch.int16) + 1).clamp_max(255).to(torch.uint8)
 
     def concat(self, other: "KVConfidenceState") -> "KVConfidenceState":
         other_gate_sum = other.gate_sum.to(device=self.gate_sum.device, dtype=self.gate_sum.dtype)
