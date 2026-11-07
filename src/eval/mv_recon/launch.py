@@ -273,6 +273,7 @@ def get_args_parser():
     add_token_overlay_dump_args(parser)
     parser.add_argument("--eval_frame_stride", type=int, default=1, help="Use every Nth frame only when building eval point clouds; inference still uses all frames")
     parser.add_argument("--eval_stage", choices=("all", "infer"), default="all", help="all runs CPU metrics inline; infer saves point clouds for evaluate_saved.py")
+    parser.add_argument("--eval_device", choices=("cpu", "cuda"), default="cpu", help="device for the inline metrics of --eval_stage all: cpu = Open3D legacy ICP + pykdtree (reference), cuda = the same ICP loop and exact NN distances on this rank's GPU")
     parser.add_argument(
         "--recon_eval_mode",
         type=str,
@@ -318,6 +319,8 @@ def main(args):
             "points=direct_predicted_3d, "
             f"metrics={'voxel_centroids' if args.eval_metrics_on_voxels else 'full_points'}"
         )
+    if args.eval_device == "cuda" and args.eval_stage != "all":
+        raise SystemExit("Error: --eval_device cuda applies to --eval_stage all only")
     if args.eval_stage == "infer" and args.recon_eval_mode != "legacy":
         raise SystemExit("Error: deferred evaluation currently supports --recon_eval_mode legacy only")
     if args.eviction_policy == "svd_leverage":
@@ -766,7 +769,10 @@ def main(args):
                         torch.cuda.empty_cache()
                         continue
 
-                    metrics = evaluate_arrays(pts_all, pts_gt_all, masks_all, name_data, args.use_proj)
+                    metrics = evaluate_arrays(
+                        pts_all, pts_gt_all, masks_all, name_data, args.use_proj,
+                        device=device if args.eval_device == "cuda" else "cpu",
+                    )
                     metric_msg = format_metric(scene_id, metrics, infer_time, fps)
                     print(metric_msg)
                     with open(log_file, "a") as f:

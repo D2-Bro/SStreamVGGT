@@ -1,4 +1,4 @@
-"""CPU reconstruction metrics shared by inline and deferred evaluation."""
+"""Reconstruction metrics shared by inline and deferred evaluation (CPU reference, optional GPU path)."""
 
 import os
 from pathlib import Path
@@ -28,8 +28,8 @@ def save_eval_inputs(path, pred, gt, masks, *, scene_id, dataset, rank, infer_ti
         temporary.unlink(missing_ok=True)
 
 
-def evaluate_arrays(pred, gt, masks, dataset, use_proj=False):
-    """Run the legacy point-to-point ICP and nearest-neighbor metrics on CPU."""
+def prepare_points(pred, gt, masks, use_proj=False):
+    """Mask, Sim(3)-align (use_proj only) and drop non-finite points; returns float64 (N, 3) arrays."""
     if pred.shape != gt.shape or pred.shape[:-1] != masks.shape or pred.shape[-1] != 3:
         raise ValueError(f"Incompatible point/mask shapes: {pred.shape}, {gt.shape}, {masks.shape}")
     selected = masks > 0
@@ -54,12 +54,45 @@ def evaluate_arrays(pred, gt, masks, dataset, use_proj=False):
     gt = gt[np.isfinite(gt).all(axis=1)]
     if len(pred) == 0 or len(gt) == 0:
         raise ValueError("No finite points remain after masking")
+    return np.ascontiguousarray(pred, dtype=np.float64), np.ascontiguousarray(gt, dtype=np.float64)
+
+
+def icp_threshold(dataset):
+    return 100 if "DTU" in dataset else 0.1
+
+
+def metrics_from_distances(acc_dist, comp_dist):
+    """Same reductions as eval.mv_recon.utils.accuracy / completion (NC is fixed to 0 there)."""
+    metrics = dict(acc=np.mean(acc_dist), comp=np.mean(comp_dist), nc1=0.0, nc2=0.0,
+                   acc_med=np.median(acc_dist), comp_med=np.median(comp_dist),
+                   nc1_med=0.0, nc2_med=0.0)
+    for threshold in THRESHOLDS:
+        precision = float(np.mean(acc_dist < threshold))
+        recall = float(np.mean(comp_dist < threshold))
+        denominator = precision + recall
+        metrics[f"f1_{round(threshold * 100)}cm"] = (
+            2 * precision * recall / denominator if denominator > 0 else 0.0
+        )
+    return metrics
+
+
+def evaluate_arrays(pred, gt, masks, dataset, use_proj=False, device="cpu"):
+    """Legacy point-to-point ICP and nearest-neighbor metrics.
+
+    device="cpu": Open3D legacy ICP + pykdtree (reference path).
+    device="cuda[:i]": the same ICP loop and exact NN distances on the GPU (eval.mv_recon.gpu_evaluation).
+    """
+    pred, gt = prepare_points(pred, gt, masks, use_proj)
+    threshold = icp_threshold(dataset)
+    if str(device) != "cpu":
+        from eval.mv_recon.gpu_evaluation import icp_and_distances
+        acc_dist, comp_dist = icp_and_distances(pred, gt, threshold, device)
+        return metrics_from_distances(acc_dist, comp_dist)
 
     source = o3d.geometry.PointCloud()
     source.points = o3d.utility.Vector3dVector(pred)
     target = o3d.geometry.PointCloud()
     target.points = o3d.utility.Vector3dVector(gt)
-    threshold = 100 if "DTU" in dataset else 0.1
     reg = o3d.pipelines.registration.registration_icp(
         source, target, threshold, np.eye(4),
         o3d.pipelines.registration.TransformationEstimationPointToPoint(),

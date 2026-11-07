@@ -43,6 +43,7 @@ kf_every=5
 
 eval_frame_stride=1
 eval_stage="${EVAL_STAGE:-all}"
+eval_device="${EVAL_DEVICE:-cpu}"
 stream_chunk_size="${STREAM_CHUNK_SIZE:-1}"
 if ! [[ "$num_processes" =~ ^[1-9][0-9]*$ ]]; then
     echo "Error: NUM_PROCESSES must be a positive integer: $num_processes" >&2
@@ -98,6 +99,7 @@ accelerate launch --num_processes "$num_processes" --main_process_port "${MAIN_P
     --kf_every "$kf_every" \
     --eval_frame_stride "$eval_frame_stride" \
     --eval_stage "$eval_stage" \
+    --eval_device "$eval_device" \
     --eviction_policy "$eviction_policy" \
     --leverage_granularity layer \
     --leverage_feature "$leverage_feature" \
