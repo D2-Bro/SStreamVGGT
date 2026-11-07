@@ -318,7 +318,7 @@ class LayerBudgetScoreResult:
 class EvictionManager:
     """Dispatches head-wise cache eviction policies."""
 
-    VALID_POLICIES = ("mean", "baseline_mean", "svd_leverage")
+    VALID_POLICIES = ("mean", "baseline_mean", "svd_leverage", "random")
     VALID_LEVERAGE_EVICTION_RISK_MODES = ("low_leverage")
     VALID_LEVERAGE_APPROX_METHODS = ("right_sketch_ridge",)
     VALID_LEVERAGE_EVICTION_SELECTORS = ("topk")
@@ -520,6 +520,15 @@ class EvictionManager:
         if self.policy in ("mean", "baseline_mean"):
             policy_scores = mean_scores
             kept = self._keep_lowest_scores(policy_scores, num_to_keep)
+        elif self.policy == "random":
+            # Control condition: keep a uniformly random subset of the candidates, shared across heads.
+            # One generator per manager (one manager per layer), seeded once, so runs are reproducible.
+            if getattr(self, "_random_policy_generator", None) is None:
+                self._random_policy_generator = torch.Generator(device="cpu")
+                self._random_policy_generator.manual_seed(int(self.leverage_random_seed))
+            random_scores = torch.rand(B, num_candidates, generator=self._random_policy_generator).to(k.device)
+            policy_scores = random_scores.unsqueeze(1).expand(B, H, num_candidates)
+            kept = self._select_svd_leverage_kept(random_scores, num_to_keep, num_heads=H)
         elif self.policy == "svd_leverage":
             rls_refresh_before_score = self.rls_refresh_count
             score_trace_start = self._perf_trace_start(candidate_k)

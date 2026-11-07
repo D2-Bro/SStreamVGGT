@@ -253,6 +253,9 @@ def get_args_parser():
     )
     parser.add_argument("--layer_budget_alpha", type=float, default=0.7)
     parser.add_argument("--layer_budget_min_tokens", type=int, default=0)
+    parser.add_argument("--redundancy_log", action="store_true", help="Write cache redundancy statistics (cosine, effective rank, psi) per scene/step/layer, before and after eviction, to <output_dir>/<dataset>/redundancy/<scene>.csv")
+    parser.add_argument("--redundancy_log_every", type=int, default=10, help="Log redundancy statistics every N steps")
+    parser.add_argument("--strict_budget", action="store_true", help="Reserve the first-frame anchor in every layer before splitting the rest of --budget, so the total cache never exceeds --budget (default: the anchor floor may exceed it)")
     parser.add_argument("--layer_budget_eps", type=float, default=0)
     parser.add_argument("--layer_budget_value_gamma", type=float, default=0.7)
     parser.add_argument("--layer_budget_value_norm_type", type=str, default="mean", choices=("mean", "rms"), help="Layer value-norm prior type for value_weighted_leverage_pr budget allocation")
@@ -614,8 +617,15 @@ def main(args):
                                     "layer_budget_scores.csv",
                                 )
 
+                            if args.redundancy_log:
+                                from streamvggt.utils import redundancy_log
+                                redundancy_log.configure(
+                                    osp.join(args.output_dir, name_data, "redundancy"), every=args.redundancy_log_every
+                                )
+                                redundancy_log.set_scene(scene_key)
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize(device)
+                                torch.cuda.reset_peak_memory_stats(device)
                             infer_start = time.perf_counter()
                             results = model.inference(
                                 batch,
@@ -658,6 +668,7 @@ def main(args):
                                 layer_budget_norm_source=args.layer_budget_norm_source,
                                 layer_budget_alpha=args.layer_budget_alpha,
                                 layer_budget_min_tokens=args.layer_budget_min_tokens,
+                                layer_budget_strict=args.strict_budget,
                                 layer_budget_eps=args.layer_budget_eps,
                                 layer_budget_log_path=layer_budget_log_path,
                                 anchor_budget_overage_log_path=anchor_budget_overage_log_path,
@@ -673,6 +684,10 @@ def main(args):
                                 torch.cuda.synchronize(device)
                             infer_time = time.perf_counter() - infer_start
                             fps = num_input_frames / infer_time if infer_time > 0 else float("inf")
+                            peak_mem_gb = (
+                                torch.cuda.max_memory_allocated(device) / 1024 ** 3
+                                if torch.cuda.is_available() else float("nan")
+                            )
                             time_all.append(infer_time)
                             fps_all.append(fps)
 
@@ -773,7 +788,7 @@ def main(args):
                         pts_all, pts_gt_all, masks_all, name_data, args.use_proj,
                         device=device if args.eval_device == "cuda" else "cpu",
                     )
-                    metric_msg = format_metric(scene_id, metrics, infer_time, fps)
+                    metric_msg = format_metric(scene_id, metrics, infer_time, fps) + f"PeakMemGB: {peak_mem_gb:.3f}, "
                     print(metric_msg)
                     with open(log_file, "a") as f:
                         print(metric_msg, file=f)
@@ -873,6 +888,7 @@ pattern = r"""
     F1@10cm:\s*(?P<f1_10cm>[^,]+),\s*
     F1@25cm:\s*(?P<f1_25cm>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*
     (?:,?\s*Time:\s*(?P<time>[^,]+),\s*FPS:\s*(?P<fps>[^,]+))?
+    (?:,?\s*PeakMemGB:\s*(?P<peak_mem_gb>[^,]+))?
 """
 
 regex = re.compile(pattern, re.VERBOSE)

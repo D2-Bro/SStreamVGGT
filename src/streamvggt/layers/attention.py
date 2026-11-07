@@ -4,6 +4,7 @@ import time
 import warnings
 
 import torch
+from streamvggt.utils import redundancy_log
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -572,6 +573,8 @@ class Attention(nn.Module):
         anchor_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
         anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
         keep_indices = torch.cat([anchor_indices, top_indices + num_anchor_tokens,], dim=2,)
+        if redundancy_log.enabled(step_idx):
+            redundancy_log.record(k, num_anchor_tokens, top_indices, layer_id, step_idx)
         final_k, final_v = _materialize_kv_by_keep_indices(
             k, v, keep_indices, head_shared=True
         )

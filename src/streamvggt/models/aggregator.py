@@ -291,6 +291,7 @@ class Aggregator(nn.Module):
         layer_budget_log_path: Optional[str] = None,
         anchor_budget_overage_log_path: Optional[str] = None,
         layer_budget_score_only: bool = False,
+        layer_budget_strict: bool = False,
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
     ) -> Tuple[List[torch.Tensor], int]:
@@ -413,13 +414,25 @@ class Aggregator(nn.Module):
             if images.is_cuda and torch.cuda.is_available():
                 torch.cuda.synchronize(images.device)
             dynamic_budget_start = time.perf_counter()
+        allocation_min_tokens = int(layer_budget_min_tokens)
+        if layer_budget_strict:
+            # Strict budget: reserve the first-frame anchor (P tokens, never evicted) in every layer first and
+            # split only the remainder, so the anchor floor in attention.eviction can never push the total over
+            # the global budget.
+            anchor_reserve = self.depth * P
+            if int(total_budget) < anchor_reserve:
+                raise ValueError(
+                    f"--strict_budget needs total_budget >= depth * tokens_per_frame = {self.depth} * {P} = "
+                    f"{anchor_reserve}, got {int(total_budget)}"
+                )
+            allocation_min_tokens = max(allocation_min_tokens, int(P))
         current_budgets = self._calculate_dynamic_budgets(
             total_budget,
             layer_budget_strategy=layer_budget_strategy,
             layer_budget_value_gamma=layer_budget_value_gamma,
             layer_budget_value_norm_type=layer_budget_value_norm_type,
             layer_budget_alpha=layer_budget_alpha,
-            layer_budget_min_tokens=layer_budget_min_tokens,
+            layer_budget_min_tokens=allocation_min_tokens,
             layer_budget_eps=layer_budget_eps,
             layer_budget_log_path=layer_budget_log_path,
             layer_budget_step_idx=past_frame_idx,

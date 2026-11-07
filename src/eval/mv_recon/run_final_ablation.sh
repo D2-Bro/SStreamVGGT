@@ -6,7 +6,7 @@ model_name='StreamVGGT'
 ckpt_name='checkpoints'
 model_weights="${workdir}/ckpt/${ckpt_name}.pth"
 # model_weights="${workdir}/../OVGGT/ckpt/${ckpt_name}.pth"
-max_frames='full'
+max_frames="${MAX_FRAMES:-full}"
 eviction_policy='svd_leverage'
 layer_budget_strategy='value_weighted_leverage_pr' #[leverage_pr, uniform, key_norm, value_weighted_leverage_pr]
 layer_budget_alpha=0.7
@@ -15,8 +15,8 @@ layer_budget_eps=0
 layer_budget_value_gamma=0.7
 layer_budget_value_norm_type='mean' #[mean, rms]
 layer_budget_norm_source='key' #[value, key]
-total_budget=60000
-budget_frame_multiplier=''
+total_budget="${TOTAL_BUDGET:-60000}"
+budget_frame_multiplier="${BUDGET_FRAME_MULTIPLIER:-}"
 leverage_feature=key # [key, key_value, key_value_lowdim_concat]
 leverage_eviction_selector=topk # [topk, fast_dpp, layer_head_fast_dpp, similarity_topk]
 
@@ -40,6 +40,11 @@ leverage_conf_gate_init=mean
 leverage_projected_key_cache="true"
 
 eval_frame_stride=1
+kf_every="${KF_EVERY:-2}"
+eval_device="${EVAL_DEVICE:-cpu}"
+num_processes="${NUM_PROCESSES:-1}"
+# Extra launch.py flags for experiment wrappers (word-split on spaces).
+read -r -a extra_args <<< "${EXTRA_ARGS:-}"
 
 attention_utility_args=()
 attention_utility_suffix=""
@@ -69,7 +74,7 @@ if [ "$leverage_projected_key_cache" = true ]; then
     projected_key_cache_args=(--leverage_projected_key_cache)
 fi
 
-output_dir="${workdir}/eval_results/mv_recon/Rebuttal_beta0.5_wo_none_60000_FullSeq"
+output_dir="${OUTPUT_DIR:-${workdir}/eval_results/mv_recon/Rebuttal_beta0.5_wo_none_60000_FullSeq}"
 echo "$output_dir"
 
 export OMP_NUM_THREADS=16
@@ -77,12 +82,14 @@ export OPENBLAS_NUM_THREADS=16
 export MKL_NUM_THREADS=16
 export NUMEXPR_NUM_THREADS=16
 
-accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/launch.py \
+accelerate launch --num_processes "$num_processes" --main_process_port "${MAIN_PROCESS_PORT:-29202}" ./eval/mv_recon/launch.py \
     --weights "$model_weights" \
     --output_dir "$output_dir" \
     --model_name "$model_name" \
     --max_frames "$max_frames" \
     --eval_frame_stride "$eval_frame_stride" \
+    --kf_every "$kf_every" \
+    --eval_device "$eval_device" \
     --eviction_policy "$eviction_policy" \
     --leverage_granularity layer \
     --leverage_feature "$leverage_feature" \
@@ -116,7 +123,8 @@ accelerate launch --num_processes 1 --main_process_port 29202 ./eval/mv_recon/la
     --stream_chunk_size 1 \
     --rls_refresh_interval 8 \
     "${projected_key_cache_args[@]}" \
-    "${attention_utility_args[@]}" 
+    "${attention_utility_args[@]}" \
+    "${extra_args[@]}"
     
 # Add --profile_eviction to the launch command above when measuring eviction latency.
 
