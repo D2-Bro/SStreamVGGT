@@ -38,6 +38,18 @@ present in this repo, pass `EXTRA_ARGS="--weights /home/dongjae/InfiniteVGGT/ckp
 
 ---
 
+## Running everything and collecting results
+
+```bash
+cd src/eval/mv_recon/rebuttal
+GPUS="0 2 3 5" CUDA_DETERMINISTIC=false bash run_queue.sh jobs_all.txt   # 31 runs, one per GPU at a time
+python tools/collect_rebuttal_results.py      # from the repo root -> eval_results/mv_recon/rebuttal/results.json
+```
+`results.json` holds, per experiment / run / dataset, the per-scene metrics and means (CD = (Acc + Comp) / 2,
+F1 at 5/10/25 cm, FPS, PeakMemGB, frames), whether the run finished, the strict-budget overage, the redundancy
+medians (pr_analysis), and the queue status. It can be regenerated at any time; unfinished runs are marked
+`"complete": false`. CUDA determinism is off for these runs (`--no_cuda_deterministic`, 2.8 → 4.1 FPS on a 3090).
+
 ## Experiment 2: strict budget
 
 **Issue.** The first-frame anchor (1041 tokens per layer) is never evicted. When KABA gives a layer less than
