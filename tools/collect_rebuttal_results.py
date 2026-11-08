@@ -198,9 +198,13 @@ def queue_status(root):
                     parts = line.rstrip("\n").split("\t")
                     if len(parts) == 3:
                         done[parts[0]] = {"gpu": parts[1], "rc": int(parts[2])}
-        for out in glob.glob(os.path.join(d, "*.out")):  # queue.out and worker_gpu*.out
-            with open(out) as f:
-                started |= {m.group(1) for m in re.finditer(r" start (\S+) ", f.read())}
+    # A worker can serve both the recon and the trajectory queue (its log lives in one of them): read all logs.
+    eval_root = os.path.abspath(os.path.join(root, "..", ".."))
+    for out in glob.glob(os.path.join(eval_root, "*", "rebuttal", "queue*", "*.out")):
+        if "stopped" in out:
+            continue
+        with open(out) as f:
+            started |= {m.group(1) for m in re.finditer(r" start (\S+) ", f.read())}
     jobs = {}
     for name in names:
         if name in done:
