@@ -233,6 +233,10 @@ Table B, cumulative (KABA throughout):
 | C6 | (6) 2x leverage for new tokens | `C6_double` |
 | C7 | confidence gate (= ours) | `C7_ours` |
 
+Table B is also run at full sequence (`MAX_FRAMES=full bash compactor.sh <config>`, outputs
+`B_<config>_framesfull`); there C0 equals table A `compactor_kaba` and C7 equals strict `B60000_soft`, so 11 runs.
+The full-sequence table B and the trajectory runs are queued together in `jobs_phase2.txt`.
+
 Leave-one-out from ours: `ours_wo_history`, `ours_wo_headnorm`, `ours_wo_freeze`, `ours_wo_meannorm`
 (z-score with lambda 1, so only the normalisation changes), `ours_wo_double`. Removing (3) alone is not possible:
 per-head token sets would need per-head confidence/attention state; C1 → C2 measures it instead.

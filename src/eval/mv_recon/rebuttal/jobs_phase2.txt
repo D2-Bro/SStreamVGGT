@@ -1,0 +1,38 @@
+# Phase 2: Compactor B at full sequence (11 runs; C0 = compA compactor_kaba, C7 = strict B60000_soft), then the 7-Scenes trajectory runs (jobs_pose.txt).
+compBfull_C1_headnorm	MAX_FRAMES=full bash compactor.sh C1_headnorm
+compBfull_C2_concat	MAX_FRAMES=full bash compactor.sh C2_concat
+compBfull_C3_history	MAX_FRAMES=full bash compactor.sh C3_history
+compBfull_C4_freeze	MAX_FRAMES=full bash compactor.sh C4_freeze
+compBfull_C5_meannorm	MAX_FRAMES=full bash compactor.sh C5_meannorm
+compBfull_C6_double	MAX_FRAMES=full bash compactor.sh C6_double
+compBfull_ours_wo_history	MAX_FRAMES=full bash compactor.sh ours_wo_history
+compBfull_ours_wo_headnorm	MAX_FRAMES=full bash compactor.sh ours_wo_headnorm
+compBfull_ours_wo_freeze	MAX_FRAMES=full bash compactor.sh ours_wo_freeze
+compBfull_ours_wo_meannorm	MAX_FRAMES=full bash compactor.sh ours_wo_meannorm
+compBfull_ours_wo_double	MAX_FRAMES=full bash compactor.sh ours_wo_double
+pose_strict_B60000_soft	MODES=soft bash pose_strict.sh 60000
+pose_strict_B60000_strict	MODES=strict bash pose_strict.sh 60000
+pose_strict_B30000_soft	MODES=soft bash pose_strict.sh 30000
+pose_strict_B30000_strict	MODES=strict bash pose_strict.sh 30000
+pose_compA_compactor_uniform	bash pose_compactor.sh compactor_uniform
+pose_compA_compactor_kaba	bash pose_compactor.sh compactor_kaba
+pose_compB_C1_headnorm	bash pose_compactor.sh C1_headnorm
+pose_compB_C2_concat	bash pose_compactor.sh C2_concat
+pose_compB_C3_history	bash pose_compactor.sh C3_history
+pose_compB_C4_freeze	bash pose_compactor.sh C4_freeze
+pose_compB_C5_meannorm	bash pose_compactor.sh C5_meannorm
+pose_compB_C6_double	bash pose_compactor.sh C6_double
+pose_compB_ours_wo_history	bash pose_compactor.sh ours_wo_history
+pose_compB_ours_wo_headnorm	bash pose_compactor.sh ours_wo_headnorm
+pose_compB_ours_wo_freeze	bash pose_compactor.sh ours_wo_freeze
+pose_compB_ours_wo_meannorm	bash pose_compactor.sh ours_wo_meannorm
+pose_compB_ours_wo_double	bash pose_compactor.sh ours_wo_double
+pose_stride20_60000	BUDGETS=60000 bash pose_stride.sh 20
+pose_stride20_30000	BUDGETS=30000 bash pose_stride.sh 20
+pose_stride20_full	BUDGETS=full bash pose_stride.sh 20
+pose_stride50_60000	BUDGETS=60000 bash pose_stride.sh 50
+pose_stride50_30000	BUDGETS=30000 bash pose_stride.sh 50
+pose_stride50_full	BUDGETS=full bash pose_stride.sh 50
+pose_stride100_60000	BUDGETS=60000 bash pose_stride.sh 100
+pose_stride100_30000	BUDGETS=30000 bash pose_stride.sh 100
+pose_stride100_full	BUDGETS=full bash pose_stride.sh 100

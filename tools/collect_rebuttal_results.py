@@ -181,16 +181,20 @@ def pose_run_summary(run_dir):
 
 def queue_status(root):
     qdir = os.path.join(root, "queue")
-    jobs_name = "jobs_pose.txt" if "pose_evaluation" in root else "jobs_all.txt"
-    jobs_file = os.path.join(os.path.dirname(__file__), "..", "src", "eval", "mv_recon", "rebuttal", jobs_name)
+    jobs_dir = os.path.join(os.path.dirname(__file__), "..", "src", "eval", "mv_recon", "rebuttal")
     names = []
-    if os.path.exists(jobs_file):
-        with open(jobs_file) as f:
-            names = [l.split("\t")[0] for l in f if l.strip() and not l.lstrip().startswith("#")]
+    for jobs_name in ("jobs_all.txt", "jobs_phase2.txt", "jobs_pose.txt"):
+        path = os.path.join(jobs_dir, jobs_name)
+        if os.path.exists(path):
+            with open(path) as f:
+                names += [l.split("\t")[0] for l in f if l.strip() and not l.lstrip().startswith("#")]
+    is_pose = "pose_evaluation" in root
+    names = [n for n in dict.fromkeys(names) if n.startswith("pose_") == is_pose]
     done = {}
     started = set()
-    # Active queues: queue/ and queue_*/ (except stopped ones, kept only for reference).
-    qdirs = [d for d in [qdir] + sorted(glob.glob(os.path.join(root, "queue_*"))) if "stopped" not in d]
+    # Active queues of both roots (a queue can hold recon and trajectory jobs); stopped ones are ignored.
+    eval_root_q = os.path.abspath(os.path.join(root, "..", ".."))
+    qdirs = [d for d in sorted(glob.glob(os.path.join(eval_root_q, "*", "rebuttal", "queue*"))) if "stopped" not in d]
     for d in qdirs:
         if os.path.exists(os.path.join(d, "status.tsv")):
             with open(os.path.join(d, "status.tsv")) as f:
@@ -236,11 +240,14 @@ def main():
             if os.path.isdir(run_dir) and not os.path.basename(run_dir).startswith("summary"):
                 runs[os.path.basename(run_dir)] = run_summary(run_dir)
         experiments[exp] = runs
-    # Compactor table A "ours" is the strict B60000_soft run (same configuration plus an overage log).
+    # Full-sequence runs shared between tables (same configuration): ours = strict B60000_soft (plus an overage
+    # log there); table B C0 (Compactor) = table A compactor_kaba.
     if "B60000_soft" in experiments.get("strict", {}):
-        experiments["compactor"]["A_ours_framesfull"] = {
-            "same_as": "strict/B60000_soft", **experiments["strict"]["B60000_soft"]
-        }
+        for alias in ("A_ours_framesfull", "B_C7_ours_framesfull"):
+            experiments["compactor"][alias] = {"same_as": "strict/B60000_soft", **experiments["strict"]["B60000_soft"]}
+    if "A_compactor_kaba_framesfull" in experiments.get("compactor", {}):
+        experiments["compactor"]["B_C0_compactor_framesfull"] = {
+            "same_as": "compactor/A_compactor_kaba_framesfull", **experiments["compactor"]["A_compactor_kaba_framesfull"]}
 
     # 7-Scenes trajectory runs (full sequence; first-100-frame metrics from the same run).
     pose_root = os.path.abspath(os.path.join(root, "..", "..", "pose_evaluation", "rebuttal"))
