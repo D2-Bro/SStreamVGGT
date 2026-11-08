@@ -287,7 +287,7 @@ def get_args_parser():
     add_projected_norm_histogram_args(parser)
     add_token_overlay_dump_args(parser)
     parser.add_argument("--eval_frame_stride", type=int, default=1, help="Use every Nth frame only when building eval point clouds; inference still uses all frames")
-    parser.add_argument("--eval_stage", choices=("all", "infer"), default="all", help="all runs CPU metrics inline; infer saves point clouds for evaluate_saved.py")
+    parser.add_argument("--eval_stage", choices=("all", "infer", "none"), default="all", help="all runs metrics inline; infer saves point clouds for evaluate_saved.py; none runs inference only (no metrics, e.g. for analysis logs)")
     parser.add_argument("--eval_device", choices=("cpu", "cuda"), default="cpu", help="device for the inline metrics of --eval_stage all: cpu = Open3D legacy ICP + pykdtree (reference), cuda = the same ICP loop and exact NN distances on this rank's GPU")
     parser.add_argument(
         "--recon_eval_mode",
@@ -334,7 +334,7 @@ def main(args):
             "points=direct_predicted_3d, "
             f"metrics={'voxel_centroids' if args.eval_metrics_on_voxels else 'full_points'}"
         )
-    if args.eval_device == "cuda" and args.eval_stage != "all":
+    if args.eval_device == "cuda" and args.eval_stage == "infer":
         raise SystemExit("Error: --eval_device cuda applies to --eval_stage all only")
     if args.eval_stage == "infer" and args.recon_eval_mode != "legacy":
         raise SystemExit("Error: deferred evaluation currently supports --recon_eval_mode legacy only")
@@ -637,7 +637,16 @@ def main(args):
                                 redundancy_log.configure(
                                     osp.join(args.output_dir, name_data, "redundancy"), every=args.redundancy_log_every
                                 )
-                                redundancy_log.set_scene(scene_key)
+                                # One representative per scene: sequences that differ only by number (7-Scenes
+                                # chess/seq-03, chess/seq-05, ...) log only the first one in dataset order.
+                                scene_list = list(getattr(dataset, "scene_list", []) or [])
+                                representative = True
+                                if scene_list:
+                                    base = scene_label.split("/")[0]
+                                    first = next(i for i, name in enumerate(scene_list + [scene_label])
+                                                 if str(name).split("/")[0] == base)
+                                    representative = first >= len(scene_list) or scene_list[first] == scene_label
+                                redundancy_log.set_scene(scene_key if representative else None)
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize(device)
                                 torch.cuda.reset_peak_memory_stats(device)
@@ -735,6 +744,16 @@ def main(args):
                         print(timing_msg)
 
                     summarize_layer_budget_log(layer_budget_log_path)
+                    if args.eval_stage == "none":
+                        print(f"Inference only (--eval_stage none): {timing_scene_id}, FPS: {fps:.3f}")
+                        print(
+                            f"Idx: {timing_scene_id}, inference only, Time: {infer_time}, FPS: {fps}, "
+                            f"PeakMemGB: {peak_mem_gb:.3f}",
+                            file=open(log_file, "a"),
+                        )
+                        del preds, batch, results
+                        torch.cuda.empty_cache()
+                        continue
 
                     # Evaluation
                     print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
@@ -844,7 +863,7 @@ def main(args):
                     json.dump(manifest, f, indent=2)
                 os.replace(manifest_path + ".tmp", manifest_path)
                 print(f"Inference complete. Run: python eval/mv_recon/evaluate_saved.py --output_dir {args.output_dir}")
-            if args.eval_stage == "infer":
+            if args.eval_stage in ("infer", "none"):
                 continue
             # Get depth from pcd and run TSDFusion
             if accelerator.is_main_process:

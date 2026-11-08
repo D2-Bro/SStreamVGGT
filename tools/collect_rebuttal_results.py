@@ -139,16 +139,19 @@ def queue_status(root):
         with open(jobs_file) as f:
             names = [l.split("\t")[0] for l in f if l.strip() and not l.lstrip().startswith("#")]
     done = {}
-    if os.path.exists(os.path.join(qdir, "status.tsv")):
-        with open(os.path.join(qdir, "status.tsv")) as f:
-            for line in f:
-                parts = line.rstrip("\n").split("\t")
-                if len(parts) == 3:
-                    done[parts[0]] = {"gpu": parts[1], "rc": int(parts[2])}
     started = set()
-    if os.path.exists(os.path.join(qdir, "queue.out")):
-        with open(os.path.join(qdir, "queue.out")) as f:
-            started = {m.group(1) for m in re.finditer(r" start (\S+) ", f.read())}
+    # Active queues: queue/ and queue_*/ (except stopped ones, kept only for reference).
+    qdirs = [d for d in [qdir] + sorted(glob.glob(os.path.join(root, "queue_*"))) if "stopped" not in d]
+    for d in qdirs:
+        if os.path.exists(os.path.join(d, "status.tsv")):
+            with open(os.path.join(d, "status.tsv")) as f:
+                for line in f:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) == 3:
+                        done[parts[0]] = {"gpu": parts[1], "rc": int(parts[2])}
+        if os.path.exists(os.path.join(d, "queue.out")):
+            with open(os.path.join(d, "queue.out")) as f:
+                started |= {m.group(1) for m in re.finditer(r" start (\S+) ", f.read())}
     jobs = {}
     for name in names:
         if name in done:

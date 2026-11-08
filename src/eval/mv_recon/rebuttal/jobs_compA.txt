@@ -1,0 +1,2 @@
+compA_compactor_uniform	bash compactor.sh compactor_uniform
+compA_compactor_kaba	bash compactor.sh compactor_kaba

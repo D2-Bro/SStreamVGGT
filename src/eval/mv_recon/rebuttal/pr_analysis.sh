@@ -11,7 +11,8 @@ conditions=("$@"); [ ${#conditions[@]} -eq 0 ] && conditions=(IDC random mean)
 out_root="${OUT_ROOT:-../eval_results/mv_recon/rebuttal/pr_analysis}"
 every="${REDUNDANCY_LOG_EVERY:-10}"
 for cond in "${conditions[@]}"; do
-    extra="--redundancy_log --redundancy_log_every ${every} ${EXTRA_ARGS:-}"
+    # Redundancy statistics only: first 100 frames, one sequence per scene, no reconstruction metrics.
+    extra="--redundancy_log --redundancy_log_every ${every} --eval_stage none ${EXTRA_ARGS:-}"
     # random / mean are not leverage policies: no attention utility and no KABA statistics.
     script="run_final_ablation.sh"; utility=false
     case "$cond" in
@@ -22,7 +23,7 @@ for cond in "${conditions[@]}"; do
     esac
     echo "=== redundancy log: ${cond}"
     (cd "${script_dir}/../../.." && \
-        LEVERAGE_ATTENTION_UTILITY="$utility" EVAL_DEVICE="${EVAL_DEVICE:-cuda}" OUTPUT_DIR="${out_root}/${cond}" \
+        LEVERAGE_ATTENTION_UTILITY="$utility" MAX_FRAMES="${MAX_FRAMES:-100}" OUTPUT_DIR="${out_root}/${cond}" \
         EXTRA_ARGS="$extra" bash "eval/mv_recon/${script}")
 done
 echo "Analyze with (from the repo root; paths assume the default OUT_ROOT):"
