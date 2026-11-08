@@ -46,6 +46,8 @@ eval_device="${EVAL_DEVICE:-cpu}"
 num_processes="${NUM_PROCESSES:-1}"
 # Extra launch.py flags for experiment wrappers (word-split on spaces).
 read -r -a extra_args <<< "${EXTRA_ARGS:-}"
+# CUDA_DETERMINISTIC=false keeps the seeds but drops torch.use_deterministic_algorithms (faster).
+[ "${CUDA_DETERMINISTIC:-true}" = false ] && extra_args=(--no_cuda_deterministic "${extra_args[@]}")
 
 attention_utility_args=()
 attention_utility_suffix=""

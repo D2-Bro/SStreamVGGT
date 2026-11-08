@@ -1,6 +1,9 @@
 import os
 
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+import sys as _sys
+if "--no_cuda_deterministic" not in _sys.argv:
+    # Needed only by torch.use_deterministic_algorithms; it also caps the cuBLAS workspace.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import random
 import sys
@@ -41,7 +44,7 @@ import hashlib
 from pathlib import Path
 import attn_cuda._ext as attn_ext
 
-def seed_everything(seed: int) -> int:
+def seed_everything(seed: int, deterministic: bool = True) -> int:
     seed = int(seed)
 
     random.seed(seed)
@@ -53,12 +56,13 @@ def seed_everything(seed: int) -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True)
 
     print(
-        f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}",
+        f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}, cuda_deterministic={deterministic}",
         flush=True,
     )
 
@@ -261,6 +265,7 @@ def get_args_parser():
     parser.add_argument("--leverage_unobserved_lev_multiplier", type=float, default=None, help="Score of tokens with no attention yet = m * leverage weight * normalised leverage (2 = paper rule, 1 = no doubling); unset keeps the legacy score")
     parser.add_argument("--compactor_ridge", type=float, default=5e-3, help="Ridge on each head's key Gram matrix in the compactor policy")
     parser.add_argument("--compactor_headwise_norm", action="store_true", help="Compactor policy: unit-normalise each head's keys before leverage")
+    parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the random seeds but do not force deterministic CUDA kernels (faster)")
     parser.add_argument("--max_scenes", type=int, default=None, help="Evaluate only the first N scenes of each dataset (smoke tests)")
     parser.add_argument("--strict_budget", action="store_true", help="Reserve the first-frame anchor in every layer before splitting the rest of --budget, so the total cache never exceeds --budget (default: the anchor floor may exceed it)")
     parser.add_argument("--layer_budget_eps", type=float, default=0)
@@ -908,7 +913,7 @@ if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
 
-    seed_everything(args.random_seed)
+    seed_everything(args.random_seed, deterministic=not args.no_cuda_deterministic)
     from streamvggt.utils import ablation_config
     ablation_config.configure(
         attention_source=args.leverage_attention_source,
