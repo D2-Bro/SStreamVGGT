@@ -12,7 +12,7 @@ for budget in "${budgets[@]}"; do
         extra="--log-anchor-budget-overage ${EXTRA_ARGS:-}"
         [ "$mode" = strict ] && extra="$extra --strict_budget"
         echo "=== strict budget: B=${budget} ${mode}"
-        TOTAL_BUDGET="$budget" EVAL_DEVICE="${EVAL_DEVICE:-cuda}" \
+        TOTAL_BUDGET="$budget" EVAL_DEVICE="${EVAL_DEVICE:-cpu}" \
         OUTPUT_DIR="${out_root}/B${budget}_${mode}" EXTRA_ARGS="$extra" \
             bash "${script_dir}/../run_final_early_attention.sh"
     done

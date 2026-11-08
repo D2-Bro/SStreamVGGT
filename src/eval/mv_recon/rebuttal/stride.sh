@@ -13,7 +13,7 @@ for stride in "${strides[@]}"; do
         budget="$which"; name="B${budget}"
         [ "$which" = full ] && { budget="$full_cache_budget"; name="fullcache"; }
         echo "=== stride ${stride}: ${name}"
-        KF_EVERY="$stride" TOTAL_BUDGET="$budget" EVAL_DEVICE="${EVAL_DEVICE:-cuda}" \
+        KF_EVERY="$stride" TOTAL_BUDGET="$budget" EVAL_DEVICE="${EVAL_DEVICE:-cpu}" \
         OUTPUT_DIR="${out_root}/stride${stride}_${name}" EXTRA_ARGS="${EXTRA_ARGS:-}" \
             bash "${script_dir}/../run_final_early_attention.sh"
     done

@@ -48,7 +48,12 @@ python tools/collect_rebuttal_results.py      # from the repo root -> eval_resul
 `results.json` holds, per experiment / run / dataset, the per-scene metrics and means (CD = (Acc + Comp) / 2,
 F1 at 5/10/25 cm, FPS, PeakMemGB, frames), whether the run finished, the strict-budget overage, the redundancy
 medians (pr_analysis), and the queue status. It can be regenerated at any time; unfinished runs are marked
-`"complete": false`. CUDA determinism is off for these runs (`--no_cuda_deterministic`, 2.8 → 4.1 FPS on a 3090).
+`"complete": false`.
+
+Metrics use the CPU evaluation (`EVAL_DEVICE=cpu`, the default of the wrappers). The GPU evaluation is
+exact but uses hash-grid radius search on the full point clouds; on full sequences (~25M points, the same room seen
+500 times) the cells get so dense that it is far slower than the CPU KD-tree. oxford_eval avoids this by voxelizing
+first (0.05 m), which our metric protocol does not do. CUDA determinism is off for these runs (`--no_cuda_deterministic`, 2.8 → 4.1 FPS on a 3090).
 
 ## Experiment 2: strict budget
 

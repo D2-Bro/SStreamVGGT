@@ -75,7 +75,7 @@ for name in "${names[@]}"; do
     echo "=== compactor ${table}: ${name} (max_frames=${frames})"
     run=(env); [ "${DRY_RUN:-0}" = 1 ] && run=(echo env)
     # shellcheck disable=SC2086
-    "${run[@]}" $env_part MAX_FRAMES="$frames" EVAL_DEVICE="${EVAL_DEVICE:-cuda}" \
+    "${run[@]}" $env_part MAX_FRAMES="$frames" EVAL_DEVICE="${EVAL_DEVICE:-cpu}" \
         OUTPUT_DIR="${out_root}/${table}_${name}_frames${frames}" \
         EXTRA_ARGS="${flag_part} ${EXTRA_ARGS:-}" \
         bash eval/mv_recon/run_final_ablation.sh
