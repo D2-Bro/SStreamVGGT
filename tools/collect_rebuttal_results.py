@@ -131,9 +131,58 @@ def run_summary(run_dir):
     }
 
 
+POSE_LINE = re.compile(r"^(?P<dataset>[^-\s]+)-(?P<seq>\S+)\s*\|\s*ATE:\s*(?P<ate>[^,]+),\s*RPE trans:\s*(?P<rpe_trans>[^,]+),"
+                       r"\s*RPE rot:\s*(?P<rpe_rot>\S+)")
+
+
+def pose_run_summary(run_dir):
+    """7-Scenes trajectory run (eval/pose_evaluation/launch.py): per-sequence ATE / RPE, first-K-frame metrics."""
+    seqs = {}
+    for path in sorted(glob.glob(os.path.join(run_dir, "_error_log_[0-9]*.txt"))):
+        with open(path) as f:
+            for line in f:
+                m = POSE_LINE.match(line)
+                if m:
+                    seqs[m["seq"]] = {"sequence": m["seq"], "ate": float(m["ate"]),
+                                      "rpe_trans": float(m["rpe_trans"]), "rpe_rot": float(m["rpe_rot"])}
+    for path in sorted(glob.glob(os.path.join(run_dir, "_inference_timing_[0-9]*.csv"))):
+        with open(path) as f:
+            for row in csv.DictReader(f):
+                if row["sequence"] in seqs:
+                    seqs[row["sequence"]].update(frames=int(row["num_frames"]), fps=float(row["fps"]))
+    prefix = {}
+    for path in sorted(glob.glob(os.path.join(run_dir, "_prefix_metrics_[0-9]*.csv"))):
+        with open(path) as f:
+            for row in csv.DictReader(f):
+                k = int(row["prefix_frames"])
+                prefix.setdefault(k, {})[row["sequence"]] = {
+                    "sequence": row["sequence"], "ate": float(row["ate"]),
+                    "rpe_trans": float(row["rpe_trans"]), "rpe_rot": float(row["rpe_rot"])}
+    final_log = os.path.join(run_dir, "_error_log.txt")
+    complete = os.path.exists(final_log) and "Average ATE" in open(final_log).read()
+    out = {"dir": run_dir, "complete": complete, "dataset": "7scenes", "n_sequences": len(seqs), "expected_sequences": 18}
+    rows = list(seqs.values())
+    if rows:
+        out["mean"] = {m: float(np.mean([r[m] for r in rows if m in r]))
+                       for m in ("ate", "rpe_trans", "rpe_rot", "fps", "frames") if any(m in r for r in rows)}
+    out["sequences"] = rows
+    if prefix:
+        out["first_k_frames"] = {
+            str(k): {"n_sequences": len(v),
+                     "mean": {m: float(np.mean([r[m] for r in v.values()])) for m in ("ate", "rpe_trans", "rpe_rot")},
+                     "sequences": list(v.values())}
+            for k, v in sorted(prefix.items())
+        }
+    extra = overage(run_dir)
+    if extra:
+        out["budget_overage"] = extra
+    return out
+
+
 def queue_status(root):
     qdir = os.path.join(root, "queue")
-    jobs_file = os.path.join(os.path.dirname(__file__), "..", "src", "eval", "mv_recon", "rebuttal", "jobs_all.txt")
+    jobs_name = "jobs_pose.txt" if "pose_evaluation" in root else "jobs_all.txt"
+    jobs_file = os.path.join(os.path.dirname(__file__), "..", "src", "eval", "mv_recon", "rebuttal", jobs_name)
     names = []
     if os.path.exists(jobs_file):
         with open(jobs_file) as f:
@@ -189,6 +238,22 @@ def main():
             "same_as": "strict/B60000_soft", **experiments["strict"]["B60000_soft"]
         }
 
+    # 7-Scenes trajectory runs (full sequence; first-100-frame metrics from the same run).
+    pose_root = os.path.abspath(os.path.join(root, "..", "..", "pose_evaluation", "rebuttal"))
+    trajectory = {}
+    for exp in ("strict", "stride", "compactor"):
+        runs = {}
+        for run_dir in sorted(glob.glob(os.path.join(pose_root, exp, "*"))):
+            if os.path.isdir(run_dir):
+                runs[os.path.basename(run_dir)] = pose_run_summary(run_dir)
+        trajectory[exp] = runs
+    if "B60000_soft" in trajectory["strict"]:
+        for alias in ("A_ours_framesfull", "B_C7_ours_framesfull"):
+            trajectory["compactor"][alias] = {"same_as": "strict/B60000_soft", **trajectory["strict"]["B60000_soft"]}
+    if "A_compactor_kaba_framesfull" in trajectory["compactor"]:
+        trajectory["compactor"]["B_C0_compactor_framesfull"] = {
+            "same_as": "compactor/A_compactor_kaba_framesfull", **trajectory["compactor"]["A_compactor_kaba_framesfull"]}
+
     result = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "root": root,
@@ -200,6 +265,12 @@ def main():
         },
         "queue": queue_status(root),
         "experiments": experiments,
+        "trajectory_7scenes": {
+            "root": pose_root,
+            "queue": queue_status(pose_root),
+            "notes": "full sequence; first_k_frames['100'] = first 100 input frames of the same run (causal streaming)",
+            "experiments": trajectory,
+        },
     }
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)

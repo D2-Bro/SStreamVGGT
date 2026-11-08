@@ -55,6 +55,21 @@ exact but uses hash-grid radius search on the full point clouds; on full sequenc
 500 times) the cells get so dense that it is far slower than the CPU KD-tree. oxford_eval avoids this by voxelizing
 first (0.05 m), which our metric protocol does not do. CUDA determinism is off for these runs (`--no_cuda_deterministic`, 2.8 → 4.1 FPS on a 3090).
 
+## 7-Scenes trajectory evaluation
+
+Every experiment that reports reconstruction metrics is also evaluated on 7-Scenes camera poses with the same
+method configuration (`eval/pose_evaluation/launch.py`, 518 px, frame stride = `KF_EVERY`, ATE / RPE with evo).
+Trajectory runs always use the full sequence; `--pose_eval_prefix_frames 100` also reports the metrics of the first
+100 input frames of the same run (streaming is causal, so this is the 100-frame result).
+
+- `eval/pose_evaluation/run_pose_ablation.sh` / `run_pose_early_attention.sh`: same env variables as the mv_recon scripts.
+- `rebuttal/pose_strict.sh`, `pose_stride.sh`, `pose_compactor.sh`: same configurations as `strict.sh`,
+  `stride.sh`, `compactor.sh`; outputs in `eval_results/pose_evaluation/rebuttal/`.
+- `rebuttal/jobs_pose.txt` (26 runs) with `run_queue_wait.sh` (each worker waits until its GPU is empty).
+  Not run separately because they coincide at full sequence: compactor A ours = compB C7_ours = strict B60000_soft;
+  compB C0_compactor = compactor_kaba.
+- `results.json` → `trajectory_7scenes` (per-sequence ATE / RPE, means, `first_k_frames["100"]`, strict overage).
+
 ## Experiment 2: strict budget
 
 **Issue.** The first-frame anchor (1041 tokens per layer) is never evicted. When KABA gives a layer less than

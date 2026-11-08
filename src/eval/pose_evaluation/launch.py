@@ -1,7 +1,9 @@
 import os
 import subprocess
 import csv
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+import sys as _sys
+if "--no_cuda_deterministic" not in _sys.argv:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import random
 import sys
 from pathlib import Path
@@ -28,7 +30,7 @@ from streamvggt.utils.cache_analysis import (
 from tqdm import tqdm
 import time
 
-def seed_everything(seed: int) -> int:
+def seed_everything(seed: int, deterministic: bool = True) -> int:
     seed = int(seed)
 
     random.seed(seed)
@@ -40,12 +42,13 @@ def seed_everything(seed: int) -> int:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    # torch.use_deterministic_algorithms(True)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        # torch.use_deterministic_algorithms(True)
 
     print(
-        f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}",
+        f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}, cuda_deterministic={deterministic}",
         flush=True,
     )
 
@@ -199,6 +202,16 @@ def get_args_parser():
     )
     parser.add_argument("--layer_budget_alpha", type=float, default=0.7)
     parser.add_argument("--layer_budget_min_tokens", type=int, default=0)
+    # Rebuttal options, same meaning as in eval/mv_recon/launch.py
+    parser.add_argument("--strict_budget", action="store_true", help="Reserve the first-frame anchor in every layer before splitting the rest of --budget (total cache never exceeds --budget)")
+    parser.add_argument("--leverage_attention_source", choices=("causal_history", "noncausal_current"), default="causal_history")
+    parser.add_argument("--leverage_score_norm", choices=("mean", "zscore"), default="mean")
+    parser.add_argument("--leverage_compactor_lambda", type=float, default=0.5)
+    parser.add_argument("--leverage_unobserved_lev_multiplier", type=float, default=None)
+    parser.add_argument("--compactor_ridge", type=float, default=5e-3)
+    parser.add_argument("--compactor_headwise_norm", action="store_true")
+    parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the seeds but do not force deterministic CUDA kernels")
+    parser.add_argument("--pose_eval_prefix_frames", type=int, nargs="*", default=[], help="Also report ATE/RPE on the first K input frames of each sequence (streaming is causal, so this equals a K-frame run); e.g. 100")
     parser.add_argument("--layer_budget_eps", type=float, default=0)
     parser.add_argument("--layer_budget_value_gamma", type=float, default=0.7)
     parser.add_argument("--layer_budget_value_norm_type", type=str, default="mean", choices=("mean", "rms"), help="Layer value-norm prior type for value_weighted_leverage_pr budget allocation")
@@ -395,6 +408,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             layer_budget_norm_source=args.layer_budget_norm_source,
                             layer_budget_alpha=args.layer_budget_alpha,
                             layer_budget_min_tokens=args.layer_budget_min_tokens,
+                            layer_budget_strict=args.strict_budget,
                             layer_budget_eps=args.layer_budget_eps,
                             layer_budget_log_path=layer_budget_log_path,
                             anchor_budget_overage_log_path=anchor_budget_overage_log_path,
@@ -521,6 +535,25 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 rpe_trans_list.append(rpe_trans)
                 rpe_rot_list.append(rpe_rot)
 
+                # Prefix metrics: the first K frames of this full-sequence run (causal streaming = a K-frame run).
+                if gt_traj is not None and args.pose_eval_prefix_frames:
+                    prefix_csv = os.path.join(save_dir, f"_prefix_metrics_{distributed_state.process_index}.csv")
+                    new_file = not os.path.exists(prefix_csv)
+                    with open(prefix_csv, "a", newline="") as prefix_file:
+                        writer = csv.writer(prefix_file)
+                        if new_file:
+                            writer.writerow(["dataset", "sequence", "prefix_frames", "ate", "rpe_trans", "rpe_rot"])
+                        for k in args.pose_eval_prefix_frames:
+                            if k >= len(filelist):
+                                continue
+                            p_ate, p_rpe_t, p_rpe_r = eval_metrics(
+                                [np.asarray(x)[:k] for x in pred_traj],
+                                [np.asarray(x)[:k] for x in gt_traj],
+                                seq=seq,
+                                filename=f"{save_dir}/{seq}_eval_metric_first{k}.txt",
+                            )
+                            writer.writerow([args.eval_dataset, seq, k, p_ate, p_rpe_t, p_rpe_r])
+
                 # Write to error log after each sequence
                 with open(error_log_path, "a") as f:
                     f.write(
@@ -587,6 +620,25 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
         with open(os.path.join(save_dir, "inference_timing_summary.txt"), "w") as f:
             f.write(timing_summary + "\n")
 
+        prefix_rows = []
+        for rank in range(distributed_state.num_processes):
+            prefix_csv = os.path.join(save_dir, f"_prefix_metrics_{rank}.csv")
+            if os.path.exists(prefix_csv):
+                with open(prefix_csv, newline="") as prefix_file:
+                    prefix_rows.extend(csv.DictReader(prefix_file))
+        prefix_summary = []
+        for k in sorted({int(r["prefix_frames"]) for r in prefix_rows}):
+            rows_k = [r for r in prefix_rows if int(r["prefix_frames"]) == k]
+            prefix_summary.append(
+                f"First {k} frames ({len(rows_k)} sequences): Average ATE: "
+                f"{np.mean([float(r['ate']) for r in rows_k]):.5f}, Average RPE trans: "
+                f"{np.mean([float(r['rpe_trans']) for r in rows_k]):.5f}, Average RPE rot: "
+                f"{np.mean([float(r['rpe_rot']) for r in rows_k]):.5f}"
+            )
+        if prefix_summary:
+            with open(os.path.join(save_dir, "prefix_metrics_summary.txt"), "w") as f:
+                f.write("\n".join(prefix_summary) + "\n")
+
         # Copy the error log from each process to the main error log
         with open(f"{save_dir}/_error_log.txt", "a") as f:
             for i in range(distributed_state.num_processes):
@@ -606,7 +658,18 @@ if __name__ == "__main__":
     args = get_args_parser()
     args = args.parse_args()
 
-    seed_everything(args.random_seed)
+    seed_everything(args.random_seed, deterministic=not args.no_cuda_deterministic)
+    from streamvggt.utils import ablation_config
+    ablation_config.configure(
+        attention_source=args.leverage_attention_source,
+        score_norm=args.leverage_score_norm,
+        compactor_lambda=args.leverage_compactor_lambda,
+        unobserved_lev_multiplier=args.leverage_unobserved_lev_multiplier,
+        compactor_ridge=args.compactor_ridge,
+        compactor_headwise_norm=args.compactor_headwise_norm,
+    )
+    if args.eviction_policy == "compactor" and (args.leverage_conf_gate or args.leverage_attention_utility):
+        raise SystemExit("Error: --eviction_policy compactor runs without --leverage_conf_gate and --leverage_attention_utility")
 
     from streamvggt.utils.load_fn import load_and_preprocess_images 
     from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
