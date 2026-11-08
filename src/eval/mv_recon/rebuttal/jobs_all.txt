@@ -1,0 +1,33 @@
+# Rebuttal experiments, longest first. Run: GPUS="0 1 2 3 5 6" bash run_queue.sh jobs_all.txt
+# Compactor table A 'ours' = strict B60000_soft (same configuration plus an overage log), not run twice.
+pr_IDC	bash pr_analysis.sh IDC
+pr_random	bash pr_analysis.sh random
+pr_mean	bash pr_analysis.sh mean
+compA_compactor_uniform	bash compactor.sh compactor_uniform
+compA_compactor_kaba	bash compactor.sh compactor_kaba
+strict_B60000_soft	MODES=soft bash strict.sh 60000
+strict_B60000_strict	MODES=strict bash strict.sh 60000
+strict_B30000_soft	MODES=soft bash strict.sh 30000
+strict_B30000_strict	MODES=strict bash strict.sh 30000
+compB_C0_compactor	bash compactor.sh C0_compactor
+compB_C1_headnorm	bash compactor.sh C1_headnorm
+compB_C2_concat	bash compactor.sh C2_concat
+compB_C3_history	bash compactor.sh C3_history
+compB_C4_freeze	bash compactor.sh C4_freeze
+compB_C5_meannorm	bash compactor.sh C5_meannorm
+compB_C6_double	bash compactor.sh C6_double
+compB_C7_ours	bash compactor.sh C7_ours
+compB_ours_wo_history	bash compactor.sh ours_wo_history
+compB_ours_wo_headnorm	bash compactor.sh ours_wo_headnorm
+compB_ours_wo_freeze	bash compactor.sh ours_wo_freeze
+compB_ours_wo_meannorm	bash compactor.sh ours_wo_meannorm
+compB_ours_wo_double	bash compactor.sh ours_wo_double
+stride20_60000	BUDGETS=60000 bash stride.sh 20
+stride20_30000	BUDGETS=30000 bash stride.sh 20
+stride20_full	BUDGETS=full bash stride.sh 20
+stride50_60000	BUDGETS=60000 bash stride.sh 50
+stride50_30000	BUDGETS=30000 bash stride.sh 50
+stride50_full	BUDGETS=full bash stride.sh 50
+stride100_60000	BUDGETS=60000 bash stride.sh 100
+stride100_30000	BUDGETS=30000 bash stride.sh 100
+stride100_full	BUDGETS=full bash stride.sh 100
