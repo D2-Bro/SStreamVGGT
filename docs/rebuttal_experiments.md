@@ -88,6 +88,11 @@ soft runs log the overage to `<output>/<dataset>/<scene>/anchor_budget_overage.c
 
 **Report.** CD / F1, actual total cache (mean / max, % of B), share of steps over budget, PeakMemGB.
 
+Per-layer breakdown: `--log-anchor-budget-overage` also writes `anchor_budget_overage_layers.csv` (step, layer,
+capacity, assigned budget, anchor tokens, anchor deficit, retained tokens). The soft runs were repeated with it,
+inference only (`--eval_stage none`), in `strict_layers/B{60000,30000}_soft`; `results.json` summarises per layer
+how often the budget falls below the anchor and how often a layer keeps only the anchor.
+
 Smoke test (30 frames, B = 30K, soft): peak overage about 4.1K tokens (13.6% over the budget).
 
 ---

@@ -1127,10 +1127,17 @@ class Aggregator(nn.Module):
         self, log_path, step_idx, total_budget, budgets, capacities, score_only
     ):
         anchor_deficit = 0
+        layer_rows = []
         for layer, block in enumerate(self.global_blocks):
             capacity = max(int(capacities.get(layer, 0)), 0)
             anchor_tokens = min(max(int(block.attn.num_anchor_tokens), 0), capacity)
-            anchor_deficit += max(0, anchor_tokens - int(budgets[layer]))
+            budget = int(budgets[layer])
+            deficit = max(0, anchor_tokens - budget)
+            anchor_deficit += deficit
+            # Tokens this layer actually keeps after eviction: everything if it fits, else the larger of the
+            # assigned budget and the never-evicted anchor.
+            retained = capacity if capacity <= budget else max(budget, anchor_tokens)
+            layer_rows.append((layer, capacity, budget, anchor_tokens, deficit, retained))
 
         assigned_budget = sum(int(budget) for budget in budgets)
         total_budget = max(int(total_budget), 0)
@@ -1154,6 +1161,14 @@ class Aggregator(nn.Module):
                 f"{global_overage},{self._anchor_budget_overage_cumulative},"
                 f"{self._anchor_budget_overage_peak},{int(bool(score_only))}\n"
             )
+        # Per-layer breakdown next to it: <name>_layers.csv
+        layers_path = os.path.splitext(log_path)[0] + "_layers.csv"
+        write_layer_header = not os.path.exists(layers_path) or os.path.getsize(layers_path) == 0
+        with open(layers_path, "a", encoding="utf-8") as f:
+            if write_layer_header:
+                f.write("step,layer,capacity,assigned_budget,anchor_tokens,anchor_deficit_tokens,retained_tokens\n")
+            for layer, capacity, budget, anchor_tokens, deficit, retained in layer_rows:
+                f.write(f"{int(step_idx)},{layer},{capacity},{budget},{anchor_tokens},{deficit},{retained}\n")
 
     def _calculate_dynamic_budgets(
         self,

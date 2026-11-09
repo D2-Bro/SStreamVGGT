@@ -74,12 +74,38 @@ def overage(dataset_dir):
         })
     if not out:
         return None
+    layers = overage_per_layer(dataset_dir)
     return {
+        **({"per_layer": layers} if layers else {}),
         "scenes": out,
         "max_overage_tokens": max(s["max_overage_tokens"] for s in out),
         "max_overage_pct": max(s["max_overage_pct"] for s in out),
         "share_of_steps_over_budget": float(sum(s["steps_over_budget"] for s in out) / sum(s["steps"] for s in out)),
     }
+
+
+def overage_per_layer(dataset_dir):
+    """From anchor_budget_overage_layers.csv (all scenes and steps): per layer, how often and by how much the
+    assigned budget falls below the never-evicted anchor, and how often the layer keeps only the anchor."""
+    paths = sorted(glob.glob(os.path.join(dataset_dir, "*", "anchor_budget_overage_layers.csv")))
+    if not paths:
+        return None
+    import pandas as pd
+    df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
+    df = df[df["capacity"] > df["anchor_tokens"]]  # steps where eviction could keep more than the anchor
+    out = []
+    for layer, sub in df.groupby("layer"):
+        out.append({
+            "layer": int(layer),
+            "steps": int(len(sub)),
+            "mean_assigned_budget": float(sub["assigned_budget"].mean()),
+            "mean_retained_tokens": float(sub["retained_tokens"].mean()),
+            "share_steps_budget_below_anchor": float((sub["anchor_deficit_tokens"] > 0).mean()),
+            "mean_anchor_deficit_tokens": float(sub["anchor_deficit_tokens"].mean()),
+            "max_anchor_deficit_tokens": int(sub["anchor_deficit_tokens"].max()),
+            "share_steps_anchor_only": float((sub["retained_tokens"] <= sub["anchor_tokens"]).mean()),
+        })
+    return out
 
 
 def redundancy(dataset_dir, erank_min=2.0, cos_max=0.9):
@@ -116,13 +142,13 @@ def run_summary(run_dir):
             entry["mean"] = {m: float(np.mean([s[m] for s in scenes if m in s]))
                              for m in METRICS if any(m in s for s in scenes)}
         entry["scenes"] = scenes
-        extra = overage(dataset_dir)
-        if extra:
-            entry["budget_overage"] = extra
-        extra = redundancy(dataset_dir)
-        if extra:
-            entry["redundancy"] = extra
-        if scenes or extra:
+        over = overage(dataset_dir)
+        if over:
+            entry["budget_overage"] = over
+        red = redundancy(dataset_dir)
+        if red:
+            entry["redundancy"] = red
+        if scenes or over or red:
             datasets[name] = entry
     return {
         "dir": run_dir,
@@ -234,7 +260,7 @@ def main():
     out_path = args.out or os.path.join(root, "results.json")
 
     experiments = {}
-    for exp in ("strict", "stride", "pr_analysis", "compactor"):
+    for exp in ("strict", "strict_layers", "stride", "pr_analysis", "compactor"):
         runs = {}
         for run_dir in sorted(glob.glob(os.path.join(root, exp, "*"))):
             if os.path.isdir(run_dir) and not os.path.basename(run_dir).startswith("summary"):
