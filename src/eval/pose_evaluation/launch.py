@@ -203,6 +203,7 @@ def get_args_parser():
     parser.add_argument("--layer_budget_alpha", type=float, default=0.7)
     parser.add_argument("--layer_budget_min_tokens", type=int, default=0)
     # Rebuttal options, same meaning as in eval/mv_recon/launch.py
+    parser.add_argument("--strict_budget_mode", choices=("reserve", "redistribute"), default="reserve", help="With --strict_budget: reserve = anchor in every layer first, the rest by KABA weights; redistribute = full budget by KABA weights, layers below the anchor lifted to it and the overage taken from the others by weight")
     parser.add_argument("--strict_budget", action="store_true", help="Reserve the first-frame anchor in every layer before splitting the rest of --budget (total cache never exceeds --budget)")
     parser.add_argument("--leverage_attention_source", choices=("causal_history", "noncausal_current"), default="causal_history")
     parser.add_argument("--leverage_score_norm", choices=("mean", "zscore"), default="mean")
@@ -409,6 +410,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             layer_budget_alpha=args.layer_budget_alpha,
                             layer_budget_min_tokens=args.layer_budget_min_tokens,
                             layer_budget_strict=args.strict_budget,
+                            layer_budget_strict_mode=args.strict_budget_mode,
                             layer_budget_eps=args.layer_budget_eps,
                             layer_budget_log_path=layer_budget_log_path,
                             anchor_budget_overage_log_path=anchor_budget_overage_log_path,

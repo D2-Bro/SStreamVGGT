@@ -1,0 +1,7 @@
+# strict budget, redistribute mode (recon full sequence, then 7-Scenes trajectory)
+strict_B30000_redistribute	bash strict_redistribute.sh 30000
+strict_B60000_redistribute	bash strict_redistribute.sh 60000
+strict_B200000_redistribute	bash strict_redistribute.sh 200000
+pose_strict_B30000_redistribute	bash pose_strict_redistribute.sh 30000
+pose_strict_B60000_redistribute	bash pose_strict_redistribute.sh 60000
+pose_strict_B200000_redistribute	bash pose_strict_redistribute.sh 200000

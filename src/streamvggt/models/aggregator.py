@@ -20,6 +20,7 @@ from streamvggt.layers.eviction import (
     VALID_LAYER_BUDGET_STRATEGIES,
     VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES,
     _allocate_layer_budgets_from_scores,
+    _redistribute_anchor_deficit,
     _combine_value_weighted_leverage_pr_scores,
 )
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
@@ -292,6 +293,7 @@ class Aggregator(nn.Module):
         anchor_budget_overage_log_path: Optional[str] = None,
         layer_budget_score_only: bool = False,
         layer_budget_strict: bool = False,
+        layer_budget_strict_mode: str = "reserve",
         cache_write_current_frame: bool = True,
         cache_evict_current_frame: bool = True,
     ) -> Tuple[List[torch.Tensor], int]:
@@ -416,6 +418,7 @@ class Aggregator(nn.Module):
                 torch.cuda.synchronize(images.device)
             dynamic_budget_start = time.perf_counter()
         allocation_min_tokens = int(layer_budget_min_tokens)
+        anchor_redistribute_tokens = None
         if layer_budget_strict:
             # Strict budget: reserve the first-frame anchor (P tokens, never evicted) in every layer first and
             # split only the remainder, so the anchor floor in attention.eviction can never push the total over
@@ -426,7 +429,14 @@ class Aggregator(nn.Module):
                     f"--strict_budget needs total_budget >= depth * tokens_per_frame = {self.depth} * {P} = "
                     f"{anchor_reserve}, got {int(total_budget)}"
                 )
-            allocation_min_tokens = max(allocation_min_tokens, int(P))
+            if layer_budget_strict_mode == "reserve":
+                allocation_min_tokens = max(allocation_min_tokens, int(P))
+            elif layer_budget_strict_mode == "redistribute":
+                # Allocate the full budget by KABA weights first; layers below the anchor are lifted to it and
+                # the overage is taken from the others by weight (inside _calculate_dynamic_budgets).
+                anchor_redistribute_tokens = int(P)
+            else:
+                raise ValueError(f"layer_budget_strict_mode must be reserve or redistribute, got {layer_budget_strict_mode!r}")
         current_budgets = self._calculate_dynamic_budgets(
             total_budget,
             layer_budget_strategy=layer_budget_strategy,
@@ -434,6 +444,7 @@ class Aggregator(nn.Module):
             layer_budget_value_norm_type=layer_budget_value_norm_type,
             layer_budget_alpha=layer_budget_alpha,
             layer_budget_min_tokens=allocation_min_tokens,
+            anchor_redistribute_tokens=anchor_redistribute_tokens,
             layer_budget_eps=layer_budget_eps,
             layer_budget_log_path=layer_budget_log_path,
             layer_budget_step_idx=past_frame_idx,
@@ -1190,6 +1201,7 @@ class Aggregator(nn.Module):
         layer_budget_score_only: bool = False,
         past_key_values=None,
         current_token_count: int = 0,
+        anchor_redistribute_tokens: Optional[int] = None,
     ):
 
         with torch.no_grad():
@@ -1237,6 +1249,16 @@ class Aggregator(nn.Module):
                 eps=layer_budget_eps,
                 return_debug=True,
             )
+            if anchor_redistribute_tokens is not None:
+                budget_dict = _redistribute_anchor_deficit(
+                    budget_dict,
+                    details.get("weights", {}),
+                    capacities,
+                    int(anchor_redistribute_tokens),
+                    int(total_budget),
+                )
+                details["assigned_budget"] = sum(budget_dict.values())
+                details["events"].append("strict_redistribute_anchor_deficit")
             if layer_budget_score_only:
                 details["events"].append("score_only_shadow")
             budgets = torch.zeros_like(self.last_scores, dtype=torch.int32)

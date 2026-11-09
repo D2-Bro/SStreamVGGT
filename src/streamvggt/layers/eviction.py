@@ -285,6 +285,55 @@ def _allocate_layer_budgets_from_scores(
     return (budgets, details) if return_debug else budgets
 
 
+def _redistribute_anchor_deficit(
+    budgets: Dict[int, int],
+    weights: Dict[int, float],
+    capacities: Dict[int, int],
+    anchor_tokens: int,
+    total_budget: int,
+) -> Dict[int, int]:
+    """Strict budget, "redistribute" mode: keep the KABA allocation of ``total_budget`` but lift every layer whose
+    budget is below the never-evicted anchor up to the anchor, and take the resulting overage from the other
+    layers in proportion to their KABA weights (repeating while that pushes more layers below the anchor).
+
+    Discounting D from the free layers in proportion to their weights is the same as giving them
+    ``total - sum(fixed floors)`` in proportion to their weights, which is what is computed here.
+    Returns integer budgets summing to at most ``total_budget`` (and at most the total capacity).
+    """
+    active = [layer for layer, cap in capacities.items() if int(cap) > 0]
+    out = {layer: int(budgets.get(layer, 0)) for layer in capacities}
+    if not active:
+        return out
+    floors = {layer: min(int(anchor_tokens), int(capacities[layer])) for layer in active}
+    total = min(int(total_budget), sum(int(capacities[layer]) for layer in active))
+    if sum(floors.values()) > total:
+        raise ValueError(
+            f"Strict budget: anchors need {sum(floors.values())} tokens, more than the budget {total}"
+        )
+    fixed = set()
+    while True:
+        newly_fixed = {layer for layer in active if layer not in fixed and out[layer] < floors[layer]}
+        if not newly_fixed and fixed:
+            break
+        fixed |= newly_fixed
+        for layer in fixed:
+            out[layer] = floors[layer]
+        free = [layer for layer in active if layer not in fixed]
+        if not free:
+            break
+        remaining = total - sum(floors[layer] for layer in fixed)
+        alloc = _integer_allocate_by_weights(
+            {layer: int(capacities[layer]) for layer in free},
+            {layer: float(weights.get(layer, 1.0)) for layer in free},
+            remaining,
+        )
+        for layer in free:
+            out[layer] = int(alloc.get(layer, 0))
+        if not newly_fixed:
+            break
+    return out
+
+
 @dataclass
 class EvictionResult:
     """Indices and scores produced by a head-wise eviction policy."""

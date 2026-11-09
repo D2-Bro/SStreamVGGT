@@ -79,6 +79,13 @@ that, the anchor floor keeps all 1041, so the total cache exceeds the global bud
 weights (implemented with the allocator's existing `min_tokens` floor, `aggregator.py` before
 `_calculate_dynamic_budgets`). The total is then at most B. B below 24·1041 = 24,984 is rejected.
 
+Second strict variant, `--strict_budget_mode redistribute`: allocate the full B by KABA weights as usual, lift every
+layer below the anchor to the anchor, and take the resulting overage from the other layers in proportion to their
+KABA weights (repeated while that pushes more layers below the anchor; `eviction._redistribute_anchor_deficit`).
+Low-weight layers keep only the anchor, the KABA shares of the others are scaled down to fit B. Default mode is
+`reserve` (the anchor first, the rest by weights). Run: `bash strict_redistribute.sh 30000 60000 200000` and
+`pose_strict_redistribute.sh`; jobs in `jobs_strict_redistribute.txt`. Test: `tools/test_strict_redistribute.py`.
+
 **Run.**
 ```bash
 cd src/eval/mv_recon/rebuttal && bash strict.sh            # B = 30000, 60000 × {soft, strict}
