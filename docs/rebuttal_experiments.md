@@ -193,6 +193,12 @@ right-sketched 256-d matrix Z IDC computes leverage and psi on; cosine on its no
 IDC only, at 100 frames (every 10 steps, `pr_sketch_frames100/`) and full sequence (every 25 steps,
 `pr_sketch_framesfull/`); comparison in `pr_sketch_summary/`.
 
+Local density: for tau in 0.7 / 0.8 / 0.9, each token's number of other tokens (same set) with cosine > tau;
+per step/layer/set the mean, median, p90, max and the share of tokens with >= 1 and >= 10 such neighbours
+(`dens{tau}_*`). On candidate rows also the density (within the candidate set) of the kept vs the evicted tokens
+and the Spearman correlation between a token's leverage and its density (`spearman_lev_dens{tau}`). Runs:
+`pr_density_frames100/`, `pr_density_framesfull/` (IDC; queue_extra), summary in `pr_density_summary/`.
+
 Outputs: `summary.csv` (medians, p90, share of degenerate cases: erank < 2 or mean cosine > 0.9),
 `per_layer_median.csv`, per-layer boxplots, and a psi/N vs effective rank scatter.
 

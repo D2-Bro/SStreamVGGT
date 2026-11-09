@@ -20,7 +20,8 @@ from typing import Optional, Sequence
 
 import torch
 
-_CONFIG = {"dir": None, "every": 10, "taus": (0.5, 0.7, 0.9), "scene": None, "path": None}
+_CONFIG = {"dir": None, "every": 10, "taus": (0.5, 0.7, 0.8, 0.9), "scene": None, "path": None}
+DENSITY_TAUS = (0.7, 0.8, 0.9)  # local density: per-token count of other tokens with cosine > tau
 
 FIELDS_BASE = [
     "step", "layer", "space", "set", "n_tokens", "head_shared", "psi", "psi_over_n", "rank", "erank", "erank_over_n",
@@ -47,9 +48,30 @@ def enabled(step_idx: Optional[int]) -> bool:
     return _CONFIG["path"] is not None and step_idx is not None and int(step_idx) % _CONFIG["every"] == 0
 
 
+def _density_fields():
+    out = []
+    for t in DENSITY_TAUS:
+        k = f"dens{t:g}"
+        out += [f"{k}_mean", f"{k}_p50", f"{k}_p90", f"{k}_max", f"{k}_ge1", f"{k}_ge10",
+                # candidates rows only: density (within the candidate set) of the kept vs the evicted tokens,
+                # and the Spearman correlation between a token's leverage and its density
+                f"{k}_kept_mean", f"{k}_evicted_mean", f"{k}_kept_ge1", f"{k}_evicted_ge1", f"spearman_lev_{k}"]
+    return out
+
+
 def _fields():
     taus = [f"frac_cos_gt_{t:g}" for t in _CONFIG["taus"]]
-    return FIELDS_BASE + taus + ["nn_cos_mean", "nn_cos_p10", "nn_cos_p50", "nn_cos_p90"]
+    return FIELDS_BASE + taus + ["nn_cos_mean", "nn_cos_p10", "nn_cos_p50", "nn_cos_p90"] + _density_fields()
+
+
+def _summarize_density(counts: torch.Tensor, prefix: str) -> dict:
+    if counts.numel() == 0:
+        return {}
+    c = counts.double()
+    q = torch.quantile(c, torch.tensor([0.5, 0.9], device=c.device, dtype=c.dtype))
+    return {f"{prefix}_mean": float(c.mean()), f"{prefix}_p50": float(q[0]), f"{prefix}_p90": float(q[1]),
+            f"{prefix}_max": float(c.max()), f"{prefix}_ge1": float((c >= 1).double().mean()),
+            f"{prefix}_ge10": float((c >= 10).double().mean())}
 
 
 def key_features(k_tokens: torch.Tensor) -> torch.Tensor:
@@ -60,7 +82,7 @@ def key_features(k_tokens: torch.Tensor) -> torch.Tensor:
 
 
 def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096,
-                   spectral: Optional[torch.Tensor] = None) -> dict:
+                   spectral: Optional[torch.Tensor] = None, return_tokens: bool = False):
     """Statistics of a set of unit rows x [N, d] (float64). Rank, effective rank, stable rank and psi use
     ``spectral`` (same rows, any scale; default x), e.g. the raw sketched matrix IDC computes leverage on."""
     n = x.shape[0]
@@ -88,11 +110,14 @@ def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096,
     counts = torch.zeros(len(taus), dtype=torch.float64, device=x.device)
     nn = torch.empty(n, dtype=torch.float64, device=x.device)
     taus_t = torch.tensor(list(taus), dtype=torch.float64, device=x.device)
+    dens_t = torch.tensor(list(DENSITY_TAUS), dtype=torch.float64, device=x.device)
+    density = torch.zeros(len(DENSITY_TAUS), n, dtype=torch.int64, device=x.device)
     for i in range(0, n, chunk):
         c = x[i:i + chunk] @ x.T
         idx = torch.arange(i, min(i + chunk, n), device=x.device)
         c[idx - i, idx] = -2.0  # drop self-pairs
         counts += (c.unsqueeze(0) > taus_t.view(-1, 1, 1)).sum(dim=(1, 2)).double()
+        density[:, i:i + chunk] = (c.unsqueeze(0) > dens_t.view(-1, 1, 1)).sum(dim=2)
         nn[i:i + chunk] = c.max(dim=1).values
     pairs = n * (n - 1)
     for t, cnt in zip(taus, counts.tolist()):
@@ -101,6 +126,10 @@ def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096,
         q = torch.quantile(nn.float(), torch.tensor([0.1, 0.5, 0.9], device=x.device))
         out.update(nn_cos_mean=float(nn.mean()), nn_cos_p10=float(q[0]), nn_cos_p50=float(q[1]),
                    nn_cos_p90=float(q[2]))
+    for j, t in enumerate(DENSITY_TAUS):
+        out.update(_summarize_density(density[j], f"dens{t:g}"))
+    if return_tokens:
+        return out, {"density": density, "leverage": lev}
     return out
 
 
@@ -133,11 +162,26 @@ def record(k: torch.Tensor, num_anchor_tokens: int, kept_candidate_indices: torc
         z = sketch_features[0].double()
         spaces.append(("sketch", torch.nn.functional.normalize(z, p=2, dim=-1), z))
     rows = []
+    keep_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
+    keep_mask[kept[0]] = True
     for space, feats, spectral in spaces:
         for name, idx in (("candidates", None), ("retained", kept[0])):
             f = feats if idx is None else feats[idx]
             sp = None if spectral is None else (spectral if idx is None else spectral[idx])
-            stats = set_statistics(f, _CONFIG["taus"], spectral=sp)
+            stats, tokens = set_statistics(f, _CONFIG["taus"], spectral=sp, return_tokens=True)
+            if idx is None:
+                from scipy.stats import spearmanr
+                lev = tokens["leverage"].cpu().numpy()
+                for j, t in enumerate(DENSITY_TAUS):
+                    d = tokens["density"][j]
+                    k = f"dens{t:g}"
+                    for part, mask in (("kept", keep_mask), ("evicted", ~keep_mask)):
+                        if bool(mask.any()):
+                            stats[f"{k}_{part}_mean"] = float(d[mask].double().mean())
+                            stats[f"{k}_{part}_ge1"] = float((d[mask] >= 1).double().mean())
+                    dn = d.cpu().numpy()
+                    if dn.std() > 0 and lev.std() > 0:
+                        stats[f"spearman_lev_{k}"] = float(spearmanr(lev, dn).correlation)
             stats.update(step=int(step_idx), layer=int(layer_id) if layer_id is not None else -1, space=space,
                          set=name, head_shared=int(head_shared))
             rows.append(stats)

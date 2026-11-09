@@ -30,8 +30,13 @@ LINE = re.compile(
 EXPECTED_SCENES = {"7scenes": 18, "NRGBD": 9}
 METRICS = ["cd", "acc", "comp", "acc_med", "comp_med", "f1_5cm", "f1_10cm", "f1_25cm", "fps", "time",
            "peak_mem_gb", "frames"]
-REDUNDANCY_METRICS = ["n_tokens", "mean_cos", "frac_cos_gt_0.5", "frac_cos_gt_0.7", "frac_cos_gt_0.9",
-                      "nn_cos_mean", "erank", "erank_over_n", "stable_rank", "psi_over_n"]
+REDUNDANCY_METRICS = ["n_tokens", "mean_cos", "frac_cos_gt_0.5", "frac_cos_gt_0.7", "frac_cos_gt_0.8",
+                      "frac_cos_gt_0.9", "nn_cos_mean", "erank", "erank_over_n", "stable_rank", "psi_over_n"]
+# local density: per-token number of other tokens with cosine > tau (summaries per step/layer/set)
+REDUNDANCY_METRICS += [f"dens{t}_{k}" for t in ("0.7", "0.8", "0.9")
+                       for k in ("mean", "p50", "p90", "max", "ge1", "ge10", "kept_mean", "evicted_mean",
+                                 "kept_ge1", "evicted_ge1")]
+REDUNDANCY_METRICS += [f"spearman_lev_dens{t}" for t in ("0.7", "0.8", "0.9")]
 
 
 def parse_scenes(dataset_dir):
@@ -121,9 +126,10 @@ def redundancy(dataset_dir, erank_min=2.0, cos_max=0.9):
         # key: "candidates"/"retained" for the 1024-d space (as before), "sketch_candidates"/... for IDC's sketch
         key = set_name if space == "full" else f"{space}_{set_name}"
         out[key] = {
-            "median": {m: float(sub[m].median()) for m in REDUNDANCY_METRICS if m in sub},
-            "p10": {m: float(sub[m].quantile(0.1)) for m in REDUNDANCY_METRICS if m in sub},
-            "p90": {m: float(sub[m].quantile(0.9)) for m in REDUNDANCY_METRICS if m in sub},
+            "median": {m: float(sub[m].median()) for m in REDUNDANCY_METRICS if m in sub and sub[m].notna().any()},
+            "mean": {m: float(sub[m].mean()) for m in REDUNDANCY_METRICS if m in sub and sub[m].notna().any()},
+            "p10": {m: float(sub[m].quantile(0.1)) for m in REDUNDANCY_METRICS if m in sub and sub[m].notna().any()},
+            "p90": {m: float(sub[m].quantile(0.9)) for m in REDUNDANCY_METRICS if m in sub and sub[m].notna().any()},
             "min_erank": float(sub["erank"].min()),
             "degenerate_share": float(((sub["erank"] < erank_min) | (sub["mean_cos"] > cos_max)).mean()),
         }
@@ -264,7 +270,7 @@ def main():
 
     experiments = {}
     for exp in ("strict", "strict_layers", "stride", "pr_analysis", "pr_sketch_frames100", "pr_sketch_framesfull",
-                "compactor"):
+                "pr_density_frames100", "pr_density_framesfull", "compactor"):
         runs = {}
         for run_dir in sorted(glob.glob(os.path.join(root, exp, "*"))):
             if os.path.isdir(run_dir) and not os.path.basename(run_dir).startswith("summary"):

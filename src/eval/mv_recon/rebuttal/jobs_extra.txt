@@ -1,0 +1,5 @@
+# Extra jobs in their own queue (queue_extra): local density runs, and compactor_kaba_sk16 which the
+# redistribute queue lost (a worker that knew only 6 jobs consumed its index on exit).
+pr_density_frames100	MAX_FRAMES=100 REDUNDANCY_LOG_EVERY=10 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_density_frames100 bash pr_analysis.sh IDC
+pr_density_framesfull	MAX_FRAMES=full REDUNDANCY_LOG_EVERY=25 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_density_framesfull bash pr_analysis.sh IDC
+compA_compactor_kaba_sk16	bash compactor.sh compactor_kaba_sk16

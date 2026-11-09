@@ -21,6 +21,9 @@ import pandas as pd
 
 METRICS = ["mean_cos", "frac_cos_gt_0.5", "frac_cos_gt_0.7", "frac_cos_gt_0.9", "nn_cos_mean", "erank",
            "erank_over_n", "stable_rank", "psi_over_n", "n_tokens"]
+DENSITY = [f"dens{t}_{k}" for t in ("0.7", "0.8", "0.9")
+           for k in ("mean", "p50", "p90", "ge1", "ge10", "kept_mean", "evicted_mean")] + \
+          [f"spearman_lev_dens{t}" for t in ("0.7", "0.8", "0.9")]
 
 
 def load(run_dir):
@@ -42,8 +45,8 @@ def summary_table(df, erank_min, cos_max):
     rows = []
     for (cond, space, set_name), sub in df.groupby(["condition", "space", "set"], sort=False):
         row = {"condition": cond, "space": space, "set": set_name, "rows": len(sub)}
-        for m in METRICS:
-            if m in sub:
+        for m in METRICS + DENSITY:
+            if m in sub and sub[m].notna().any():
                 row[f"{m}_median"] = sub[m].median()
                 row[f"{m}_p90"] = sub[m].quantile(0.9)
         row["degenerate_share"] = float(((sub["erank"] < erank_min) | (sub["mean_cos"] > cos_max)).mean())
