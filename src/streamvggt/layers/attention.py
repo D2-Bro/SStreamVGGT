@@ -592,7 +592,10 @@ class Attention(nn.Module):
                 "attention utility (their per-token state assumes one token set per layer)"
             )
         if redundancy_log.enabled(step_idx):
-            redundancy_log.record(k, num_anchor_tokens, top_indices, layer_id, step_idx, per_head_cache=per_head_cache)
+            redundancy_log.record(
+                k, num_anchor_tokens, top_indices, layer_id, step_idx, per_head_cache=per_head_cache,
+                sketch_features=getattr(eviction, "_last_projected_key_features", None),
+            )
         final_k, final_v = _materialize_kv_by_keep_indices(
             k, v, keep_indices, head_shared=not per_head_cache
         )

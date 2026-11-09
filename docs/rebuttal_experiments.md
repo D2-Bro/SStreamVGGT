@@ -181,6 +181,11 @@ cd ../../../.. && python tools/analyze_cache_redundancy.py \
     --out eval_results/mv_recon/rebuttal/pr_analysis/summary
 python tools/psi_counterexample.py --redundancy_csv 'eval_results/mv_recon/rebuttal/pr_analysis/IDC/*/redundancy/*.csv'
 ```
+Sketch space: each row also has `space` = `full` (1024-d head-normalized concatenated keys) or `sketch` (the
+right-sketched 256-d matrix Z IDC computes leverage and psi on; cosine on its normalized rows, ranks and psi on Z).
+IDC only, at 100 frames (every 10 steps, `pr_sketch_frames100/`) and full sequence (every 25 steps,
+`pr_sketch_framesfull/`); comparison in `pr_sketch_summary/`.
+
 Outputs: `summary.csv` (medians, p90, share of degenerate cases: erank < 2 or mean cosine > 0.9),
 `per_layer_median.csv`, per-layer boxplots, and a psi/N vs effective rank scatter.
 

@@ -32,14 +32,16 @@ def load(run_dir):
         df = pd.read_csv(path)
         df["dataset"] = os.path.basename(os.path.dirname(os.path.dirname(path)))
         df["scene"] = os.path.splitext(os.path.basename(path))[0]
+        if "space" not in df:
+            df["space"] = "full"
         frames.append(df)
     return pd.concat(frames, ignore_index=True)
 
 
 def summary_table(df, erank_min, cos_max):
     rows = []
-    for (cond, set_name), sub in df.groupby(["condition", "set"], sort=False):
-        row = {"condition": cond, "set": set_name, "rows": len(sub)}
+    for (cond, space, set_name), sub in df.groupby(["condition", "space", "set"], sort=False):
+        row = {"condition": cond, "space": space, "set": set_name, "rows": len(sub)}
         for m in METRICS:
             if m in sub:
                 row[f"{m}_median"] = sub[m].median()
@@ -107,13 +109,13 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     table = summary_table(df, args.erank_min, args.cos_max)
     table.to_csv(os.path.join(args.out, "summary.csv"), index=False)
-    per_layer = df.groupby(["condition", "set", "layer"])[METRICS].median().reset_index()
+    per_layer = df.groupby(["condition", "space", "set", "layer"])[METRICS].median().reset_index()
     per_layer.to_csv(os.path.join(args.out, "per_layer_median.csv"), index=False)
     with pd.option_context("display.width", 200, "display.max_columns", 50):
-        cols = ["condition", "set", "rows", "mean_cos_median", "frac_cos_gt_0.9_median", "nn_cos_mean_median",
+        cols = ["condition", "space", "set", "rows", "mean_cos_median", "frac_cos_gt_0.9_median", "nn_cos_mean_median",
                 "erank_median", "erank_over_n_median", "psi_over_n_median", "degenerate_share"]
         print(table[[c for c in cols if c in table]].to_string(index=False))
-    plots(df, args.out)
+    plots(df[df["space"] == "full"], args.out)  # plots: 1024-d space (sketch rows are in the CSVs)
     print(f"Saved: {args.out}/summary.csv, per_layer_median.csv, box_*.png, scatter_psi_vs_erank.png")
 
 

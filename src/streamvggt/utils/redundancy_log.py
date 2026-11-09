@@ -7,7 +7,8 @@ before eviction and the retained set after it.
 
 Keys are represented as IDC scores them: post-RoPE keys, each head normalized to unit length, heads concatenated
 (then divided by sqrt(H) so that a row is a unit vector and a dot product is the head-averaged cosine). Anchor
-(first-frame) tokens are excluded. One CSV per scene, one row per (step, layer, set).
+(first-frame) tokens are excluded. One CSV per scene, one row per (step, layer, space, set), space = full (1024-d) or sketch (IDC's
+right-sketched 256-d matrix).
 
 Enabled from a launcher with configure(); attention.eviction calls record() after choosing the kept tokens.
 """
@@ -22,7 +23,7 @@ import torch
 _CONFIG = {"dir": None, "every": 10, "taus": (0.5, 0.7, 0.9), "scene": None, "path": None}
 
 FIELDS_BASE = [
-    "step", "layer", "set", "n_tokens", "head_shared", "psi", "psi_over_n", "rank", "erank", "erank_over_n",
+    "step", "layer", "space", "set", "n_tokens", "head_shared", "psi", "psi_over_n", "rank", "erank", "erank_over_n",
     "stable_rank", "mean_cos",
 ]
 
@@ -58,22 +59,26 @@ def key_features(k_tokens: torch.Tensor) -> torch.Tensor:
     return x.permute(1, 0, 2).reshape(k_tokens.shape[1], -1) / math.sqrt(H)
 
 
-def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096) -> dict:
-    """Statistics of a set of unit rows x [N, d] (float64)."""
+def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096,
+                   spectral: Optional[torch.Tensor] = None) -> dict:
+    """Statistics of a set of unit rows x [N, d] (float64). Rank, effective rank, stable rank and psi use
+    ``spectral`` (same rows, any scale; default x), e.g. the raw sketched matrix IDC computes leverage on."""
     n = x.shape[0]
     out = {"n_tokens": n}
-    # spectrum: Gram in feature space (d x d), eigenvalues = squared singular values
-    eig = torch.linalg.eigvalsh(x.T @ x).clamp_min(0.0).flip(0)
+    m = x if spectral is None else spectral
+    # spectrum: Gram in feature space (d x d), eigenvalues = squared singular values (one eigendecomposition)
+    evals, evecs = torch.linalg.eigh(m.T @ m)
+    evals = evals.clamp_min(0.0)
+    eig = evals.flip(0)
     total = float(eig.sum())
-    tol = float(eig[0]) * max(x.shape) * torch.finfo(torch.float64).eps if total > 0 else 0.0
+    tol = float(eig[0]) * max(m.shape) * torch.finfo(torch.float64).eps if total > 0 else 0.0
     rank = int((eig > tol).sum())
     p = eig[eig > tol] / total
     erank = float(torch.exp(-(p * p.log()).sum())) if total > 0 else 0.0
     out.update(rank=rank, erank=erank, erank_over_n=erank / n, stable_rank=total / float(eig[0]) if total > 0 else 0.0)
-    # exact leverage on the same features: l_i = x_i (X^T X)^+ x_i^T over the numerical range
-    evals, evecs = torch.linalg.eigh(x.T @ x)
+    # exact leverage on the same rows: l_i = m_i (M^T M)^+ m_i^T over the numerical range
     keep = evals > tol
-    proj = x @ evecs[:, keep]
+    proj = m @ evecs[:, keep]
     lev = (proj.square() / evals[keep]).sum(dim=1)
     psi = float(lev.sum() ** 2 / lev.square().sum()) if float(lev.square().sum()) > 0 else 0.0
     out.update(psi=psi, psi_over_n=psi / n)
@@ -104,7 +109,8 @@ _WARNED_PER_HEAD = [False]
 
 @torch.no_grad()
 def record(k: torch.Tensor, num_anchor_tokens: int, kept_candidate_indices: torch.Tensor,
-           layer_id: Optional[int], step_idx: Optional[int], per_head_cache: bool = False):
+           layer_id: Optional[int], step_idx: Optional[int], per_head_cache: bool = False,
+           sketch_features: Optional[torch.Tensor] = None):
     """k: pre-eviction cache [B, H, N, D]; kept_candidate_indices: [B, H, K] indices into the candidates.
 
     Skipped for per-head caches (compactor policy): there, the same cache position holds a different token in
@@ -121,12 +127,20 @@ def record(k: torch.Tensor, num_anchor_tokens: int, kept_candidate_indices: torc
     kept = kept_candidate_indices[0]
     head_shared = bool((kept == kept[:1]).all())
     x = key_features(cand)
+    spaces = [("full", x, None)]
+    # IDC's own sketch space: the right-sketched candidate matrix Z [Nc, r] its leverage scores come from.
+    if sketch_features is not None and sketch_features.shape[1] == x.shape[0]:
+        z = sketch_features[0].double()
+        spaces.append(("sketch", torch.nn.functional.normalize(z, p=2, dim=-1), z))
     rows = []
-    for name, feats in (("candidates", x), ("retained", x[kept[0]])):
-        stats = set_statistics(feats, _CONFIG["taus"])
-        stats.update(step=int(step_idx), layer=int(layer_id) if layer_id is not None else -1, set=name,
-                     head_shared=int(head_shared))
-        rows.append(stats)
+    for space, feats, spectral in spaces:
+        for name, idx in (("candidates", None), ("retained", kept[0])):
+            f = feats if idx is None else feats[idx]
+            sp = None if spectral is None else (spectral if idx is None else spectral[idx])
+            stats = set_statistics(f, _CONFIG["taus"], spectral=sp)
+            stats.update(step=int(step_idx), layer=int(layer_id) if layer_id is not None else -1, space=space,
+                         set=name, head_shared=int(head_shared))
+            rows.append(stats)
     with open(_CONFIG["path"], "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_fields(), extrasaction="ignore")
         for row in rows:

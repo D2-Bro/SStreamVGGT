@@ -115,8 +115,12 @@ def redundancy(dataset_dir, erank_min=2.0, cos_max=0.9):
     import pandas as pd
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
     out = {"rows": int(len(df)), "degenerate_rule": f"erank < {erank_min} or mean_cos > {cos_max}"}
-    for set_name, sub in df.groupby("set"):
-        out[set_name] = {
+    if "space" not in df:
+        df["space"] = "full"
+    for (space, set_name), sub in df.groupby(["space", "set"]):
+        # key: "candidates"/"retained" for the 1024-d space (as before), "sketch_candidates"/... for IDC's sketch
+        key = set_name if space == "full" else f"{space}_{set_name}"
+        out[key] = {
             "median": {m: float(sub[m].median()) for m in REDUNDANCY_METRICS if m in sub},
             "p10": {m: float(sub[m].quantile(0.1)) for m in REDUNDANCY_METRICS if m in sub},
             "p90": {m: float(sub[m].quantile(0.9)) for m in REDUNDANCY_METRICS if m in sub},
@@ -260,7 +264,8 @@ def main():
     out_path = args.out or os.path.join(root, "results.json")
 
     experiments = {}
-    for exp in ("strict", "strict_layers", "stride", "pr_analysis", "compactor"):
+    for exp in ("strict", "strict_layers", "stride", "pr_analysis", "pr_sketch_frames100", "pr_sketch_framesfull",
+                "compactor"):
         runs = {}
         for run_dir in sorted(glob.glob(os.path.join(root, exp, "*"))):
             if os.path.isdir(run_dir) and not os.path.basename(run_dir).startswith("summary"):
