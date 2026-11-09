@@ -213,8 +213,7 @@ def queue_status(root):
     qdir = os.path.join(root, "queue")
     jobs_dir = os.path.join(os.path.dirname(__file__), "..", "src", "eval", "mv_recon", "rebuttal")
     names = []
-    for jobs_name in ("jobs_all.txt", "jobs_phase2.txt", "jobs_pose.txt"):
-        path = os.path.join(jobs_dir, jobs_name)
+    for path in sorted(glob.glob(os.path.join(jobs_dir, "jobs_*.txt"))):
         if os.path.exists(path):
             with open(path) as f:
                 names += [l.split("\t")[0] for l in f if l.strip() and not l.lstrip().startswith("#")]

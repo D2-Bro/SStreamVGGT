@@ -1,0 +1,5 @@
+# strict budget at 200K (recon full sequence, then 7-Scenes trajectory)
+strict_B200000_soft	MODES=soft bash strict.sh 200000
+strict_B200000_strict	MODES=strict bash strict.sh 200000
+pose_strict_B200000_soft	MODES=soft bash pose_strict.sh 200000
+pose_strict_B200000_strict	MODES=strict bash pose_strict.sh 200000
