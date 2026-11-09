@@ -72,6 +72,27 @@ def test_compactor_scores_match_numpy() -> None:
     _reset_config()
 
 
+def test_compactor_right_sketch_matches_numpy() -> None:
+    g = torch.Generator().manual_seed(4)
+    k = torch.randn(1, 3, 50, 64, generator=g) * 2 + 0.5
+    q = torch.randn(1, 3, 7, 64, generator=g)
+    ablation_config.configure(compactor_lambda=0.5, compactor_ridge=5e-3, compactor_headwise_norm=False,
+                              compactor_sketch_dim=16)
+    manager = EvictionManager(policy="compactor", layer_budget_strategy="uniform")
+    _, lev = manager._compactor_scores(k, q, num_anchor_tokens=4)
+    phi = torch.randn(64, 16, generator=torch.Generator().manual_seed(42), dtype=torch.float64).numpy() / 4.0
+    x = k.double().numpy()[0, :, 4:]
+    x = x - x.mean(axis=1, keepdims=True)
+    ref = []
+    for h in range(3):
+        z = x[h] @ phi
+        inv = np.linalg.inv(z.T @ z + 5e-3 * np.eye(16))
+        ref.append(np.einsum("nd,de,ne->n", z, inv, z))
+    assert np.allclose(lev.numpy()[0], np.stack(ref), rtol=1e-4, atol=1e-6)
+    assert float(lev.sum(dim=-1).max()) <= 16.0 + 1e-6  # leverage sums to at most the sketch rank
+    _reset_config()
+
+
 def test_compactor_select_is_per_head_and_materializes_per_head() -> None:
     g = torch.Generator().manual_seed(2)
     B, H, N, D, anchor, budget = 1, 4, 30, 8, 6, 16

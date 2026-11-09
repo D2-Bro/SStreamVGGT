@@ -892,8 +892,8 @@ class EvictionManager:
         - attention: current-frame queries attend to all live keys (anchor + candidates) without a causal mask;
           per-head column sum over the queries, softmax scaled by 1/sqrt(D).
         - leverage: per head, keys mean-centred over the candidates (optionally unit-normalised per head first),
-          ridge leverage x_i (X^T X + r I)^-1 x_i^T. The head dim (64) is below any useful sketch size, so the
-          leverage is exact (what the right sketch approximates).
+          ridge leverage x_i (X^T X + r I)^-1 x_i^T; exact on the 64-d keys by default, or on a right sketch to
+          ``compactor_sketch_dim`` dims (as the official code does with k = 48).
         - score: z(attention) + lambda * z(leverage), z with population mean/std pooled over the heads and
           candidates of the layer (as the official kernel does). The caller keeps the top-k per head.
         Returns (scores [B, H, Nc], leverage [B, H, Nc]).
@@ -906,6 +906,18 @@ class EvictionManager:
         if CONFIG.compactor_headwise_norm:
             x = F.normalize(x, p=2, dim=-1)
         x = x - x.mean(dim=2, keepdim=True)
+        sketch_dim = int(CONFIG.compactor_sketch_dim)
+        if sketch_dim > 0:
+            # Right sketch per head (official Compactor: PHI ~ N(0, 1/k), seed 42, one matrix for all heads/layers).
+            # Centring commutes with the linear sketch, so centring first is the same as centring the sketched rows.
+            key = ("compactor_phi", x.shape[-1], sketch_dim, str(x.device))
+            phi = self._leverage_right_sketch_cache.get(key)
+            if phi is None:
+                generator = torch.Generator().manual_seed(42)
+                phi = torch.randn(x.shape[-1], sketch_dim, generator=generator, dtype=torch.float64)
+                phi = (phi / math.sqrt(float(sketch_dim))).to(device=x.device)
+                self._leverage_right_sketch_cache[key] = phi
+            x = x @ phi
         D = x.shape[-1]
         gram = x.transpose(-1, -2) @ x + float(CONFIG.compactor_ridge) * torch.eye(D, device=x.device, dtype=x.dtype)
         solved = torch.linalg.solve(gram, x.transpose(-1, -2))  # [B, H, D, Nc]

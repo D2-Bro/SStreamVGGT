@@ -210,6 +210,7 @@ def get_args_parser():
     parser.add_argument("--leverage_compactor_lambda", type=float, default=0.5)
     parser.add_argument("--leverage_unobserved_lev_multiplier", type=float, default=None)
     parser.add_argument("--compactor_ridge", type=float, default=5e-3)
+    parser.add_argument("--compactor_sketch_dim", type=int, default=0, help="Compactor policy: right-sketch each head's keys to this many dims before leverage (0 = exact)")
     parser.add_argument("--compactor_headwise_norm", action="store_true")
     parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the seeds but do not force deterministic CUDA kernels")
     parser.add_argument("--pose_eval_prefix_frames", type=int, nargs="*", default=[], help="Also report ATE/RPE on the first K input frames of each sequence (streaming is causal, so this equals a K-frame run); e.g. 100")
@@ -669,6 +670,7 @@ if __name__ == "__main__":
         unobserved_lev_multiplier=args.leverage_unobserved_lev_multiplier,
         compactor_ridge=args.compactor_ridge,
         compactor_headwise_norm=args.compactor_headwise_norm,
+        compactor_sketch_dim=args.compactor_sketch_dim,
     )
     if args.eviction_policy == "compactor" and (args.leverage_conf_gate or args.leverage_attention_utility):
         raise SystemExit("Error: --eviction_policy compactor runs without --leverage_conf_gate and --leverage_attention_utility")

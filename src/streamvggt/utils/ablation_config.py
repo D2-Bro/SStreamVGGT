@@ -17,6 +17,9 @@ the model, aggregator, block and attention signatures. Defaults reproduce the ex
                            paper's rule, m = 1: no doubling).
   compactor_ridge          ridge added to each head's key Gram matrix in the compactor policy (official: 5e-3).
   compactor_headwise_norm  compactor policy: unit-normalise each head's keys before leverage (IDC difference 2).
+  compactor_sketch_dim     compactor policy: 0 = exact per-head leverage on the 64-d keys; k > 0 = right-sketch each
+                           head's keys to k dims first (Gaussian N(0, 1/k), seed 42, shared by heads and layers, as
+                           in the official code) and compute the ridge leverage on the k x k Gram matrix.
 """
 
 from dataclasses import dataclass, fields
@@ -31,6 +34,7 @@ class AblationConfig:
     unobserved_lev_multiplier: Optional[float] = None
     compactor_ridge: float = 5e-3
     compactor_headwise_norm: bool = False
+    compactor_sketch_dim: int = 0
 
 
 CONFIG = AblationConfig()

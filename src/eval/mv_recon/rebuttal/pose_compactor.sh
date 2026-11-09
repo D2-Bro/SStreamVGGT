@@ -35,6 +35,11 @@ CFG[ours]="$idc_env LEVERAGE_ATTENTION_UTILITY=true LEVERAGE_ATTENTION_FREEZE_UP
 # Table B, cumulative (KABA throughout)
 CFG[C0_compactor]="${CFG[compactor_kaba]}"
 CFG[C1_headnorm]="$compactor_env | --eviction_policy compactor --compactor_headwise_norm"
+# Same Compactor configurations with each head's keys right-sketched 64 -> 16 before leverage
+CFG[compactor_uniform_sk16]="$compactor_env | --eviction_policy compactor --layer_budget_strategy uniform --compactor_sketch_dim 16"
+CFG[compactor_kaba_sk16]="$compactor_env | --eviction_policy compactor --compactor_sketch_dim 16"
+CFG[C0_compactor_sk16]="$compactor_env | --eviction_policy compactor --compactor_sketch_dim 16"
+CFG[C1_headnorm_sk16]="$compactor_env | --eviction_policy compactor --compactor_headwise_norm --compactor_sketch_dim 16"
 CFG[C2_concat]="$idc_env LEVERAGE_ATTENTION_UTILITY=false CONF_GATE=false | --leverage_attention_source noncausal_current --leverage_score_norm zscore --leverage_attention_beta 0.5"
 CFG[C3_history]="$idc_env LEVERAGE_ATTENTION_UTILITY=true LEVERAGE_ATTENTION_FREEZE_UPDATES=0 CONF_GATE=false | --leverage_score_norm zscore --leverage_unobserved_lev_multiplier 1"
 CFG[C4_freeze]="$idc_env LEVERAGE_ATTENTION_UTILITY=true LEVERAGE_ATTENTION_FREEZE_UPDATES=5 CONF_GATE=false | --leverage_score_norm zscore --leverage_unobserved_lev_multiplier 1"
@@ -49,9 +54,10 @@ CFG[ours_wo_freeze]="$idc_env LEVERAGE_ATTENTION_UTILITY=true LEVERAGE_ATTENTION
 CFG[ours_wo_meannorm]="$idc_env LEVERAGE_ATTENTION_UTILITY=true LEVERAGE_ATTENTION_FREEZE_UPDATES=5 | --leverage_score_norm zscore --leverage_compactor_lambda 1.0 --leverage_unobserved_lev_multiplier 2"
 CFG[ours_wo_double]="$idc_env LEVERAGE_ATTENTION_UTILITY=true LEVERAGE_ATTENTION_FREEZE_UPDATES=5 | --leverage_unobserved_lev_multiplier 1"
 
-TABLE_A=(compactor_uniform compactor_kaba ours)
+TABLE_A=(compactor_uniform compactor_kaba ours compactor_uniform_sk16 compactor_kaba_sk16)
 TABLE_B=(C0_compactor C1_headnorm C2_concat C3_history C4_freeze C5_meannorm C6_double C7_ours
-         ours_wo_history ours_wo_headnorm ours_wo_freeze ours_wo_meannorm ours_wo_double)
+         ours_wo_history ours_wo_headnorm ours_wo_freeze ours_wo_meannorm ours_wo_double
+         C0_compactor_sk16 C1_headnorm_sk16)
 
 names=()
 for arg in "$@"; do

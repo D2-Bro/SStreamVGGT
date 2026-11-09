@@ -5,3 +5,12 @@ strict_B200000_redistribute	bash strict_redistribute.sh 200000
 pose_strict_B30000_redistribute	bash pose_strict_redistribute.sh 30000
 pose_strict_B60000_redistribute	bash pose_strict_redistribute.sh 60000
 pose_strict_B200000_redistribute	bash pose_strict_redistribute.sh 200000
+# Compactor with per-head right sketch 64 -> 16 (appended; served by the same queue)
+compA_compactor_uniform_sk16	bash compactor.sh compactor_uniform_sk16
+compA_compactor_kaba_sk16	bash compactor.sh compactor_kaba_sk16
+compBfull_C1_headnorm_sk16	MAX_FRAMES=full bash compactor.sh C1_headnorm_sk16
+compB_C0_compactor_sk16	bash compactor.sh C0_compactor_sk16
+compB_C1_headnorm_sk16	bash compactor.sh C1_headnorm_sk16
+pose_compA_compactor_uniform_sk16	bash pose_compactor.sh compactor_uniform_sk16
+pose_compA_compactor_kaba_sk16	bash pose_compactor.sh compactor_kaba_sk16
+pose_compB_C1_headnorm_sk16	bash pose_compactor.sh C1_headnorm_sk16

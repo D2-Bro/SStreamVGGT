@@ -264,6 +264,7 @@ def get_args_parser():
     parser.add_argument("--leverage_compactor_lambda", type=float, default=0.5, help="Leverage weight lambda for --leverage_score_norm zscore and the compactor policy")
     parser.add_argument("--leverage_unobserved_lev_multiplier", type=float, default=None, help="Score of tokens with no attention yet = m * leverage weight * normalised leverage (2 = paper rule, 1 = no doubling); unset keeps the legacy score")
     parser.add_argument("--compactor_ridge", type=float, default=5e-3, help="Ridge on each head's key Gram matrix in the compactor policy")
+    parser.add_argument("--compactor_sketch_dim", type=int, default=0, help="Compactor policy: right-sketch each head's keys to this many dims before leverage (0 = exact)")
     parser.add_argument("--compactor_headwise_norm", action="store_true", help="Compactor policy: unit-normalise each head's keys before leverage")
     parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the random seeds but do not force deterministic CUDA kernels (faster)")
     parser.add_argument("--max_scenes", type=int, default=None, help="Evaluate only the first N scenes of each dataset (smoke tests)")
@@ -943,6 +944,7 @@ if __name__ == "__main__":
         unobserved_lev_multiplier=args.leverage_unobserved_lev_multiplier,
         compactor_ridge=args.compactor_ridge,
         compactor_headwise_norm=args.compactor_headwise_norm,
+        compactor_sketch_dim=args.compactor_sketch_dim,
     )
     if args.eviction_policy == "compactor" and (args.leverage_conf_gate or args.leverage_attention_utility):
         raise SystemExit("Error: --eviction_policy compactor keeps different tokens per head; "
