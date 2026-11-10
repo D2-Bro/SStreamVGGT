@@ -1,0 +1,5 @@
+# 60K soft vs redistribute with CUDA determinism on (recon: 7-Scenes + NRGBD, ETH3D stride 1).
+det_strict_B60000_soft	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det/strict MODES=soft bash strict.sh 60000
+det_strict_B60000_redistribute	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det/strict bash strict_redistribute.sh 60000
+det_eth3d_strict_B60000_soft	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d_det/strict MODES=soft bash strict.sh 60000
+det_eth3d_strict_B60000_redistribute	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d_det/strict bash strict_redistribute.sh 60000
