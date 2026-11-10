@@ -1,0 +1,2 @@
+# Density heterogeneity, full sequence, NRGBD only (7-Scenes finished; the earlier run ran out of memory when sharing a GPU).
+het_framesfull_nrgbd	MAX_FRAMES=full REDUNDANCY_LOG_EVERY=25 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_het_framesfull EXTRA_ARGS='--redundancy_dump_tokens --eval_datasets NRGBD' bash pr_analysis.sh IDC
