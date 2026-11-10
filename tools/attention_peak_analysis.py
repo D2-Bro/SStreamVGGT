@@ -225,12 +225,23 @@ if __name__ == "__main__":
                         help="also check A @ v == SDPA output, and that outputs do not depend on the patch or on "
                              "--eviction_policy (two extra unpatched runs)")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--dump_inputs", default=None,
+                        help="only save the preprocessed frames ([S, 3, H, W] in [0, 1]) to this .npz and exit "
+                             "(input for tools/vggt_attention_peak.py)")
     args = parser.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(42)
     assert not torch.cuda.is_available() or os.environ.get("CUDA_VISIBLE_DEVICES") == "", "run on CPU"
 
     sys.path.insert(0, str(Path(args.weights).resolve().parent))
+    if args.dump_inputs:
+        batch, label, frames = load_batch(args)
+        images = torch.cat([view["img"] for view in batch], 0).float().numpy()
+        os.makedirs(os.path.dirname(os.path.abspath(args.dump_inputs)), exist_ok=True)
+        np.savez(args.dump_inputs, images=images, frames=np.array(frames), label=label,
+                 sha=__import__("hashlib").sha256(images.tobytes()).hexdigest())
+        print(f"saved {args.dump_inputs}: {label}, images {images.shape}")
+        sys.exit(0)
     from streamvggt.models.streamvggt import StreamVGGT
 
     t0 = time.time()
@@ -288,7 +299,8 @@ if __name__ == "__main__":
     pd.DataFrame(State.keynorm).to_csv(out / "key_norm.csv", index=False)
     checks["k_shape_equals_step_x_tokens"] = bool((rows["n_keys"] == rows["step"] * State.tokens_per_frame).all())
     checks["first_frame_no_past"] = bool(rows[rows.step == 1]["cross_frame_mass"].isna().all())
-    meta = {"scene": label, "frames": frames, "tokens_per_frame": State.tokens_per_frame, "kf_every": args.kf_every,
+    imgs = torch.cat([view["img"] for view in batch], 0).float().numpy()
+    meta = {"scene": label, "frames": frames, "input_sha256": __import__("hashlib").sha256(imgs.tobytes()).hexdigest(), "tokens_per_frame": State.tokens_per_frame, "kf_every": args.kf_every,
             "max_frames": args.max_frames, "budget": args.budget, "dtype": "float32 (CPU)",
             "eviction": "disabled (never called)", "layer_budget_strategy": "uniform (KABA off)", "checks": checks}
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
