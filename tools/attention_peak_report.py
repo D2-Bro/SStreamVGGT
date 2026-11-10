@@ -118,10 +118,11 @@ def main():
     ax.set_xlabel("global attention layer (0-indexed)")
     ax.set_ylabel("top-50 attention entry\n(head-avg., patch tokens)")
     ax.set_title(f"StreamVGGT causal global attention, 7-Scenes ({n_scenes} seq., {T} frames, full cache)", fontsize=9)
+    ax.set_ylim(top=float(q3.max()) * 1.15)
     ymax = ax.get_ylim()[1]
     for x, name in ((4, "early"), (14, "middle"), (21.5, "last")):
         ax.text(x, ymax * 0.93, name, ha="center", fontsize=8, color="0.35")
-    ax.legend(fontsize=7, loc="upper left")
+    ax.legend(fontsize=7, loc="center left")
     fig.tight_layout()
     fig.savefig(os.path.join(a.out, "fig_attn_peak.png"), dpi=200)
 
