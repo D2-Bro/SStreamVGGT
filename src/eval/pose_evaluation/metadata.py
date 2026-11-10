@@ -594,7 +594,7 @@ dataset_metadata = {
         "process_func": lambda args, img_path: process_scannet(args, img_path),
     },
     "tum": {
-        "img_path": "/home/dongjae/data/tum",
+        "img_path": os.environ.get("SSTREAMVGGT_TUM_ROOT", "/home/dongjae/data/tum"),
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "rgb_90"),
         "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
@@ -608,9 +608,11 @@ dataset_metadata = {
         "process_func": None,
     },
     "tum_stride2": {
-        "img_path": "/home/dongjae/data/tum",
+        "img_path": os.environ.get("SSTREAMVGGT_TUM_ROOT", "/home/dongjae/data/tum"),
         "mask_path": None,
         "dir_path_func": lambda img_path, seq: os.path.join(img_path, seq, "rgb_stride2"),
+        # rgb_stride2 / groundtruth_stride2 are already every 2nd frame: --pose_eval_stride is divided by this
+        "base_stride": 2,
         "gt_traj_func": lambda img_path, anno_path, seq: os.path.join(
             img_path, seq, "groundtruth_stride2.txt"
         ),

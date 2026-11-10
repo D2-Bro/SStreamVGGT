@@ -213,6 +213,8 @@ def get_args_parser():
     parser.add_argument("--compactor_sketch_dim", type=int, default=0, help="Compactor policy: right-sketch each head's keys to this many dims before leverage (0 = exact)")
     parser.add_argument("--compactor_headwise_norm", action="store_true")
     parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the seeds but do not force deterministic CUDA kernels")
+    parser.add_argument("--redundancy_log", action="store_true", help="Write cache redundancy / local density statistics per sequence to <output_dir>/<dataset>/redundancy/<seq>.csv")
+    parser.add_argument("--redundancy_log_every", type=int, default=10)
     parser.add_argument("--pose_eval_prefix_frames", type=int, nargs="*", default=[], help="Also report ATE/RPE on the first K input frames of each sequence (streaming is causal, so this equals a K-frame run); e.g. 100")
     parser.add_argument("--layer_budget_eps", type=float, default=0)
     parser.add_argument("--layer_budget_value_gamma", type=float, default=0.7)
@@ -321,7 +323,14 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         os.path.join(dir_path, name) for name in os.listdir(dir_path)
                     ]
                     filelist.sort()
-                filelist = filelist[::args.pose_eval_stride]
+                base_stride = int(metadata.get("base_stride", 1))
+                if args.pose_eval_stride % base_stride != 0:
+                    raise ValueError(
+                        f"--pose_eval_stride {args.pose_eval_stride} must be a multiple of the base stride "
+                        f"{base_stride} of {args.eval_dataset} (its frames are already subsampled)"
+                    )
+                eff_stride = max(1, args.pose_eval_stride // base_stride)
+                filelist = filelist[::eff_stride]
                 if args.max_frames is not None:
                     filelist = filelist[: args.max_frames]
                 if not filelist:
@@ -355,6 +364,12 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 with torch.no_grad():
                     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
                     with torch.cuda.amp.autocast(dtype=dtype):
+                        if args.redundancy_log:
+                            from streamvggt.utils import redundancy_log
+                            redundancy_log.configure(
+                                os.path.join(save_dir, args.eval_dataset, "redundancy"), every=args.redundancy_log_every
+                            )
+                            redundancy_log.set_scene(seq.replace("/", "_"))
                         if torch.cuda.is_available():
                             torch.cuda.synchronize(device)
                         start = time.perf_counter()
@@ -507,14 +522,14 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     elif args.eval_dataset == "sintel":
                         gt_traj = load_traj(
                             gt_traj_file=gt_traj_file,
-                            stride=args.pose_eval_stride,
+                            stride=eff_stride,
                             num_frames=len(filelist),
                         )
                     elif traj_format is not None:
                         gt_traj = load_traj(
                             gt_traj_file=gt_traj_file,
                             traj_format=traj_format,
-                            stride=args.pose_eval_stride,
+                            stride=eff_stride,
                             num_frames=len(filelist),
                         )
                     else:

@@ -267,6 +267,8 @@ def get_args_parser():
     parser.add_argument("--compactor_sketch_dim", type=int, default=0, help="Compactor policy: right-sketch each head's keys to this many dims before leverage (0 = exact)")
     parser.add_argument("--compactor_headwise_norm", action="store_true", help="Compactor policy: unit-normalise each head's keys before leverage")
     parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the random seeds but do not force deterministic CUDA kernels (faster)")
+    parser.add_argument("--eval_datasets", type=str, default="7scenes,NRGBD", help="Comma-separated datasets to evaluate (7scenes, NRGBD, ETH3D)")
+    parser.add_argument("--eth3d_root", type=str, default="/home/dongjae/dataset/eth3d", help="ETH3D root (per-scene dslr_calibration_jpg, ground_truth_depth, images)")
     parser.add_argument("--max_scenes", type=int, default=None, help="Evaluate only the first N scenes of each dataset (smoke tests)")
     parser.add_argument("--strict_budget_mode", choices=("reserve", "redistribute"), default="reserve", help="With --strict_budget: reserve = anchor in every layer first, the rest by KABA weights; redistribute = full budget by KABA weights, layers below the anchor lifted to it and the overage taken from the others by weight")
     parser.add_argument("--strict_budget", action="store_true", help="Reserve the first-frame anchor in every layer before splitting the rest of --budget, so the total cache never exceeds --budget (default: the anchor floor may exceed it)")
@@ -423,6 +425,20 @@ def main(args):
         #     kf_every=1,
         # ),
     }
+
+    requested_datasets = [name.strip() for name in args.eval_datasets.split(",") if name.strip()]
+    if "ETH3D" in requested_datasets and "ETH3D" not in datasets_all:
+        # ETH3D (paper: every frame, i.e. kf_every 1); the stride comes from --kf_every.
+        datasets_all["ETH3D"] = ETH3D(
+            ROOT=args.eth3d_root,
+            full_video=True,
+            resolution=resolution,
+            kf_every=args.kf_every,
+        )
+    unknown = [name for name in requested_datasets if name not in datasets_all]
+    if unknown:
+        raise SystemExit(f"Error: unknown --eval_datasets entries {unknown}; available: {list(datasets_all)}")
+    datasets_all = {name: datasets_all[name] for name in requested_datasets}
 
     accelerator = Accelerator(
         kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(seconds=6000))]
@@ -644,10 +660,13 @@ def main(args):
                                 scene_list = list(getattr(dataset, "scene_list", []) or [])
                                 representative = True
                                 if scene_list:
-                                    base = scene_label.split("/")[0]
-                                    first = next(i for i, name in enumerate(scene_list + [scene_label])
-                                                 if str(name).split("/")[0] == base)
-                                    representative = first >= len(scene_list) or scene_list[first] == scene_label
+                                    # this sequence's scene = scene_list[data_idx // num_seq]; representative if it is
+                                    # the first sequence of that scene (labels may carry a suffix, e.g. ETH3D).
+                                    current = int(data_idx) // max(int(getattr(dataset, "num_seq", 1)), 1)
+                                    base = str(scene_list[current]).split("/")[0] if current < len(scene_list) else None
+                                    first = next((i for i, name in enumerate(scene_list)
+                                                  if str(name).split("/")[0] == base), current)
+                                    representative = first == current
                                 redundancy_log.set_scene(scene_key if representative else None)
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize(device)
