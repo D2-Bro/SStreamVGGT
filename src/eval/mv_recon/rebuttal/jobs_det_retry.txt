@@ -1,0 +1,4 @@
+# Deterministic recon runs that hit OOM (several queues started on one GPU at once); start only below 4 GB used.
+det_strict_B60000_soft	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det/strict MODES=soft bash strict.sh 60000
+det_strict_B60000_redistribute	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det/strict bash strict_redistribute.sh 60000
+det_wo_kaba_B60000	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det/wo_kaba MODES=soft EXTRA_ARGS='--layer_budget_strategy uniform' bash strict.sh 60000

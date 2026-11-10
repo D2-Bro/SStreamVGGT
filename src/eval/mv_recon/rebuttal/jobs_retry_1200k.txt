@@ -1,0 +1,1 @@
+budget1200k_7scenes_soft	TOTAL_BUDGET=1200000 OUTPUT_DIR=../eval_results/mv_recon/rebuttal/budget1200k/B1200000_soft EXTRA_ARGS='--eval_datasets 7scenes --eval_stage none --log-anchor-budget-overage' bash ../run_final_early_attention.sh

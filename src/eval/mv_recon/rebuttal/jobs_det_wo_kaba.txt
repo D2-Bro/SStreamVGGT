@@ -1,0 +1,3 @@
+# Ours w/o KABA (uniform layer allocation), 60K, full sequence, CUDA determinism on: recon 7-Scenes + NRGBD, 7-Scenes trajectory.
+det_wo_kaba_B60000	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det/wo_kaba MODES=soft EXTRA_ARGS='--layer_budget_strategy uniform' bash strict.sh 60000
+det_pose_wo_kaba_B60000	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/pose_evaluation/rebuttal_det/wo_kaba MODES=soft EXTRA_ARGS='--layer_budget_strategy uniform' bash pose_strict.sh 60000

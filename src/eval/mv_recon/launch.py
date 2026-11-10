@@ -395,19 +395,19 @@ def main(args):
     else:
         raise NotImplementedError
     datasets_all = {
-        # "7scenes": SevenScenes(
-        #     split="test",
-        #     ROOT="/home/dongjae/data/7scenes",
-        #     # ROOT="/data2/dongjae/datasets/7scenes_sfm",
-        #     resolution=resolution,
-        #     num_seq=1,
-        #     full_video=True,
-        #     kf_every=args.kf_every,
-        #     max_frames=args.max_frames,
-        # ),
+        "7scenes": SevenScenes(
+            split="test",
+            ROOT="/home/dongjae/dataset/7scenes",
+            # ROOT="/data2/dongjae/datasets/7scenes_sfm",
+            resolution=resolution,
+            num_seq=1,
+            full_video=True,
+            kf_every=args.kf_every,
+            max_frames=args.max_frames,
+        ),
         "NRGBD": NRGBD(
             split="test",
-            ROOT="/home/dongjae/data/neural_rgbd_data",
+            ROOT="/home/dongjae/dataset/neural_rgbd_data",
             resolution=resolution,
             num_seq=1,
             full_video=True,
