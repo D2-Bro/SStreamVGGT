@@ -45,7 +45,7 @@ def seed_everything(seed: int, deterministic: bool = True) -> int:
     if deterministic:
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
-        # torch.use_deterministic_algorithms(True)
+        torch.use_deterministic_algorithms(True)
 
     print(
         f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}, cuda_deterministic={deterministic}",

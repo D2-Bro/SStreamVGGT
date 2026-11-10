@@ -2,6 +2,9 @@
 # 1) deterministic runs (into *_fix roots); 2) non-deterministic runs that use the attention utility, rerun in place
 #    (pre-fix results moved to *_pre_colsum_fix); compactor variants are not rerun; 3) compactor retries (no utility, unaffected).
 # Order: reconstruction / analysis jobs first, trajectory jobs last.
+# Smoke test first: pose launcher with torch.use_deterministic_algorithms on, 20 frames, run twice (outputs must match).
+smoke_pose_det_a	CUDA_DETERMINISTIC=true MAX_FRAMES=20 OUT_ROOT=../eval_results/pose_evaluation/smoke_det_a MODES=soft bash pose_strict.sh 60000
+smoke_pose_det_b	CUDA_DETERMINISTIC=true MAX_FRAMES=20 OUT_ROOT=../eval_results/pose_evaluation/smoke_det_b MODES=soft bash pose_strict.sh 60000
 det_strict_B60000_soft	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det_fix/strict MODES=soft bash strict.sh 60000
 det_strict_B60000_redistribute	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det_fix/strict bash strict_redistribute.sh 60000
 det_wo_kaba_B60000	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/mv_recon/rebuttal_det_fix/wo_kaba MODES=soft EXTRA_ARGS='--layer_budget_strategy uniform' bash strict.sh 60000
