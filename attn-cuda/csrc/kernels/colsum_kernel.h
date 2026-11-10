@@ -256,6 +256,10 @@ colsum_n_major_kernel(StacFlashParams params)
         // After GEMM, smem_q is no longer read — start Q[mi+1] prefetch
         // to overlap DMA with the epilogue computation below
         if (mi + 1 < m_block_max) {
+            // The gmem->smem Q copy partitions rows differently from the MMA, so a warp
+            // that finished its GEMM would overwrite rows other warps are still reading
+            // (non-deterministic and wrong colsum for the kBlockN=64 path, seqlen_k < 2048).
+            __syncthreads();
             load_q_async(mi + 1);
             cute::cp_async_fence();
         }
