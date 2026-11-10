@@ -321,7 +321,8 @@ def main():
         for path in sorted(glob.glob(os.path.join(here, "..", "src", "eval", "mv_recon", "rebuttal", "jobs_*.txt"))):
             with open(path) as f:
                 names += [l.split("\t")[0] for l in f if l.strip() and not l.lstrip().startswith("#")]
-        names = [n for n in dict.fromkeys(names) if n.startswith(prefix)]
+        names = [n for n in dict.fromkeys(names) if n.startswith(prefix)
+                 and not (prefix == "replica_" and n.startswith("replica_det_"))]
         done, started = {}, set()
         for d in glob.glob(qdir):
             if os.path.exists(os.path.join(d, "status.tsv")):
@@ -349,7 +350,7 @@ def main():
                                                          **eth["compactor"]["A_compactor_kaba_framesfull"]}
     new_datasets["ETH3D_recon"] = {"root": eth_root, "queue": new_queue(os.path.join(eth_root, "queue*"), "eth3d_"),
                                    "experiments": eth}
-    for tag in ("replica", "tum"):
+    for tag in ("replica", "tum", "replica_det"):
         proot = os.path.join(eval_root, "pose_evaluation", f"rebuttal_{tag}")
         tr = {}
         for exp in ("strict", "stride", "compactor"):
@@ -371,7 +372,10 @@ def main():
                                                             **tr["compactor"]["A_compactor_kaba_framesfull"]}
         new_datasets[f"{tag}_trajectory"] = {
             "root": proot,
-            "queue": new_queue(os.path.join(eval_root, "pose_evaluation", "rebuttal_newds_queue"), f"{tag}_"),
+            "queue": new_queue(os.path.join(eval_root, "pose_evaluation",
+                                            "rebuttal_replica_det_queue" if tag == "replica_det" else "rebuttal_newds_queue"),
+                               f"{tag}_"),
+            **({"note": "CUDA determinism on (cudnn.deterministic, cuBLAS workspace config)"} if tag == "replica_det" else {}),
             "experiments": tr,
         }
 
