@@ -81,9 +81,9 @@ def main():
     tab.to_csv(os.path.join(a.out, "attn_peak_by_layer.csv"))
 
     # KABA: share of the total budget per layer and the fraction of steps a layer sits at the anchor floor
-    kl = pd.concat([pd.read_csv(f) for f in glob.glob(a.kaba_layers)])
+    kl = pd.concat([pd.read_csv(f).assign(run=i) for i, f in enumerate(sorted(glob.glob(a.kaba_layers)))])
     kl = kl[kl.capacity > kl.anchor_tokens]  # steps where eviction is needed
-    kl["share"] = kl.assigned_budget / kl.groupby(["step"]).assigned_budget.transform("sum")
+    kl["share"] = kl.assigned_budget / kl.groupby(["run", "step"]).assigned_budget.transform("sum")
     kaba = pd.DataFrame({"kaba_share": kl.groupby("layer").share.mean(),
                          "kaba_retained_median": kl.groupby("layer").retained_tokens.median(),
                          "kaba_anchor_floor_frac": kl.assign(f=kl.assigned_budget <= kl.anchor_tokens)
