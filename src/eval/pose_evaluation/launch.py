@@ -20,6 +20,13 @@ from eval.pose_evaluation.utils import *
 from accelerate import PartialState
 from streamvggt.models.streamvggt import StreamVGGT
 from streamvggt.layers.confidence_state import parse_confidence_gate_init
+from streamvggt.utils.w5_profile import (
+    W5 as w5_profiler,
+    append_summary_row as w5_append_summary_row,
+    gpu_info as w5_gpu_info,
+    gpu_memory_begin as w5_gpu_memory_begin,
+    gpu_memory_end as w5_gpu_memory_end,
+)
 from streamvggt.utils.cache_analysis import (
     add_leverage_score_histogram_args,
     leverage_score_histogram_config_from_args,
@@ -208,6 +215,13 @@ def get_args_parser():
     parser.add_argument("--layer_budget_log_path", type=str, default=None, help="Optional explicit CSV path for layer budget score logs")
     parser.add_argument("--eviction_debug", action="store_true", help="Print verbose eviction summaries without enabling latency profiling")
     parser.add_argument("--profile_eviction", action="store_true", help="Print per-eviction svd_leverage timing/profile fields without changing eviction behavior")
+    parser.add_argument("--perf_trace", action="store_true", help="Collect non-synchronizing CUDA-event performance totals and print one summary per inference")
+    parser.add_argument("--w5_profile", action="store_true", help="W5 analysis: per-frame latency, IDC/KABA time, actual KV storage and peak memory per sequence")
+    parser.add_argument("--w5_profile_dir", type=str, default=None, help="Output dir for W5 CSVs (default: <output_dir>/w5_profile)")
+    parser.add_argument("--w5_warmup_frames", type=int, default=10, help="Frames of the first sequence used for one discarded warmup inference (0 disables)")
+    parser.add_argument("--w5_skip_eval", action="store_true", help="Skip trajectory evaluation (timing/memory-only runs)")
+    parser.add_argument("--w5_max_seqs", type=int, default=0, help="Only run the first N sequences (0 = all)")
+    parser.add_argument("--w5_seqs", type=str, default=None, help="Comma-separated sequence names to run (default: all)")
     add_leverage_score_histogram_args(parser)
     parser.add_argument("--budget", type=int, default=60000, help="Total token budget for StreamVGGT (if applicable)")
     parser.add_argument("--budget_frame_multiplier", type=float, default=None, help="Set StreamVGGT total budget to ceil(multiplier * tokens_per_frame) * num_global_layers; overrides --budget")
@@ -257,6 +271,14 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 seq for seq in seq_list if os.path.isdir(os.path.join(img_path, seq))
             ]
         seq_list = sorted(seq_list)
+    if args.w5_seqs:
+        wanted = [name.strip() for name in args.w5_seqs.split(",") if name.strip()]
+        missing = [name for name in wanted if name not in seq_list]
+        if missing:
+            raise SystemExit(f"Error: --w5_seqs not found in {args.eval_dataset}: {missing}")
+        seq_list = wanted
+    if args.w5_max_seqs > 0:
+        seq_list = seq_list[: args.w5_max_seqs]
 
     if save_dir is None:
         save_dir = args.output_dir
@@ -266,6 +288,13 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
     device = distributed_state.device
 
     os.makedirs(save_dir, exist_ok=True)
+    w5_dir = args.w5_profile_dir or os.path.join(save_dir, "w5_profile")
+    w5_summary_path = os.path.join(w5_dir, f"summary_rank{distributed_state.process_index}.csv")
+    w5_warmed_up = False
+    if args.w5_profile:
+        os.makedirs(w5_dir, exist_ok=True)
+        if os.path.exists(w5_summary_path):
+            os.remove(w5_summary_path)
     with distributed_state.split_between_processes(seq_list) as seqs:
         ate_list = []
         rpe_trans_list = []
@@ -340,10 +369,6 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                 with torch.no_grad():
                     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
                     with torch.cuda.amp.autocast(dtype=dtype):
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize(device)
-                        start = time.perf_counter()
-
                         leverage_score_histogram_config = None
                         if args.leverage_score_histogram_dir:
                             hist_dir = os.path.join(
@@ -353,8 +378,7 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                                 safe_seq,
                             )
                             leverage_score_histogram_config = leverage_score_histogram_config_from_args(args, output_dir=hist_dir)
-                        output = model.inference(
-                            frames,
+                        infer_kwargs = dict(
                             total_budget=args.budget,
                             stream_chunk_size=args.stream_chunk_size,
                             budget_frame_multiplier=args.budget_frame_multiplier,
@@ -402,13 +426,55 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                             empty_cache_interval=args.empty_cache_interval,
                             eviction_debug=args.eviction_debug,
                             leverage_score_histogram_config=leverage_score_histogram_config,
+                            perf_trace=args.perf_trace,
                         )
+                        if args.w5_profile and not w5_warmed_up and args.w5_warmup_frames > 0:
+                            warmup_kwargs = dict(infer_kwargs)
+                            warmup_kwargs.update(
+                                layer_budget_log_path=None,
+                                anchor_budget_overage_log_path=None,
+                                leverage_score_histogram_config=None,
+                                profile_eviction=False,
+                                perf_trace=False,
+                            )
+                            model.inference(frames[: args.w5_warmup_frames], cache_results=False, **warmup_kwargs)
+                            torch.cuda.synchronize(device)
+                            torch.cuda.empty_cache()
+                            print(f"[W5] warmup done on {args.w5_warmup_frames} frames")
+                        w5_warmed_up = True
+                        w5_baseline_gb = w5_gpu_memory_begin() if args.w5_profile else 0.0
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize(device)
+                        start = time.perf_counter()
+                        output = model.inference(frames, w5_profile=args.w5_profile, **infer_kwargs)
                         if leverage_score_histogram_config is not None:
                             leverage_score_histogram_config.flush()
                         if torch.cuda.is_available():
                             torch.cuda.synchronize(device)
                         infer_time = time.perf_counter() - start
                 fps = len(filelist) / infer_time if infer_time > 0 else float("inf")
+                w5_row = None
+                if args.w5_profile:
+                    w5_mem = w5_gpu_memory_end()
+                    w5_stats = dict(getattr(model, "last_run_stats", None) or {})
+                    w5_profiler.write_sequence_csvs(os.path.join(w5_dir, args.eval_dataset), safe_seq)
+                    w5_row = {
+                        "dataset": args.eval_dataset,
+                        "seq": safe_seq,
+                        **w5_gpu_info(),
+                        "launcher_time_s": infer_time,
+                        **w5_stats,
+                        "baseline_GB": w5_baseline_gb,
+                        **w5_mem,
+                    }
+                    print(
+                        f"[W5] {args.eval_dataset}/{safe_seq} frames={w5_stats.get('n_frames')} "
+                        f"e2e={w5_stats.get('e2e_time_s', 0):.3f}s ({w5_stats.get('e2e_fps', 0):.2f} FPS) "
+                        f"infer={w5_stats.get('infer_time_s', 0):.3f}s ({w5_stats.get('infer_fps', 0):.2f} FPS) "
+                        f"idc={w5_stats.get('idc_time_s', 0):.3f}s kaba={w5_stats.get('kaba_time_s', 0):.3f}s "
+                        f"peak={w5_mem['peak_alloc_GB']:.2f}GB kv_excess_max={w5_stats.get('kv_excess_max')}"
+                    )
+                w5_eval_start = time.perf_counter()
                 print(
                     f"Finished pose estimation for {args.eval_dataset} {seq: <16}, "
                     f"Inference time: {infer_time:.6f}s, FPS: {fps:.2f}"
@@ -477,6 +543,13 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
 
                 print(f"Pose encoding and extrinsics saved to: {pose_save_path}")
 
+                if args.w5_skip_eval:
+                    if w5_row is not None:
+                        w5_row["eval_time_s"] = 0.0
+                        w5_row["ate"] = None
+                        w5_append_summary_row(w5_summary_path, w5_row)
+                    continue
+
 
                 gt_traj_loader = metadata.get("gt_traj_loader", None)
                 if gt_traj_loader is not None:
@@ -518,6 +591,10 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                     bug = True
 
                 ate_list.append(ate)
+                if w5_row is not None:
+                    w5_row["eval_time_s"] = time.perf_counter() - w5_eval_start
+                    w5_row["ate"] = ate
+                    w5_append_summary_row(w5_summary_path, w5_row)
                 rpe_trans_list.append(rpe_trans)
                 rpe_rot_list.append(rpe_rot)
 

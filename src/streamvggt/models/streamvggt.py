@@ -23,6 +23,7 @@ from streamvggt.utils.cache_analysis import (
     PreEvictionSnapshotConfig,
     TokenOverlayDumpConfig,
 )
+from streamvggt.utils.w5_profile import W5 as _W5, IDC as _W5_IDC
 from streamvggt.layers.confidence_state import make_token_confidence_gate, pack_kv_cache, sample_token_confidence, unpack_kv_cache
 
 @dataclass
@@ -258,6 +259,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         eviction_policy_layers: Optional[Set[int]] = None,
         profile_eviction: bool = False,
         perf_trace: bool = False,
+        w5_profile: bool = False,
         empty_cache_interval: int = 1,
         eviction_debug: bool = False,
         leverage_sketch_dim: Optional[int] = 256,
@@ -398,6 +400,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         perf_trace_events = []
         perf_trace_cpu_totals = {}
         self.aggregator.configure_perf_trace(perf_trace)
+        _W5.configure(w5_profile)
+        _W5.begin_sequence()
+        self.last_run_stats = None
 
         def _perf_trace_start():
             if not perf_trace:
@@ -449,6 +454,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             chunk_last_idx = chunk_frame_ids[-1]
             cache_write_current_frame = True
             cache_evict_current_frame = True
+            _W5.begin_chunk(chunk_start)
 
             profile_stage_start = _profile_start()
             target_device = next(self.parameters()).device
@@ -595,6 +601,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             depth_last = depth_all[:, -1]
 
             tokens_per_frame = int(aggregated_tokens[-1].shape[2])
+            _W5.record_cache(
+                chunk_last_idx,
+                past_key_values,
+                past_key_values_camera,
+                self.aggregator.global_blocks,
+                None if layer_budget_score_only else total_budget,
+            )
             for local_idx, (global_frame_idx, frame) in enumerate(zip(chunk_frame_ids, chunk_frames)):
                 camera_pose = camera_pose_all[:, local_idx, :]
                 depth = depth_all[:, local_idx]
@@ -602,6 +615,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                 pts3d = pts3d_all[:, local_idx]
                 pts3d_conf = pts3d_conf_all[:, local_idx]
 
+                w5_gate_start = _W5.start() if leverage_conf_gate else None
                 if leverage_conf_gate:
                     use_depth_conf = float(leverage_conf_gate_depth_alpha) != 0.0
                     use_point_conf = float(leverage_conf_gate_point_beta) != 0.0
@@ -651,6 +665,7 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                             continue
                         confidence_state.update_frame_gate(global_frame_idx, token_conf_gate)
                         past_key_values[layer_id] = pack_kv_cache(k_cache, v_cache, confidence_state)
+                _W5.end(_W5_IDC, w5_gate_start)
 
                 profile_stage_start = _profile_start()
                 res_gpu = {
@@ -705,6 +720,11 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                     del res_gpu
 
             _profile_record("anchor_cache_update", profile_stage_start)
+            _W5.end_chunk(chunk_frame_ids)
+
+        if _W5.enabled:
+            self.last_run_stats = _W5.end_sequence()
+            self.last_run_stats["budget"] = int(total_budget) if total_budget is not None else -1
 
         if profile_eviction:
             if torch.cuda.is_available():

@@ -26,6 +26,13 @@ import subprocess
 from collections import defaultdict
 from pathlib import Path
 from streamvggt.layers.confidence_state import parse_confidence_gate_init
+from streamvggt.utils.w5_profile import (
+    W5 as w5_profiler,
+    append_summary_row as w5_append_summary_row,
+    gpu_info as w5_gpu_info,
+    gpu_memory_begin as w5_gpu_memory_begin,
+    gpu_memory_end as w5_gpu_memory_end,
+)
 from streamvggt.utils.cache_analysis import (
     add_eviction_nn_analysis_args,
     add_leverage_score_histogram_args,
@@ -41,7 +48,7 @@ import hashlib
 from pathlib import Path
 import attn_cuda._ext as attn_ext
 
-def seed_everything(seed: int) -> int:
+def seed_everything(seed: int, deterministic_algorithms: bool = True) -> int:
     seed = int(seed)
 
     random.seed(seed)
@@ -55,7 +62,9 @@ def seed_everything(seed: int) -> int:
 
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
+    if deterministic_algorithms:
+        # ~33% slower inference (CuBLAS/indexing fallbacks); disabled for W5 timing runs.
+        torch.use_deterministic_algorithms(True)
 
     print(
         f"[Seed] rank={os.environ.get('RANK', '0')}, seed={seed}",
@@ -267,6 +276,14 @@ def get_args_parser():
         action="store_true",
         help="Collect non-synchronizing CUDA-event performance totals and print one summary per inference",
     )
+    parser.add_argument("--w5_profile", action="store_true", help="W5 analysis: per-frame latency, IDC/KABA time, actual KV storage and peak memory per sequence")
+    parser.add_argument("--w5_profile_dir", type=str, default=None, help="Output dir for W5 CSVs (default: <output_dir>/w5_profile)")
+    parser.add_argument("--w5_warmup_frames", type=int, default=10, help="Frames of the first sequence used for one discarded warmup inference (0 disables)")
+    parser.add_argument("--w5_skip_eval", action="store_true", help="Skip reconstruction metrics (timing/memory-only runs)")
+    parser.add_argument("--w5_max_scenes", type=int, default=0, help="Only run the first N scenes of each dataset (0 = all)")
+    parser.add_argument("--datasets", type=str, default="NRGBD", help="Comma-separated mv_recon datasets: 7scenes,NRGBD,ETH3D,ETH3D_undistort")
+    parser.add_argument("--inputs_on_cpu", action="store_true", help="Keep the whole sequence in host RAM and stream frames to the GPU one by one (peak GPU memory then excludes the input sequence)")
+    parser.add_argument("--empty_cache_interval", type=int, default=1, help="Call torch.cuda.empty_cache every N frames inside inference (0 disables)")
     add_eviction_nn_analysis_args(parser)
     add_leverage_score_histogram_args(parser)
     add_projected_norm_histogram_args(parser)
@@ -372,40 +389,43 @@ def main(args):
         # resolution = (518, 336)
     else:
         raise NotImplementedError
-    datasets_all = {
-        # "7scenes": SevenScenes(
-        #     split="test",
-        #     ROOT="/home/dongjae/data/7scenes",
-        #     # ROOT="/data2/dongjae/datasets/7scenes_sfm",
-        #     resolution=resolution,
-        #     num_seq=1,
-        #     full_video=True,
-        #     kf_every=args.kf_every,
-        #     max_frames=args.max_frames,
-        # ),
-        "NRGBD": NRGBD(
+    dataset_factories = {
+        "7scenes": lambda: SevenScenes(
             split="test",
-            ROOT="/home/dongjae/data/neural_rgbd_data",
+            ROOT=os.environ.get("SSTREAMVGGT_7SCENES_ROOT", "/home/dongjae/data/7scenes"),
             resolution=resolution,
             num_seq=1,
             full_video=True,
             kf_every=args.kf_every,
             max_frames=args.max_frames,
-            # test_id=[ "kitchen", "morning_apartment", "staircase", "thin_geometry", "whiteroom"]
         ),
-        # "ETH3D": ETH3D(
-        #     ROOT="/home/dongjae/data/eth3d",
-        #     full_video=True,
-        #     resolution=resolution,
-        #     kf_every=1,
-        # ),
-        # "ETH3D_undistort": ETH3D_undistort(
-        #     ROOT="/home/dongjae/data/eth3d",
-        #     full_video=True,
-        #     resolution=resolution,
-        #     kf_every=1,
-        # ),
+        "NRGBD": lambda: NRGBD(
+            split="test",
+            ROOT=os.environ.get("SSTREAMVGGT_NRGBD_ROOT", "/home/dongjae/data/neural_rgbd_data"),
+            resolution=resolution,
+            num_seq=1,
+            full_video=True,
+            kf_every=args.kf_every,
+            max_frames=args.max_frames,
+        ),
+        "ETH3D": lambda: ETH3D(
+            ROOT=os.environ.get("SSTREAMVGGT_ETH3D_ROOT", "/home/dongjae/data/eth3d"),
+            full_video=True,
+            resolution=resolution,
+            kf_every=1,
+        ),
+        "ETH3D_undistort": lambda: ETH3D_undistort(
+            ROOT=os.environ.get("SSTREAMVGGT_ETH3D_ROOT", "/home/dongjae/data/eth3d"),
+            full_video=True,
+            resolution=resolution,
+            kf_every=1,
+        ),
     }
+    requested_datasets = [name.strip() for name in args.datasets.split(",") if name.strip()]
+    unknown_datasets = [name for name in requested_datasets if name not in dataset_factories]
+    if unknown_datasets:
+        raise SystemExit(f"Error: unknown --datasets {unknown_datasets}; choose from {sorted(dataset_factories)}")
+    datasets_all = {name: dataset_factories[name]() for name in requested_datasets}
 
     accelerator = Accelerator(
         kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(seconds=6000))]
@@ -458,6 +478,13 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
     criterion = Regr3D_t_ScaleShiftInv(L21, norm_mode=False, gt_scale=True)
+    w5_dir = args.w5_profile_dir or osp.join(args.output_dir, "w5_profile")
+    w5_summary_path = osp.join(w5_dir, f"summary_rank{accelerator.process_index}.csv")
+    w5_state = {"warmed_up": False}
+    if args.w5_profile:
+        os.makedirs(w5_dir, exist_ok=True)
+        if osp.exists(w5_summary_path):
+            os.remove(w5_summary_path)
 
     with torch.no_grad():
         for name_data, dataset in datasets_all.items():
@@ -485,7 +512,10 @@ def main(args):
             fps_all = []
             time_all = []
 
-            with accelerator.split_between_processes(list(range(len(dataset)))) as idxs:
+            scene_indices = list(range(len(dataset)))
+            if args.w5_max_scenes > 0:
+                scene_indices = scene_indices[: args.w5_max_scenes]
+            with accelerator.split_between_processes(scene_indices) as idxs:
                 for data_idx in tqdm(idxs):
                     batch = default_collate([dataset[data_idx]])
                     ignore_keys = set(
@@ -500,6 +530,9 @@ def main(args):
                         ]
                     )
                     for view in batch:
+                        if args.inputs_on_cpu:
+                            # Keep the sequence in host RAM; inference streams each frame to the GPU.
+                            break
                         for name in view.keys():  # pseudo_focal
                             if name in ignore_keys:
                                 continue
@@ -614,11 +647,7 @@ def main(args):
                                     "layer_budget_scores.csv",
                                 )
 
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize(device)
-                            infer_start = time.perf_counter()
-                            results = model.inference(
-                                batch,
+                            infer_kwargs = dict(
                                 eviction_policy=args.eviction_policy,
                                 stream_chunk_size=args.stream_chunk_size,
                                 budget_frame_multiplier=args.budget_frame_multiplier,
@@ -668,10 +697,55 @@ def main(args):
                                 leverage_score_histogram_config=leverage_score_histogram_config,
                                 projected_norm_histogram_config=projected_norm_histogram_config,
                                 token_overlay_dump_config=token_overlay_dump_config,
+                                empty_cache_interval=args.empty_cache_interval,
                             )
+                            if args.w5_profile and not w5_state["warmed_up"] and args.w5_warmup_frames > 0:
+                                warmup_kwargs = dict(infer_kwargs)
+                                for log_key in (
+                                    "layer_budget_log_path",
+                                    "anchor_budget_overage_log_path",
+                                    "eviction_nn_analysis_config",
+                                    "leverage_score_histogram_config",
+                                    "projected_norm_histogram_config",
+                                    "token_overlay_dump_config",
+                                ):
+                                    warmup_kwargs[log_key] = None
+                                warmup_kwargs["profile_eviction"] = False
+                                warmup_kwargs["perf_trace"] = False
+                                model.inference(batch[: args.w5_warmup_frames], cache_results=False, **warmup_kwargs)
+                                torch.cuda.synchronize(device)
+                                torch.cuda.empty_cache()
+                                print(f"[W5] warmup done on {args.w5_warmup_frames} frames")
+                            w5_state["warmed_up"] = True
+                            w5_baseline_gb = w5_gpu_memory_begin() if args.w5_profile else 0.0
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize(device)
+                            infer_start = time.perf_counter()
+                            results = model.inference(batch, w5_profile=args.w5_profile, **infer_kwargs)
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize(device)
                             infer_time = time.perf_counter() - infer_start
+                            w5_row = None
+                            if args.w5_profile:
+                                w5_mem = w5_gpu_memory_end()
+                                w5_stats = dict(getattr(model, "last_run_stats", None) or {})
+                                w5_profiler.write_sequence_csvs(osp.join(w5_dir, name_data), scene_key)
+                                w5_row = {
+                                    "dataset": name_data,
+                                    "seq": scene_key,
+                                    **w5_gpu_info(),
+                                    "launcher_time_s": infer_time,
+                                    **w5_stats,
+                                    "baseline_GB": w5_baseline_gb,
+                                    **w5_mem,
+                                }
+                                print(
+                                    f"[W5] {name_data}/{scene_key} frames={w5_stats.get('n_frames')} "
+                                    f"e2e={w5_stats.get('e2e_time_s', 0):.3f}s ({w5_stats.get('e2e_fps', 0):.2f} FPS) "
+                                    f"infer={w5_stats.get('infer_time_s', 0):.3f}s ({w5_stats.get('infer_fps', 0):.2f} FPS) "
+                                    f"idc={w5_stats.get('idc_time_s', 0):.3f}s kaba={w5_stats.get('kaba_time_s', 0):.3f}s "
+                                    f"peak={w5_mem['peak_alloc_GB']:.2f}GB kv_excess_max={w5_stats.get('kv_excess_max')}"
+                                )
                             fps = num_input_frames / infer_time if infer_time > 0 else float("inf")
                             time_all.append(infer_time)
                             fps_all.append(fps)
@@ -705,6 +779,15 @@ def main(args):
                         print(timing_msg)
 
                     summarize_layer_budget_log(layer_budget_log_path)
+
+                    if args.w5_skip_eval:
+                        if w5_row is not None:
+                            w5_row["eval_time_s"] = 0.0
+                            w5_append_summary_row(w5_summary_path, w5_row)
+                        del results, preds, batch
+                        torch.cuda.empty_cache()
+                        continue
+                    w5_eval_start = time.perf_counter()
 
                     # Evaluation
                     print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
@@ -774,6 +857,9 @@ def main(args):
                         device=device if args.eval_device == "cuda" else "cpu",
                     )
                     metric_msg = format_metric(scene_id, metrics, infer_time, fps)
+                    if w5_row is not None:
+                        w5_row["eval_time_s"] = time.perf_counter() - w5_eval_start
+                        w5_append_summary_row(w5_summary_path, w5_row)
                     print(metric_msg)
                     with open(log_file, "a") as f:
                         print(metric_msg, file=f)
@@ -814,7 +900,7 @@ def main(args):
                     json.dump(manifest, f, indent=2)
                 os.replace(manifest_path + ".tmp", manifest_path)
                 print(f"Inference complete. Run: python eval/mv_recon/evaluate_saved.py --output_dir {args.output_dir}")
-            if args.eval_stage == "infer":
+            if args.eval_stage == "infer" or args.w5_skip_eval:
                 continue
             # Get depth from pcd and run TSDFusion
             if accelerator.is_main_process:
@@ -882,6 +968,9 @@ if __name__ == "__main__":
     parser = get_args_parser()
     args = parser.parse_args()
 
-    seed_everything(args.random_seed)
+    seed_everything(
+        args.random_seed,
+        deterministic_algorithms=not (args.w5_profile or args.perf_trace or args.profile_eviction),
+    )
 
     main(args)

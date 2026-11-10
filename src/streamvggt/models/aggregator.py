@@ -24,6 +24,7 @@ from streamvggt.layers.eviction import (
 )
 from streamvggt.layers.rope import RotaryPositionEmbedding2D, PositionGetter
 from streamvggt.layers.vision_transformer import vit_small, vit_base, vit_large, vit_giant2
+from streamvggt.utils.w5_profile import W5 as _W5, KABA as _W5_KABA
 from streamvggt.utils.cache_analysis import (
     CacheAnalysisConfig,
     EvictionNNAnalysisConfig,
@@ -409,6 +410,7 @@ class Aggregator(nn.Module):
         output_list = []
         current_cache_token_count = S * P if cache_write_current_frame else 0
         budget_trace_start, budget_trace_cpu_start = self._perf_trace_start(images)
+        w5_kaba_start = _W5.start()
         if profile_eviction:
             if images.is_cuda and torch.cuda.is_available():
                 torch.cuda.synchronize(images.device)
@@ -438,6 +440,7 @@ class Aggregator(nn.Module):
             self._layer_budget_capacities(past_key_values, current_cache_token_count)
             if anchor_budget_overage_log_path else None
         )
+        _W5.end(_W5_KABA, w5_kaba_start)
         self._perf_trace_end("dynamic_budget", budget_trace_start, budget_trace_cpu_start)
         scores = []
         layer_budget_scores = []

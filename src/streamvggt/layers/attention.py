@@ -22,6 +22,7 @@ from streamvggt.utils.cache_analysis import (
     dump_token_overlay_event,
 )
 from streamvggt.layers.eviction import EvictionManager
+from streamvggt.utils.w5_profile import W5 as _W5, IDC as _W5_IDC
 from streamvggt.layers.confidence_state import KVConfidenceState, pack_kv_cache, parse_confidence_gate_init, unpack_kv_cache
 
 XFORMERS_AVAILABLE = False
@@ -975,6 +976,7 @@ class Attention(nn.Module):
                     if anchor_token_count is not None
                     else self.num_anchor_tokens
                 )
+                w5_idc_start = _W5.start()
                 eviction_result = self.eviction(
                     k,
                     v,
@@ -983,6 +985,7 @@ class Attention(nn.Module):
                     confidence_state=confidence_state,
                     **eviction_kwargs,
                 )
+                _W5.end(_W5_IDC, w5_idc_start)
                 if confidence_state is not None:
                     k, v, confidence_state, scores = eviction_result
                 else:
@@ -1070,6 +1073,7 @@ class Attention(nn.Module):
             x = attn @ v_for_attn
 
         if leverage_attention_utility:
+            w5_util_start = _W5.start()
             if confidence_state is None or attention_colsum is None:
                 raise RuntimeError("Attention utility state or CUDA column-sum is missing")
             if k_for_attn.shape[2] != confidence_state.frame_ids.shape[1]:
@@ -1088,6 +1092,7 @@ class Attention(nn.Module):
                 freeze_updates=int(leverage_attention_freeze_updates),
             )
             new_kv = pack_kv_cache(k, v, confidence_state)
+            _W5.end(_W5_IDC, w5_util_start)
 
         self._record_forward_profile("attention_kernel", attention_kernel_start, x, profile_forward)
         output_projection_start = self._profile_start(x, profile_forward)
