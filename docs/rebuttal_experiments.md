@@ -199,6 +199,14 @@ per step/layer/set the mean, median, p90, max and the share of tokens with >= 1 
 and the Spearman correlation between a token's leverage and its density (`spearman_lev_dens{tau}`). Runs:
 `pr_density_frames100/`, `pr_density_framesfull/` (IDC; queue_extra), summary in `pr_density_summary/`.
 
+Density heterogeneity (does N_i differ across tokens, as for clustered keys, or is it uniform, as for keys spread
+evenly over independent directions?): per step/layer/set the std, CV, top-10% / bottom-10% mean ratio, max / min
+ratio (+1 smoothed) and Gini of N_i (`dens{tau}_{std,cv,topbot,maxmin,gini}`), and the spread of each token's mean
+cosine (`tokcos_*`), in both spaces. `--redundancy_dump_tokens` saves the per-token arrays (`<scene>_tokens.npz`).
+`tools/analyze_density_heterogeneity.py` summarises them, bins tokens by density decile (mean relative leverage and
+share kept per decile) and adds a balanced vs skewed synthetic reference with the same psi/N. Runs:
+`pr_het_frames100/`, `pr_het_framesfull/` (jobs_het.txt), summary in `pr_het_summary/`.
+
 Outputs: `summary.csv` (medians, p90, share of degenerate cases: erank < 2 or mean cosine > 0.9),
 `per_layer_median.csv`, per-layer boxplots, and a psi/N vs effective rank scatter.
 

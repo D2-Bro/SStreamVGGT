@@ -214,6 +214,7 @@ def get_args_parser():
     parser.add_argument("--compactor_headwise_norm", action="store_true")
     parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the seeds but do not force deterministic CUDA kernels")
     parser.add_argument("--redundancy_log", action="store_true", help="Write cache redundancy / local density statistics per sequence to <output_dir>/<dataset>/redundancy/<seq>.csv")
+    parser.add_argument("--redundancy_dump_tokens", action="store_true", help="With --redundancy_log: also save per-token arrays (neighbour counts, mean cosine, leverage, kept) per scene as <scene>_tokens.npz")
     parser.add_argument("--redundancy_log_every", type=int, default=10)
     parser.add_argument("--pose_eval_prefix_frames", type=int, nargs="*", default=[], help="Also report ATE/RPE on the first K input frames of each sequence (streaming is causal, so this equals a K-frame run); e.g. 100")
     parser.add_argument("--layer_budget_eps", type=float, default=0)
@@ -367,7 +368,8 @@ def eval_pose_estimation_dist(args, model, img_path, save_dir=None, mask_path=No
                         if args.redundancy_log:
                             from streamvggt.utils import redundancy_log
                             redundancy_log.configure(
-                                os.path.join(save_dir, args.eval_dataset, "redundancy"), every=args.redundancy_log_every
+                                os.path.join(save_dir, args.eval_dataset, "redundancy"), every=args.redundancy_log_every,
+                                dump_tokens=args.redundancy_dump_tokens,
                             )
                             redundancy_log.set_scene(seq.replace("/", "_"))
                         if torch.cuda.is_available():

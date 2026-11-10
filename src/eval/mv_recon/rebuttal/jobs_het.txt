@@ -1,0 +1,4 @@
+# Density heterogeneity (per-token neighbour counts: std / CV / top-vs-bottom 10% / max-min / Gini, per-token mean
+# cosine), 1024-d and sketch space, with per-token arrays (--redundancy_dump_tokens). IDC, 7-Scenes + NRGBD.
+het_frames100	MAX_FRAMES=100 REDUNDANCY_LOG_EVERY=10 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_het_frames100 EXTRA_ARGS=--redundancy_dump_tokens bash pr_analysis.sh IDC
+het_framesfull	MAX_FRAMES=full REDUNDANCY_LOG_EVERY=25 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_het_framesfull EXTRA_ARGS=--redundancy_dump_tokens bash pr_analysis.sh IDC

@@ -258,6 +258,7 @@ def get_args_parser():
     parser.add_argument("--layer_budget_alpha", type=float, default=0.7)
     parser.add_argument("--layer_budget_min_tokens", type=int, default=0)
     parser.add_argument("--redundancy_log", action="store_true", help="Write cache redundancy statistics (cosine, effective rank, psi) per scene/step/layer, before and after eviction, to <output_dir>/<dataset>/redundancy/<scene>.csv")
+    parser.add_argument("--redundancy_dump_tokens", action="store_true", help="With --redundancy_log: also save per-token arrays (neighbour counts, mean cosine, leverage, kept) per scene as <scene>_tokens.npz")
     parser.add_argument("--redundancy_log_every", type=int, default=10, help="Log redundancy statistics every N steps")
     parser.add_argument("--leverage_attention_source", choices=("causal_history", "noncausal_current"), default="causal_history", help="IDC importance: attention accumulated from later frames (causal_history) or, at each eviction, the current frame's queries over all live keys with no history (noncausal_current, Compactor-style)")
     parser.add_argument("--leverage_score_norm", choices=("mean", "zscore"), default="mean", help="Combine leverage and importance by mean normalisation (IDC) or z(util) + lambda*z(lev) (Compactor)")
@@ -653,7 +654,8 @@ def main(args):
                             if args.redundancy_log:
                                 from streamvggt.utils import redundancy_log
                                 redundancy_log.configure(
-                                    osp.join(args.output_dir, name_data, "redundancy"), every=args.redundancy_log_every
+                                    osp.join(args.output_dir, name_data, "redundancy"), every=args.redundancy_log_every,
+                                    dump_tokens=args.redundancy_dump_tokens,
                                 )
                                 # One representative per scene: sequences that differ only by number (7-Scenes
                                 # chess/seq-03, chess/seq-05, ...) log only the first one in dataset order.

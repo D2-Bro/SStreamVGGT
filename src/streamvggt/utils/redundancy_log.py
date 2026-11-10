@@ -13,6 +13,7 @@ right-sketched 256-d matrix).
 Enabled from a launcher with configure(); attention.eviction calls record() after choosing the kept tokens.
 """
 
+import atexit
 import csv
 import math
 import os
@@ -20,7 +21,9 @@ from typing import Optional, Sequence
 
 import torch
 
-_CONFIG = {"dir": None, "every": 10, "taus": (0.5, 0.7, 0.8, 0.9), "scene": None, "path": None}
+_CONFIG = {"dir": None, "every": 10, "taus": (0.5, 0.7, 0.8, 0.9), "scene": None, "path": None,
+           "dump_tokens": False}
+_TOKEN_DUMP = {"scene_path": None, "items": {}}  # space -> list of per-(step, layer) dicts
 DENSITY_TAUS = (0.7, 0.8, 0.9)  # local density: per-token count of other tokens with cosine > tau
 
 FIELDS_BASE = [
@@ -29,12 +32,35 @@ FIELDS_BASE = [
 ]
 
 
-def configure(log_dir: Optional[str], every: int = 10, taus: Sequence[float] = (0.5, 0.7, 0.9)):
-    _CONFIG.update(dir=log_dir, every=max(int(every), 1), taus=tuple(float(t) for t in taus))
+def configure(log_dir: Optional[str], every: int = 10, taus: Sequence[float] = (0.5, 0.7, 0.8, 0.9),
+              dump_tokens: bool = False):
+    _CONFIG.update(dir=log_dir, every=max(int(every), 1), taus=tuple(float(t) for t in taus),
+                   dump_tokens=bool(dump_tokens))
+
+
+def _flush_token_dump():
+    """Write the per-token arrays of the current scene (one .npz per scene)."""
+    path, by_space = _TOKEN_DUMP["scene_path"], _TOKEN_DUMP["items"]
+    if path and any(by_space.values()):
+        import numpy as np
+        out = {}
+        # keys "<space>_<array>" (space = full / sketch); "<space>_offsets" slices the per-(step, layer) rows
+        for space, items in by_space.items():
+            if not items:
+                continue
+            for key in items[0]:
+                if key in ("step", "layer", "n"):
+                    out[f"{space}_{key}"] = np.asarray([it[key] for it in items], dtype=np.int32)
+                else:
+                    out[f"{space}_{key}"] = np.concatenate([it[key] for it in items])
+            out[f"{space}_offsets"] = np.cumsum([0] + [it["n"] for it in items]).astype(np.int64)
+        np.savez_compressed(path, **out)
+    _TOKEN_DUMP.update(scene_path=None, items={})
 
 
 def set_scene(scene_key: Optional[str]):
     """Start a new CSV for this scene (overwrites an earlier file of the same scene)."""
+    _flush_token_dump()
     _CONFIG["scene"] = scene_key
     _CONFIG["path"] = None
     if _CONFIG["dir"] and scene_key:
@@ -42,6 +68,8 @@ def set_scene(scene_key: Optional[str]):
         _CONFIG["path"] = os.path.join(_CONFIG["dir"], f"{scene_key}.csv")
         with open(_CONFIG["path"], "w", newline="") as f:
             csv.writer(f).writerow(_fields())
+        if _CONFIG["dump_tokens"]:
+            _TOKEN_DUMP["scene_path"] = os.path.join(_CONFIG["dir"], f"{scene_key}_tokens.npz")
 
 
 def enabled(step_idx: Optional[int]) -> bool:
@@ -55,7 +83,11 @@ def _density_fields():
         out += [f"{k}_mean", f"{k}_p50", f"{k}_p90", f"{k}_max", f"{k}_ge1", f"{k}_ge10",
                 # candidates rows only: density (within the candidate set) of the kept vs the evicted tokens,
                 # and the Spearman correlation between a token's leverage and its density
-                f"{k}_kept_mean", f"{k}_evicted_mean", f"{k}_kept_ge1", f"{k}_evicted_ge1", f"spearman_lev_{k}"]
+                f"{k}_kept_mean", f"{k}_evicted_mean", f"{k}_kept_ge1", f"{k}_evicted_ge1", f"spearman_lev_{k}",
+                # heterogeneity of the density across tokens
+                f"{k}_std", f"{k}_cv", f"{k}_min", f"{k}_p10", f"{k}_top10", f"{k}_bot10", f"{k}_topbot",
+                f"{k}_maxmin", f"{k}_gini"]
+    out += ["tokcos_mean", "tokcos_std", "tokcos_p10", "tokcos_p90", "tokcos_top10", "tokcos_bot10"]
     return out
 
 
@@ -64,14 +96,31 @@ def _fields():
     return FIELDS_BASE + taus + ["nn_cos_mean", "nn_cos_p10", "nn_cos_p50", "nn_cos_p90"] + _density_fields()
 
 
+def _top_bottom(c: torch.Tensor, frac: float = 0.1):
+    k = max(int(round(frac * c.numel())), 1)
+    srt = torch.sort(c).values
+    return float(srt[-k:].mean()), float(srt[:k].mean())
+
+
 def _summarize_density(counts: torch.Tensor, prefix: str) -> dict:
     if counts.numel() == 0:
         return {}
     c = counts.double()
-    q = torch.quantile(c, torch.tensor([0.5, 0.9], device=c.device, dtype=c.dtype))
-    return {f"{prefix}_mean": float(c.mean()), f"{prefix}_p50": float(q[0]), f"{prefix}_p90": float(q[1]),
+    q = torch.quantile(c, torch.tensor([0.1, 0.5, 0.9], device=c.device, dtype=c.dtype))
+    mean, std = float(c.mean()), float(c.std(unbiased=False))
+    top, bot = _top_bottom(c)
+    srt = torch.sort(c).values
+    n = srt.numel()
+    # Gini: 0 = every token has the same number of neighbours, -> 1 = all neighbours concentrated on few tokens
+    gini = float(((2 * torch.arange(1, n + 1, device=c.device, dtype=c.dtype) - n - 1) * srt).sum() / (n * srt.sum())) \
+        if float(srt.sum()) > 0 else 0.0
+    return {f"{prefix}_mean": mean, f"{prefix}_p50": float(q[1]), f"{prefix}_p90": float(q[2]),
             f"{prefix}_max": float(c.max()), f"{prefix}_ge1": float((c >= 1).double().mean()),
-            f"{prefix}_ge10": float((c >= 10).double().mean())}
+            f"{prefix}_ge10": float((c >= 10).double().mean()),
+            f"{prefix}_std": std, f"{prefix}_cv": std / mean if mean > 0 else float("nan"),
+            f"{prefix}_min": float(c.min()), f"{prefix}_p10": float(q[0]),
+            f"{prefix}_top10": top, f"{prefix}_bot10": bot, f"{prefix}_topbot": (top + 1.0) / (bot + 1.0),
+            f"{prefix}_maxmin": (float(c.max()) + 1.0) / (float(c.min()) + 1.0), f"{prefix}_gini": gini}
 
 
 def key_features(k_tokens: torch.Tensor) -> torch.Tensor:
@@ -128,8 +177,15 @@ def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096,
                    nn_cos_p90=float(q[2]))
     for j, t in enumerate(DENSITY_TAUS):
         out.update(_summarize_density(density[j], f"dens{t:g}"))
+    # per-token mean cosine to every other token of the set
+    tokcos = (x @ s - 1.0) / max(n - 1, 1)
+    if n > 1:
+        q = torch.quantile(tokcos, torch.tensor([0.1, 0.9], device=x.device, dtype=tokcos.dtype))
+        top, bot = _top_bottom(tokcos)
+        out.update(tokcos_mean=float(tokcos.mean()), tokcos_std=float(tokcos.std(unbiased=False)),
+                   tokcos_p10=float(q[0]), tokcos_p90=float(q[1]), tokcos_top10=top, tokcos_bot10=bot)
     if return_tokens:
-        return out, {"density": density, "leverage": lev}
+        return out, {"density": density, "leverage": lev, "tokcos": tokcos}
     return out
 
 
@@ -169,6 +225,15 @@ def record(k: torch.Tensor, num_anchor_tokens: int, kept_candidate_indices: torc
             f = feats if idx is None else feats[idx]
             sp = None if spectral is None else (spectral if idx is None else spectral[idx])
             stats, tokens = set_statistics(f, _CONFIG["taus"], spectral=sp, return_tokens=True)
+            if idx is None and _CONFIG["dump_tokens"] and _TOKEN_DUMP["scene_path"]:
+                import numpy as np
+                dump = {"step": int(step_idx), "layer": int(layer_id) if layer_id is not None else -1,
+                        "n": int(f.shape[0]), "kept": keep_mask.cpu().numpy().astype(np.bool_),
+                        "leverage": tokens["leverage"].float().cpu().numpy().astype(np.float32),
+                        "tokcos": tokens["tokcos"].float().cpu().numpy().astype(np.float16)}
+                for j, t in enumerate(DENSITY_TAUS):
+                    dump[f"dens{t:g}"] = tokens["density"][j].cpu().numpy().astype(np.int32)
+                _TOKEN_DUMP["items"].setdefault(space, []).append(dump)
             if idx is None:
                 from scipy.stats import spearmanr
                 lev = tokens["leverage"].cpu().numpy()
@@ -189,3 +254,6 @@ def record(k: torch.Tensor, num_anchor_tokens: int, kept_candidate_indices: torc
         writer = csv.DictWriter(f, fieldnames=_fields(), extrasaction="ignore")
         for row in rows:
             writer.writerow(row)
+
+
+atexit.register(_flush_token_dump)
