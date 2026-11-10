@@ -130,7 +130,7 @@ def key_features(k_tokens: torch.Tensor) -> torch.Tensor:
     return x.permute(1, 0, 2).reshape(k_tokens.shape[1], -1) / math.sqrt(H)
 
 
-def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096,
+def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 1024,
                    spectral: Optional[torch.Tensor] = None, return_tokens: bool = False):
     """Statistics of a set of unit rows x [N, d] (float64). Rank, effective rank, stable rank and psi use
     ``spectral`` (same rows, any scale; default x), e.g. the raw sketched matrix IDC computes leverage on."""
@@ -165,8 +165,11 @@ def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 4096,
         c = x[i:i + chunk] @ x.T
         idx = torch.arange(i, min(i + chunk, n), device=x.device)
         c[idx - i, idx] = -2.0  # drop self-pairs
-        counts += (c.unsqueeze(0) > taus_t.view(-1, 1, 1)).sum(dim=(1, 2)).double()
-        density[:, i:i + chunk] = (c.unsqueeze(0) > dens_t.view(-1, 1, 1)).sum(dim=2)
+        # one threshold at a time keeps the temporaries at chunk x N booleans (no [taus, chunk, N] tensors)
+        for j in range(len(taus)):
+            counts[j] += float((c > taus_t[j]).sum())
+        for j in range(len(DENSITY_TAUS)):
+            density[j, i:i + chunk] = (c > dens_t[j]).sum(dim=1)
         nn[i:i + chunk] = c.max(dim=1).values
     pairs = n * (n - 1)
     for t, cnt in zip(taus, counts.tolist()):
