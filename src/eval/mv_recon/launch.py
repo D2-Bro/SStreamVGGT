@@ -257,15 +257,17 @@ def get_args_parser():
     )
     parser.add_argument("--layer_budget_alpha", type=float, default=0.7)
     parser.add_argument("--layer_budget_min_tokens", type=int, default=0)
+    parser.add_argument("--kv_bytes_log", action="store_true", help="Write per-step KV cache storage in bytes (K, V, IDC state, projected key cache, camera cache) to <output_dir>/<dataset>/kv_bytes/<scene>.csv")
     parser.add_argument("--redundancy_log", action="store_true", help="Write cache redundancy statistics (cosine, effective rank, psi) per scene/step/layer, before and after eviction, to <output_dir>/<dataset>/redundancy/<scene>.csv")
     parser.add_argument("--redundancy_dump_tokens", action="store_true", help="With --redundancy_log: also save per-token arrays (neighbour counts, mean cosine, leverage, kept) per scene as <scene>_tokens.npz")
     parser.add_argument("--redundancy_log_every", type=int, default=10, help="Log redundancy statistics every N steps")
-    parser.add_argument("--leverage_attention_source", choices=("causal_history", "noncausal_current"), default="causal_history", help="IDC importance: attention accumulated from later frames (causal_history) or, at each eviction, the current frame's queries over all live keys with no history (noncausal_current, Compactor-style)")
+    parser.add_argument("--leverage_attention_source", choices=("causal_history", "noncausal_current", "noncausal_insert"), default="causal_history", help="IDC importance: attention accumulated from later frames (causal_history) or, at each eviction, the current frame's queries over all live keys with no history (noncausal_current, Compactor-style)")
     parser.add_argument("--leverage_score_norm", choices=("mean", "zscore"), default="mean", help="Combine leverage and importance by mean normalisation (IDC) or z(util) + lambda*z(lev) (Compactor)")
     parser.add_argument("--leverage_compactor_lambda", type=float, default=0.5, help="Leverage weight lambda for --leverage_score_norm zscore and the compactor policy")
     parser.add_argument("--leverage_unobserved_lev_multiplier", type=float, default=None, help="Score of tokens with no attention yet = m * leverage weight * normalised leverage (2 = paper rule, 1 = no doubling); unset keeps the legacy score")
     parser.add_argument("--compactor_ridge", type=float, default=5e-3, help="Ridge on each head's key Gram matrix in the compactor policy")
     parser.add_argument("--compactor_sketch_dim", type=int, default=0, help="Compactor policy: right-sketch each head's keys to this many dims before leverage (0 = exact)")
+    parser.add_argument("--compactor_attention", choices=("current", "insert"), default="current", help="Compactor policy attention score: current = current-frame queries over all live keys at each eviction; insert = frame-block score computed once when the frame enters (its queries over its own keys)")
     parser.add_argument("--compactor_headwise_norm", action="store_true", help="Compactor policy: unit-normalise each head's keys before leverage")
     parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the random seeds but do not force deterministic CUDA kernels (faster)")
     parser.add_argument("--eval_datasets", type=str, default="7scenes,NRGBD", help="Comma-separated datasets to evaluate (7scenes, NRGBD, ETH3D)")
@@ -651,6 +653,10 @@ def main(args):
                                     "layer_budget_scores.csv",
                                 )
 
+                            if args.kv_bytes_log:
+                                from streamvggt.utils import kv_bytes_log
+                                kv_bytes_log.configure(osp.join(args.output_dir, name_data, "kv_bytes"))
+                                kv_bytes_log.set_scene(scene_key)
                             if args.redundancy_log:
                                 from streamvggt.utils import redundancy_log
                                 redundancy_log.configure(
@@ -966,6 +972,7 @@ if __name__ == "__main__":
         compactor_ridge=args.compactor_ridge,
         compactor_headwise_norm=args.compactor_headwise_norm,
         compactor_sketch_dim=args.compactor_sketch_dim,
+        compactor_attention=args.compactor_attention,
     )
     if args.eviction_policy == "compactor" and (args.leverage_conf_gate or args.leverage_attention_utility):
         raise SystemExit("Error: --eviction_policy compactor keeps different tokens per head; "

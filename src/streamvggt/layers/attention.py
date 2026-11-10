@@ -86,6 +86,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
         self.num_anchor_tokens = 0
+        self._insert_scores = None  # [B, H, N] frame-block attention score per cached token (noncausal_insert)
         self._eviction_managers = {}
         self._eviction_profile_totals = {}
         self._eviction_profile_count = 0
@@ -97,6 +98,7 @@ class Attention(nn.Module):
 
     def _reset_cache_state(self):
         self.num_anchor_tokens = 0
+        self._insert_scores = None
         self._eviction_profile_totals = {}
         self._eviction_profile_count = 0
         self._attention_forward_profile_totals = {}
@@ -286,6 +288,8 @@ class Attention(nn.Module):
         if not layer_budget_score_only and cache_budget <= num_anchor_tokens:
             keep_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
             keep_indices = keep_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
+            if self._insert_scores is not None and self._insert_scores.shape[-1] == N:
+                self._insert_scores = torch.gather(self._insert_scores, 2, keep_indices)
             final_k, final_v = _materialize_kv_by_keep_indices(
                 k, v, keep_indices, head_shared=True
             )
@@ -449,7 +453,18 @@ class Attention(nn.Module):
         )
         candidate_depth_confidence = None
         candidate_point_confidence = None
-        if ablation_config.CONFIG.attention_source == "noncausal_current" and eviction_policy == "svd_leverage":
+        insert_candidates = None
+        if self._insert_scores is not None and self._insert_scores.shape[-1] == select_k.shape[2]:
+            insert_candidates = self._insert_scores[:, :, num_anchor_tokens:]
+        if (eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "insert"
+                and insert_candidates is None):
+            raise RuntimeError("compactor_attention=insert: stored frame-block scores are not aligned with the cache")
+        if ablation_config.CONFIG.attention_source == "noncausal_insert" and eviction_policy == "svd_leverage":
+            if insert_candidates is None:
+                raise RuntimeError("attention_source=noncausal_insert: stored frame-block scores are not aligned")
+            candidate_attention_utility = insert_candidates.float().mean(dim=1)
+            candidate_attention_observed = torch.ones_like(candidate_attention_utility, dtype=torch.bool)
+        elif ablation_config.CONFIG.attention_source == "noncausal_current" and eviction_policy == "svd_leverage":
             # No attention history: the current frame's queries attend to every live key (before eviction);
             # every candidate, current-frame tokens included, gets a fresh importance score.
             if query is None:
@@ -482,6 +497,11 @@ class Attention(nn.Module):
             ),
             capture_projected_norms=projected_norm_histogram_config is not None,
             query=query,
+            candidate_attention_per_head=(
+                insert_candidates
+                if eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "insert"
+                else None
+            ),
         )
         self._perf_trace_end(
             "select",
@@ -586,6 +606,8 @@ class Attention(nn.Module):
         anchor_indices = anchor_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
         keep_indices = torch.cat([anchor_indices, top_indices + num_anchor_tokens,], dim=2,)
         per_head_cache = eviction_policy == "compactor"
+        if self._insert_scores is not None and self._insert_scores.shape[-1] == N:
+            self._insert_scores = torch.gather(self._insert_scores, 2, keep_indices.to(self._insert_scores.device))
         if per_head_cache and confidence_state is not None:
             raise RuntimeError(
                 "The compactor policy keeps different tokens per head; run it without the confidence gate and "
@@ -937,6 +959,19 @@ class Attention(nn.Module):
                     ),
                     tokens_per_frame=tokens_per_frame,
                 )
+            need_insert_scores = (
+                ablation_config.CONFIG.attention_source == "noncausal_insert"
+                or (eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "insert")
+            )
+            if need_insert_scores and cache_write_current_frame:
+                # Frame-block score: the new tokens' own queries over the new tokens' keys, no causal mask.
+                n_new = int(q.shape[2])
+                new_scores = EvictionManager.noncausal_attention_colsum(q, k[:, :, -n_new:, :])
+                prev = self._insert_scores
+                if prev is None or prev.shape[-1] != k.shape[2] - n_new:
+                    # first step (or cache rebuilt): unknown scores for older tokens (anchor) get zeros
+                    prev = torch.zeros(k.shape[0], k.shape[1], k.shape[2] - n_new, device=k.device, dtype=torch.float32)
+                self._insert_scores = torch.cat([prev.to(new_scores.device), new_scores], dim=2)
             eviction_deferred_for_snapshot = (
                 pre_eviction_snapshot_config is not None
                 and step_idx is not None

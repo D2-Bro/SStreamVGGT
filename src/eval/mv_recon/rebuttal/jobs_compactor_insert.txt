@@ -1,0 +1,12 @@
+# Compactor with frame-block attention (insertion-time, per frame). recon full + 100 frames, 7-Scenes trajectory.
+ins_full_compactor_kaba_ins	MAX_FRAMES=full bash compactor_insert.sh compactor_kaba_ins
+ins_full_compactor_uniform_ins	MAX_FRAMES=full bash compactor_insert.sh compactor_uniform_ins
+ins_full_C1_headnorm_ins	MAX_FRAMES=full bash compactor_insert.sh C1_headnorm_ins
+ins_full_C2_concat_ins	MAX_FRAMES=full bash compactor_insert.sh C2_concat_ins
+ins_100_compactor_kaba_ins	MAX_FRAMES=100 bash compactor_insert.sh compactor_kaba_ins
+ins_100_C1_headnorm_ins	MAX_FRAMES=100 bash compactor_insert.sh C1_headnorm_ins
+ins_100_C2_concat_ins	MAX_FRAMES=100 bash compactor_insert.sh C2_concat_ins
+ins_pose_compactor_kaba_ins	TASK=pose bash compactor_insert.sh compactor_kaba_ins
+ins_pose_compactor_uniform_ins	TASK=pose bash compactor_insert.sh compactor_uniform_ins
+ins_pose_C1_headnorm_ins	TASK=pose bash compactor_insert.sh C1_headnorm_ins
+ins_pose_C2_concat_ins	TASK=pose bash compactor_insert.sh C2_concat_ins

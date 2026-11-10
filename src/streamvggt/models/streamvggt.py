@@ -4,6 +4,7 @@ import os
 import time
 
 import torch
+from streamvggt.utils import kv_bytes_log
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
@@ -557,6 +558,10 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
                             f"current={current_camera_tokens_per_frame}"
                         )
                     camera_cache_frame_ids.extend(int(frame_id) for frame_id in chunk_frame_ids)
+                    if kv_bytes_log.enabled():
+                        kv_bytes_log.record(
+                            int(chunk_frame_ids[-1]), past_key_values, past_key_values_camera, self.aggregator
+                        )
                     camera_pose_all = pose_enc_list[-1]
                     _profile_record("camera_head", profile_stage_start)
                     _perf_trace_end("camera_head", perf_stage_start, perf_stage_cpu_start)

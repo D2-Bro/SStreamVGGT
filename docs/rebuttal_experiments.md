@@ -70,6 +70,11 @@ Trajectory runs always use the full sequence; `--pose_eval_prefix_frames 100` al
   compB C0_compactor = compactor_kaba.
 - `results.json` → `trajectory_7scenes` (per-sequence ATE / RPE, means, `first_k_frames["100"]`, strict overage).
 
+## KV cache storage in bytes
+
+`--kv_bytes_log` writes per step the actual `nbytes` of K, V (with dtypes), the IDC state, the projected key cache,
+other eviction auxiliaries and the camera-head cache to `<output>/<dataset>/kv_bytes/<scene>.csv`.
+
 ## Experiment 2: strict budget
 
 **Issue.** The first-frame anchor (1041 tokens per layer) is never evicted. When KABA gives a layer less than
@@ -267,6 +272,13 @@ Table B, cumulative (KABA throughout):
 Table B is also run at full sequence (`MAX_FRAMES=full bash compactor.sh <config>`, outputs
 `B_<config>_framesfull`); there C0 equals table A `compactor_kaba` and C7 equals strict `B60000_soft`, so 11 runs.
 The full-sequence table B and the trajectory runs are queued together in `jobs_phase2.txt`.
+
+Frame-block attention (closer to the official Compactor, whose score is a non-causal column sum inside its own
+block): `--compactor_attention insert` (compactor policy, per head) and `--leverage_attention_source
+noncausal_insert` (IDC path, head-averaged). When a frame enters, its queries attend to its own keys without a causal
+mask; the column sum is stored with each token (kept aligned through eviction) and fixed afterwards. Runs:
+`compactor_insert.sh` / `jobs_compactor_insert.txt` (A uniform/KABA, C1, C2; recon full + 100 frames, 7-Scenes
+trajectory).
 
 Leave-one-out from ours: `ours_wo_history`, `ours_wo_headnorm`, `ours_wo_freeze`, `ours_wo_meannorm`
 (z-score with lambda 1, so only the normalisation changes), `ours_wo_double`. Removing (3) alone is not possible:

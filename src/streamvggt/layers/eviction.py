@@ -529,6 +529,7 @@ class EvictionManager:
         need_leverage_basis: bool = False,
         capture_projected_norms: bool = False,
         query: Optional[torch.Tensor] = None,
+        candidate_attention_per_head: Optional[torch.Tensor] = None,
     ) -> EvictionResult:
         """Select candidate-local indices to retain.
 
@@ -582,7 +583,9 @@ class EvictionManager:
         elif self.policy == "compactor":
             if query is None:
                 raise ValueError("The compactor policy needs the current queries (query=...)")
-            policy_scores, compactor_leverage = self._compactor_scores(k, query, num_anchor_tokens)
+            policy_scores, compactor_leverage = self._compactor_scores(
+                k, query, num_anchor_tokens, attention=candidate_attention_per_head
+            )
             if self.layer_budget_strategy in LAYER_BUDGET_SCORE_STRATEGIES:
                 # KABA on per-head leverage: the participation ratio of each head, averaged over heads.
                 layer_budget_score = self._compute_layer_budget_score(
@@ -886,6 +889,7 @@ class EvictionManager:
         k: torch.Tensor,
         query: torch.Tensor,
         num_anchor_tokens: int,
+        attention: Optional[torch.Tensor] = None,
     ):
         """Compactor (Chari & Van Durme 2025, official compactor-vllm code) ported to the streaming cache.
 
@@ -901,7 +905,9 @@ class EvictionManager:
         from streamvggt.utils.ablation_config import CONFIG
 
         candidate_k = k[:, :, int(num_anchor_tokens):, :]
-        attention = self.noncausal_attention_colsum(query, k)[:, :, int(num_anchor_tokens):]
+        if attention is None:
+            attention = self.noncausal_attention_colsum(query, k)[:, :, int(num_anchor_tokens):]
+        attention = attention.float()
         x = candidate_k.double()
         if CONFIG.compactor_headwise_norm:
             x = F.normalize(x, p=2, dim=-1)
