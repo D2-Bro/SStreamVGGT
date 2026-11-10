@@ -283,3 +283,31 @@ trajectory).
 Leave-one-out from ours: `ours_wo_history`, `ours_wo_headnorm`, `ours_wo_freeze`, `ours_wo_meannorm`
 (z-score with lambda 1, so only the normalisation changes), `ours_wo_double`. Removing (3) alone is not possible:
 per-head token sets would need per-head confidence/attention state; C1 → C2 measures it instead.
+
+## Attention peak per global layer (R2-Q3, AVGGT check)
+
+AVGGT (arXiv 2512.02541, Sec. 3.1 / Fig. 2) shows qualitatively that early global layers of VGGT have weaker top
+activated entries (head-averaged attention, patch tokens, top-50 entries of the whole matrix; layers 0-indexed 0-23).
+`tools/attention_peak_analysis.py` measures this in StreamVGGT's causal global attention, on CPU, without touching
+`src/`: the SDPA call of the global blocks is wrapped in-process (output returned unchanged) and A = softmax(qk^T/sqrt(D))
+is recomputed from the same q, k; only statistics are kept. Eviction and KABA are disabled and guarded:
+`Attention.eviction` / `EvictionManager.select` raise if called, the layer allocator must see zero scores and alpha 0
+(uniform), and each step must have keys = step x 1041.
+
+Setting: 7-Scenes, kf_every 20, first 5 frames, full cache (budget 1e9), fp32 CPU.
+
+```bash
+python tools/test_attention_peak.py
+CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=32 python tools/attention_peak_analysis.py --scene_index 0 --verify \
+  --out eval_results/mv_recon/rebuttal/attn_peak          # ~2.5 min per sequence with --verify
+R=eval_results/mv_recon/rebuttal
+python tools/attention_peak_report.py --attn $R/attn_peak \
+  --kaba_layers "$R/strict_layers/B60000_soft/7scenes/*/anchor_budget_overage_layers.csv" \
+  --density $R/pr_density_summary/per_layer_median.csv --out $R/attn_peak/report
+```
+
+`--verify` adds two unpatched reference runs (eviction_policy mean and svd_leverage) and checks that all model
+outputs are bit-identical to the patched run and that softmax(qk^T)v matches the SDPA output.
+Outputs per sequence: `attn_peak_layers.csv` (layer x step x head x query type), `attn_peak_top50.csv` (AVGGT
+statistic per step and over the union of steps = the full causal 5-view matrix), `key_norm.csv`, `meta.json`
+(checks). Report: `attn_peak_by_layer.csv`, `kaba_compare.csv`, `kaba_spearman.csv`, `fig_attn_peak.png`.
