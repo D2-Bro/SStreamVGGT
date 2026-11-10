@@ -27,7 +27,8 @@ LINE = re.compile(
     r"F1@5cm:\s*(?P<f1_5cm>[^,]+),\s*F1@10cm:\s*(?P<f1_10cm>[^,]+),\s*F1@25cm:\s*(?P<f1_25cm>[^,\s]+)"
     r"(?:,\s*Time:\s*(?P<time>[^,]+),\s*FPS:\s*(?P<fps>[^,]+))?(?:,\s*PeakMemGB:\s*(?P<peak_mem_gb>[^,]+))?"
 )
-EXPECTED_SCENES = {"7scenes": 18, "NRGBD": 9}
+EXPECTED_SCENES = {"7scenes": 18, "NRGBD": 9, "ETH3D": 13}
+EXPECTED_SEQUENCES = {"7scenes": 18, "replica": 8, "tum_stride2": 8}
 METRICS = ["cd", "acc", "comp", "acc_med", "comp_med", "f1_5cm", "f1_10cm", "f1_25cm", "fps", "time",
            "peak_mem_gb", "frames"]
 REDUNDANCY_METRICS = ["n_tokens", "mean_cos", "frac_cos_gt_0.5", "frac_cos_gt_0.7", "frac_cos_gt_0.8",
@@ -196,7 +197,15 @@ def pose_run_summary(run_dir):
                     "rpe_trans": float(row["rpe_trans"]), "rpe_rot": float(row["rpe_rot"])}
     final_log = os.path.join(run_dir, "_error_log.txt")
     complete = os.path.exists(final_log) and "Average ATE" in open(final_log).read()
-    out = {"dir": run_dir, "complete": complete, "dataset": "7scenes", "n_sequences": len(seqs), "expected_sequences": 18}
+    dataset = "7scenes"
+    for path in sorted(glob.glob(os.path.join(run_dir, "_error_log_[0-9]*.txt"))):
+        with open(path) as f:
+            m = POSE_LINE.match(f.readline())
+            if m:
+                dataset = m["dataset"]
+                break
+    out = {"dir": run_dir, "complete": complete, "dataset": dataset, "n_sequences": len(seqs),
+           "expected_sequences": EXPECTED_SEQUENCES.get(dataset)}
     rows = list(seqs.values())
     if rows:
         out["mean"] = {m: float(np.mean([r[m] for r in rows if m in r]))
@@ -224,7 +233,8 @@ def queue_status(root):
             with open(path) as f:
                 names += [l.split("\t")[0] for l in f if l.strip() and not l.lstrip().startswith("#")]
     is_pose = "pose_evaluation" in root
-    names = [n for n in dict.fromkeys(names) if n.startswith("pose_") == is_pose]
+    new_prefixes = ("eth3d_", "replica_", "tum_")  # new datasets have their own queue summaries
+    names = [n for n in dict.fromkeys(names) if n.startswith("pose_") == is_pose and not n.startswith(new_prefixes)]
     done = {}
     started = set()
     # Active queues of both roots (a queue can hold recon and trajectory jobs); stopped ones are ignored.
@@ -260,6 +270,7 @@ def queue_status(root):
 
 
 def main():
+    global here
     here = os.path.dirname(os.path.abspath(__file__))
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", default=os.path.join(here, "..", "eval_results", "mv_recon", "rebuttal"))
@@ -301,6 +312,69 @@ def main():
         trajectory["compactor"]["B_C0_compactor_framesfull"] = {
             "same_as": "compactor/A_compactor_kaba_framesfull", **trajectory["compactor"]["A_compactor_kaba_framesfull"]}
 
+    # New datasets: ETH3D reconstruction, Replica / TUM-dynamics trajectory (their own result roots and queues).
+    eval_root = os.path.abspath(os.path.join(root, "..", ".."))
+    new_datasets = {}
+
+    def new_queue(qdir, prefix):
+        names = []
+        for path in sorted(glob.glob(os.path.join(here, "..", "src", "eval", "mv_recon", "rebuttal", "jobs_*.txt"))):
+            with open(path) as f:
+                names += [l.split("\t")[0] for l in f if l.strip() and not l.lstrip().startswith("#")]
+        names = [n for n in dict.fromkeys(names) if n.startswith(prefix)]
+        done, started = {}, set()
+        for d in glob.glob(qdir):
+            if os.path.exists(os.path.join(d, "status.tsv")):
+                for line in open(os.path.join(d, "status.tsv")):
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) == 3:
+                        done[parts[0]] = int(parts[2])
+            for out_file in glob.glob(os.path.join(d, "*.out")):
+                started |= {m.group(1) for m in re.finditer(r" start (\S+) ", open(out_file).read())}
+        jobs = {n: ("finished" if done.get(n) == 0 else f"failed (rc={done[n]})" if n in done
+                    else "running" if n in started else "pending") for n in names}
+        counts = {}
+        for state in jobs.values():
+            counts[state.split(" ")[0]] = counts.get(state.split(" ")[0], 0) + 1
+        return {"counts": counts, "jobs": jobs}
+
+    eth_root = os.path.join(eval_root, "mv_recon", "rebuttal_eth3d")
+    eth = {exp: {os.path.basename(d): run_summary(d) for d in sorted(glob.glob(os.path.join(eth_root, exp, "*")))
+                 if os.path.isdir(d)} for exp in ("strict", "compactor", "pr_analysis")}
+    if "B60000_soft" in eth["strict"]:
+        for alias in ("A_ours_framesfull", "B_C7_ours_framesfull"):
+            eth["compactor"][alias] = {"same_as": "strict/B60000_soft", **eth["strict"]["B60000_soft"]}
+    if "A_compactor_kaba_framesfull" in eth["compactor"]:
+        eth["compactor"]["B_C0_compactor_framesfull"] = {"same_as": "compactor/A_compactor_kaba_framesfull",
+                                                         **eth["compactor"]["A_compactor_kaba_framesfull"]}
+    new_datasets["ETH3D_recon"] = {"root": eth_root, "queue": new_queue(os.path.join(eth_root, "queue*"), "eth3d_"),
+                                   "experiments": eth}
+    for tag in ("replica", "tum"):
+        proot = os.path.join(eval_root, "pose_evaluation", f"rebuttal_{tag}")
+        tr = {}
+        for exp in ("strict", "stride", "compactor"):
+            tr[exp] = {os.path.basename(d): pose_run_summary(d) for d in sorted(glob.glob(os.path.join(proot, exp, "*")))
+                       if os.path.isdir(d)}
+        pr = {}
+        for d in sorted(glob.glob(os.path.join(proot, "pr_analysis", "*"))):
+            red = None
+            for ds_dir in glob.glob(os.path.join(d, "*")):
+                if os.path.isdir(os.path.join(ds_dir, "redundancy")):
+                    red = redundancy(ds_dir)
+            pr[os.path.basename(d)] = {"dir": d, "redundancy": red}
+        tr["pr_analysis"] = pr
+        if "B60000_soft" in tr["strict"]:
+            for alias in ("A_ours_framesfull", "B_C7_ours_framesfull"):
+                tr["compactor"][alias] = {"same_as": "strict/B60000_soft", **tr["strict"]["B60000_soft"]}
+        if "A_compactor_kaba_framesfull" in tr["compactor"]:
+            tr["compactor"]["B_C0_compactor_framesfull"] = {"same_as": "compactor/A_compactor_kaba_framesfull",
+                                                            **tr["compactor"]["A_compactor_kaba_framesfull"]}
+        new_datasets[f"{tag}_trajectory"] = {
+            "root": proot,
+            "queue": new_queue(os.path.join(eval_root, "pose_evaluation", "rebuttal_newds_queue"), f"{tag}_"),
+            "experiments": tr,
+        }
+
     result = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "root": root,
@@ -312,6 +386,7 @@ def main():
         },
         "queue": queue_status(root),
         "experiments": experiments,
+        "new_datasets": new_datasets,
         "trajectory_7scenes": {
             "root": pose_root,
             "queue": queue_status(pose_root),

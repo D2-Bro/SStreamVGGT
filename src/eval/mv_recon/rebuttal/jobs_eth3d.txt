@@ -1,0 +1,29 @@
+# ETH3D reconstruction (stride 1 as in the paper; sequences are 14-76 frames, so 100 frames = full sequence).
+# Same configurations as 7-Scenes/NRGBD; stride experiments are not run on ETH3D (stride >= 20 leaves 1-4 frames).
+# Not run separately: compactor A ours = C7 = strict B60000_soft; C0 = compactor_kaba.
+eth3d_strict_B60000_soft	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=soft bash strict.sh 60000
+eth3d_strict_B60000_strict	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=strict bash strict.sh 60000
+eth3d_strict_B60000_redistribute	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict bash strict_redistribute.sh 60000
+eth3d_strict_B30000_soft	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=soft bash strict.sh 30000
+eth3d_strict_B30000_strict	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=strict bash strict.sh 30000
+eth3d_strict_B30000_redistribute	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict bash strict_redistribute.sh 30000
+eth3d_strict_B200000_soft	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=soft bash strict.sh 200000
+eth3d_strict_B200000_strict	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=strict bash strict.sh 200000
+eth3d_strict_B200000_redistribute	KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict bash strict_redistribute.sh 200000
+eth3d_compactor_compactor_uniform	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh compactor_uniform
+eth3d_compactor_compactor_kaba	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh compactor_kaba
+eth3d_compactor_compactor_uniform_sk16	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh compactor_uniform_sk16
+eth3d_compactor_compactor_kaba_sk16	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh compactor_kaba_sk16
+eth3d_compactor_C1_headnorm	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C1_headnorm
+eth3d_compactor_C1_headnorm_sk16	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C1_headnorm_sk16
+eth3d_compactor_C2_concat	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C2_concat
+eth3d_compactor_C3_history	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C3_history
+eth3d_compactor_C4_freeze	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C4_freeze
+eth3d_compactor_C5_meannorm	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C5_meannorm
+eth3d_compactor_C6_double	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C6_double
+eth3d_compactor_ours_wo_history	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh ours_wo_history
+eth3d_compactor_ours_wo_headnorm	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh ours_wo_headnorm
+eth3d_compactor_ours_wo_freeze	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh ours_wo_freeze
+eth3d_compactor_ours_wo_meannorm	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh ours_wo_meannorm
+eth3d_compactor_ours_wo_double	KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh ours_wo_double
+eth3d_pr_density	KF_EVERY=1 MAX_FRAMES=full REDUNDANCY_LOG_EVERY=5 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/pr_analysis bash pr_analysis.sh IDC
