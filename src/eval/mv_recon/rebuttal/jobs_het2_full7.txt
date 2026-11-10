@@ -1,0 +1,2 @@
+# Full-sequence 7-Scenes rerun (needs an empty GPU: ~15 GB).
+het2_framesfull_7scenes	MAX_FRAMES=full REDUNDANCY_LOG_EVERY=25 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_het_framesfull EXTRA_ARGS='--redundancy_dump_tokens --eval_datasets 7scenes' bash pr_analysis.sh IDC

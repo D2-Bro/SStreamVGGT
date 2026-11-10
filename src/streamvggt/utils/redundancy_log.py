@@ -213,7 +213,7 @@ def record(k: torch.Tensor, num_anchor_tokens: int, kept_candidate_indices: torc
         return
     cand = k[0, :, int(num_anchor_tokens):, :]
     kept = kept_candidate_indices[0]
-    head_shared = bool((kept == kept[:1]).all())
+    head_shared = bool((kept == kept[:1]).all()) if kept.numel() else True
     x = key_features(cand)
     spaces = [("full", x, None)]
     # IDC's own sketch space: the right-sketched candidate matrix Z [Nc, r] its leverage scores come from.
@@ -223,8 +223,10 @@ def record(k: torch.Tensor, num_anchor_tokens: int, kept_candidate_indices: torc
     rows = []
     keep_mask = torch.zeros(x.shape[0], dtype=torch.bool, device=x.device)
     keep_mask[kept[0]] = True
+    # anchor-only steps (budget below the anchor): nothing is retained, so only the candidate set is logged
+    sets = (("candidates", None),) if kept.shape[-1] < 2 else (("candidates", None), ("retained", kept[0]))
     for space, feats, spectral in spaces:
-        for name, idx in (("candidates", None), ("retained", kept[0])):
+        for name, idx in sets:
             f = feats if idx is None else feats[idx]
             sp = None if spectral is None else (spectral if idx is None else spectral[idx])
             stats, tokens = set_statistics(f, _CONFIG["taus"], spectral=sp, return_tokens=True)

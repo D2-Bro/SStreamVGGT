@@ -288,6 +288,11 @@ class Attention(nn.Module):
         if not layer_budget_score_only and cache_budget <= num_anchor_tokens:
             keep_indices = torch.arange(num_anchor_tokens, device=k.device, dtype=torch.long)
             keep_indices = keep_indices.view(1, 1, num_anchor_tokens).expand(B, H, num_anchor_tokens)
+            if redundancy_log.enabled(step_idx):
+                # budget below the anchor: every candidate is evicted; log the candidates (pre-eviction) only
+                redundancy_log.record(
+                    k, num_anchor_tokens, torch.empty(B, H, 0, device=k.device, dtype=torch.long), layer_id, step_idx
+                )
             if self._insert_scores is not None and self._insert_scores.shape[-1] == N:
                 self._insert_scores = torch.gather(self._insert_scores, 2, keep_indices)
             final_k, final_v = _materialize_kv_by_keep_indices(

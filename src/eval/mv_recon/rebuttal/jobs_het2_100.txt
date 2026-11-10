@@ -1,0 +1,2 @@
+# Density heterogeneity rerun including anchor-only layers (candidates logged when the budget is below the anchor).
+het2_frames100	MAX_FRAMES=100 REDUNDANCY_LOG_EVERY=10 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_het_frames100 EXTRA_ARGS=--redundancy_dump_tokens bash pr_analysis.sh IDC
