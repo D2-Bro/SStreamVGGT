@@ -1,0 +1,4 @@
+# Compactor uniform-allocation variants at 100 frames (recon 7-Scenes + NRGBD); the KABA ones exist as table B C0.
+c100_compactor_uniform	MAX_FRAMES=100 bash compactor.sh compactor_uniform
+c100_compactor_uniform_sk16	MAX_FRAMES=100 bash compactor.sh compactor_uniform_sk16
+c100_compactor_uniform_ins	MAX_FRAMES=100 bash compactor_insert.sh compactor_uniform_ins
