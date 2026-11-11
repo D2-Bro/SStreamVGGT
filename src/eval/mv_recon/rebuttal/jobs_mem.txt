@@ -1,0 +1,112 @@
+# Remaining post-fix jobs (after the first 5 of jobs_after_colsum_fix.txt), all deterministic, recon first.
+# Run with run_queue_mem.sh: up to 2 jobs per GPU by memory; reconstruction inputs now stay on the CPU.
+det_eth3d_strict_B60000_soft	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d_det_fix/strict MODES=soft bash strict.sh 60000
+det_eth3d_strict_B60000_redistribute	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d_det_fix/strict bash strict_redistribute.sh 60000
+strict_B60000_strict	CUDA_DETERMINISTIC=true MODES=strict bash strict.sh 60000
+strict_B30000_soft	CUDA_DETERMINISTIC=true MODES=soft bash strict.sh 30000
+strict_B30000_strict	CUDA_DETERMINISTIC=true MODES=strict bash strict.sh 30000
+strict_B30000_redistribute	CUDA_DETERMINISTIC=true bash strict_redistribute.sh 30000
+strict_B200000_soft	CUDA_DETERMINISTIC=true MODES=soft bash strict.sh 200000
+strict_B200000_strict	CUDA_DETERMINISTIC=true MODES=strict bash strict.sh 200000
+strict_B200000_redistribute	CUDA_DETERMINISTIC=true bash strict_redistribute.sh 200000
+stride20_60000	CUDA_DETERMINISTIC=true BUDGETS=60000 bash stride.sh 20
+stride20_30000	CUDA_DETERMINISTIC=true BUDGETS=30000 bash stride.sh 20
+stride50_60000	CUDA_DETERMINISTIC=true BUDGETS=60000 bash stride.sh 50
+stride50_30000	CUDA_DETERMINISTIC=true BUDGETS=30000 bash stride.sh 50
+stride100_60000	CUDA_DETERMINISTIC=true BUDGETS=60000 bash stride.sh 100
+stride100_30000	CUDA_DETERMINISTIC=true BUDGETS=30000 bash stride.sh 100
+eth3d_strict_B60000_strict	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=strict bash strict.sh 60000
+eth3d_strict_B30000_soft	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=soft bash strict.sh 30000
+eth3d_strict_B30000_strict	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=strict bash strict.sh 30000
+eth3d_strict_B30000_redistribute	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict bash strict_redistribute.sh 30000
+eth3d_strict_B200000_soft	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=soft bash strict.sh 200000
+eth3d_strict_B200000_strict	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict MODES=strict bash strict.sh 200000
+eth3d_strict_B200000_redistribute	CUDA_DETERMINISTIC=true KF_EVERY=1 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/strict bash strict_redistribute.sh 200000
+eth3d_pr_density	CUDA_DETERMINISTIC=true KF_EVERY=1 MAX_FRAMES=full REDUNDANCY_LOG_EVERY=5 EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/pr_analysis bash pr_analysis.sh IDC
+het2_frames100	CUDA_DETERMINISTIC=true MAX_FRAMES=100 REDUNDANCY_LOG_EVERY=10 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_het_frames100 EXTRA_ARGS=--redundancy_dump_tokens bash pr_analysis.sh IDC
+het2_framesfull_7scenes	CUDA_DETERMINISTIC=true MAX_FRAMES=full REDUNDANCY_LOG_EVERY=25 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_het_framesfull EXTRA_ARGS='--redundancy_dump_tokens --eval_datasets 7scenes' bash pr_analysis.sh IDC
+het_framesfull_nrgbd	CUDA_DETERMINISTIC=true MAX_FRAMES=full REDUNDANCY_LOG_EVERY=25 OUT_ROOT=../eval_results/mv_recon/rebuttal/pr_het_framesfull EXTRA_ARGS='--redundancy_dump_tokens --eval_datasets NRGBD' bash pr_analysis.sh IDC
+ins_full_C1_headnorm_ins	CUDA_DETERMINISTIC=true MAX_FRAMES=full bash compactor_insert.sh C1_headnorm_ins
+ins_full_C2_concat_ins	CUDA_DETERMINISTIC=true MAX_FRAMES=full bash compactor_insert.sh C2_concat_ins
+ins_100_compactor_kaba_ins	CUDA_DETERMINISTIC=true MAX_FRAMES=100 bash compactor_insert.sh compactor_kaba_ins
+c100_compactor_uniform_sk16	CUDA_DETERMINISTIC=true MAX_FRAMES=100 bash compactor.sh compactor_uniform_sk16
+c100_compactor_uniform_ins	CUDA_DETERMINISTIC=true MAX_FRAMES=100 bash compactor_insert.sh compactor_uniform_ins
+det_pose_wo_kaba_B60000	CUDA_DETERMINISTIC=true OUT_ROOT=../eval_results/pose_evaluation/rebuttal_det_fix/wo_kaba MODES=soft EXTRA_ARGS='--layer_budget_strategy uniform' bash pose_strict.sh 60000
+pose_strict_B60000_soft	CUDA_DETERMINISTIC=true MODES=soft bash pose_strict.sh 60000
+pose_strict_B60000_strict	CUDA_DETERMINISTIC=true MODES=strict bash pose_strict.sh 60000
+pose_strict_B60000_redistribute	CUDA_DETERMINISTIC=true bash pose_strict_redistribute.sh 60000
+pose_strict_B30000_soft	CUDA_DETERMINISTIC=true MODES=soft bash pose_strict.sh 30000
+pose_strict_B30000_strict	CUDA_DETERMINISTIC=true MODES=strict bash pose_strict.sh 30000
+pose_strict_B30000_redistribute	CUDA_DETERMINISTIC=true bash pose_strict_redistribute.sh 30000
+pose_strict_B200000_soft	CUDA_DETERMINISTIC=true MODES=soft bash pose_strict.sh 200000
+pose_strict_B200000_strict	CUDA_DETERMINISTIC=true MODES=strict bash pose_strict.sh 200000
+pose_strict_B200000_redistribute	CUDA_DETERMINISTIC=true bash pose_strict_redistribute.sh 200000
+pose_stride20_60000	CUDA_DETERMINISTIC=true BUDGETS=60000 bash pose_stride.sh 20
+pose_stride20_30000	CUDA_DETERMINISTIC=true BUDGETS=30000 bash pose_stride.sh 20
+pose_stride50_60000	CUDA_DETERMINISTIC=true BUDGETS=60000 bash pose_stride.sh 50
+pose_stride50_30000	CUDA_DETERMINISTIC=true BUDGETS=30000 bash pose_stride.sh 50
+pose_stride100_60000	CUDA_DETERMINISTIC=true BUDGETS=60000 bash pose_stride.sh 100
+pose_stride100_30000	CUDA_DETERMINISTIC=true BUDGETS=30000 bash pose_stride.sh 100
+replica_det_strict_B60000_soft	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict MODES=soft bash pose_strict.sh 60000
+replica_det_strict_B60000_strict	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict MODES=strict bash pose_strict.sh 60000
+replica_det_strict_B60000_redistribute	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict bash pose_strict_redistribute.sh 60000
+replica_det_strict_B30000_soft	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict MODES=soft bash pose_strict.sh 30000
+replica_det_strict_B30000_strict	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict MODES=strict bash pose_strict.sh 30000
+replica_det_strict_B30000_redistribute	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict bash pose_strict_redistribute.sh 30000
+replica_det_strict_B200000_soft	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict MODES=soft bash pose_strict.sh 200000
+replica_det_strict_B200000_strict	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict MODES=strict bash pose_strict.sh 200000
+replica_det_strict_B200000_redistribute	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/strict bash pose_strict_redistribute.sh 200000
+replica_det_compactor_compactor_uniform	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh compactor_uniform
+replica_det_compactor_compactor_kaba	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh compactor_kaba
+replica_det_compactor_compactor_uniform_sk16	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh compactor_uniform_sk16
+replica_det_compactor_compactor_kaba_sk16	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh compactor_kaba_sk16
+replica_det_compactor_C1_headnorm	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh C1_headnorm
+replica_det_compactor_C1_headnorm_sk16	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh C1_headnorm_sk16
+replica_det_compactor_C2_concat	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh C2_concat
+replica_det_compactor_C3_history	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh C3_history
+replica_det_compactor_C4_freeze	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh C4_freeze
+replica_det_compactor_C5_meannorm	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh C5_meannorm
+replica_det_compactor_C6_double	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh C6_double
+replica_det_compactor_ours_wo_history	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh ours_wo_history
+replica_det_compactor_ours_wo_headnorm	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh ours_wo_headnorm
+replica_det_compactor_ours_wo_freeze	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh ours_wo_freeze
+replica_det_compactor_ours_wo_meannorm	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh ours_wo_meannorm
+replica_det_compactor_ours_wo_double	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh ours_wo_double
+replica_det_stride20_60000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=60000 bash pose_stride.sh 20
+replica_det_stride20_30000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=30000 bash pose_stride.sh 20
+replica_det_stride20_full	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=full bash pose_stride.sh 20
+replica_det_stride50_60000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=60000 bash pose_stride.sh 50
+replica_det_stride50_30000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=30000 bash pose_stride.sh 50
+replica_det_stride50_full	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=full bash pose_stride.sh 50
+replica_det_stride100_60000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=60000 bash pose_stride.sh 100
+replica_det_stride100_30000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=30000 bash pose_stride.sh 100
+replica_det_stride100_full	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/stride BUDGETS=full bash pose_stride.sh 100
+replica_det_pr_frames100	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/pr_analysis MAX_FRAMES=100 REDUNDANCY_LOG_EVERY=10 bash pose_pr_analysis.sh
+replica_det_pr_framesfull	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/pr_analysis MAX_FRAMES=full REDUNDANCY_LOG_EVERY=25 bash pose_pr_analysis.sh
+tum_strict_B60000_soft	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict MODES=soft bash pose_strict.sh 60000
+tum_strict_B60000_strict	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict MODES=strict bash pose_strict.sh 60000
+tum_strict_B60000_redistribute	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict bash pose_strict_redistribute.sh 60000
+tum_strict_B30000_soft	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict MODES=soft bash pose_strict.sh 30000
+tum_strict_B30000_strict	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict MODES=strict bash pose_strict.sh 30000
+tum_strict_B30000_redistribute	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict bash pose_strict_redistribute.sh 30000
+tum_strict_B200000_soft	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict MODES=soft bash pose_strict.sh 200000
+tum_strict_B200000_strict	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict MODES=strict bash pose_strict.sh 200000
+tum_strict_B200000_redistribute	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/strict bash pose_strict_redistribute.sh 200000
+tum_stride20_60000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/stride BUDGETS=60000 bash pose_stride.sh 20
+tum_stride20_30000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/stride BUDGETS=30000 bash pose_stride.sh 20
+tum_stride50_60000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/stride BUDGETS=60000 bash pose_stride.sh 50
+tum_stride50_30000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/stride BUDGETS=30000 bash pose_stride.sh 50
+tum_stride100_60000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/stride BUDGETS=60000 bash pose_stride.sh 100
+tum_stride100_30000	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/stride BUDGETS=30000 bash pose_stride.sh 100
+tum_pr_frames100	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/pr_analysis MAX_FRAMES=100 REDUNDANCY_LOG_EVERY=10 bash pose_pr_analysis.sh
+tum_pr_framesfull	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/pr_analysis MAX_FRAMES=full REDUNDANCY_LOG_EVERY=25 bash pose_pr_analysis.sh
+tum_compactor_compactor_kaba_sk16	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/compactor bash pose_compactor.sh compactor_kaba_sk16
+tum_compactor_C1_headnorm_sk16	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/compactor bash pose_compactor.sh C1_headnorm_sk16
+tum_compactor_compactor_kaba	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/compactor bash pose_compactor.sh compactor_kaba
+tum_compactor_compactor_uniform_sk16	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/compactor bash pose_compactor.sh compactor_uniform_sk16
+tum_compactor_C1_headnorm	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/compactor bash pose_compactor.sh C1_headnorm
+tum_compactor_C2_concat	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/compactor bash pose_compactor.sh C2_concat
+ins_pose_compactor_kaba_ins	CUDA_DETERMINISTIC=true TASK=pose bash compactor_insert.sh compactor_kaba_ins
+ins_pose_compactor_uniform_ins	CUDA_DETERMINISTIC=true TASK=pose bash compactor_insert.sh compactor_uniform_ins
+ins_pose_C1_headnorm_ins	CUDA_DETERMINISTIC=true TASK=pose bash compactor_insert.sh C1_headnorm_ins
+ins_pose_C2_concat_ins	CUDA_DETERMINISTIC=true TASK=pose bash compactor_insert.sh C2_concat_ins

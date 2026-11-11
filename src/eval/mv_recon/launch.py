@@ -294,6 +294,7 @@ def get_args_parser():
     add_projected_norm_histogram_args(parser)
     add_token_overlay_dump_args(parser)
     parser.add_argument("--eval_frame_stride", type=int, default=1, help="Use every Nth frame only when building eval point clouds; inference still uses all frames")
+    parser.add_argument("--inputs_on_gpu", action="store_true", help="move the whole input sequence (images, GT points, masks) to the GPU before inference (previous behaviour; memory grows with sequence length)")
     parser.add_argument("--eval_stage", choices=("all", "infer", "none"), default="all", help="all runs metrics inline; infer saves point clouds for evaluate_saved.py; none runs inference only (no metrics, e.g. for analysis logs)")
     parser.add_argument("--eval_device", choices=("cpu", "cuda"), default="cpu", help="device for the inline metrics of --eval_stage all: cpu = Open3D legacy ICP + pykdtree (reference), cuda = the same ICP loop and exact NN distances on this rank's GPU")
     parser.add_argument(
@@ -538,7 +539,9 @@ def main(args):
                             "rng",
                         ]
                     )
-                    for view in batch:
+                    # StreamVGGT.inference moves each frame's image to the GPU itself and returns CPU copies, so by
+                    # default the whole sequence stays on the CPU (GPU memory no longer grows with sequence length).
+                    for view in (batch if args.inputs_on_gpu else []):
                         for name in view.keys():  # pseudo_focal
                             if name in ignore_keys:
                                 continue
