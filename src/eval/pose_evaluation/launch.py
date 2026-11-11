@@ -211,7 +211,7 @@ def get_args_parser():
     parser.add_argument("--leverage_unobserved_lev_multiplier", type=float, default=None)
     parser.add_argument("--compactor_ridge", type=float, default=5e-3)
     parser.add_argument("--compactor_sketch_dim", type=int, default=0, help="Compactor policy: right-sketch each head's keys to this many dims before leverage (0 = exact)")
-    parser.add_argument("--compactor_attention", choices=("current", "insert"), default="current", help="Compactor policy attention score: current = current-frame queries over all live keys at each eviction; insert = frame-block score computed once when the frame enters (its queries over its own keys)")
+    parser.add_argument("--compactor_attention", choices=("current", "insert", "history"), default="current", help="Compactor policy attention score: current = current-frame queries over all live keys at each eviction; insert = frame-block score computed once when the frame enters (its queries over its own keys); history = causal attention history accumulated per head (EMA 0.9, no freeze)")
     parser.add_argument("--compactor_headwise_norm", action="store_true")
     parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the seeds but do not force deterministic CUDA kernels")
     parser.add_argument("--redundancy_log", action="store_true", help="Write cache redundancy / local density statistics per sequence to <output_dir>/<dataset>/redundancy/<seq>.csv")

@@ -161,6 +161,25 @@ def test_freeze_zero_never_freezes() -> None:
     assert abs(float(state.attention_utility()[0, 1]) - expected) < 1e-2 * expected
 
 
+def test_compactor_history_scores_observed_mask() -> None:
+    g = torch.Generator().manual_seed(5)
+    k = torch.randn(1, 3, 30, 8, generator=g)
+    q = torch.randn(1, 3, 6, 8, generator=g)
+    att = torch.rand(1, 3, 24, generator=g)
+    obs = torch.rand(1, 3, 24, generator=g) > 0.3
+    ablation_config.configure(compactor_lambda=0.5, unobserved_lev_multiplier=None)
+    manager = EvictionManager(policy="compactor", layer_budget_strategy="uniform")
+    scores, lev = manager._compactor_scores(k, q, 6, attention=att, observed=obs)
+    a, l, o = att.double().numpy(), lev.double().numpy(), obs.numpy()
+    za = (a - a[o].mean()) / a[o].std()
+    zl = (l - l.mean()) / l.std()
+    ref = np.where(o, za + 0.5 * zl, 0.5 * zl)
+    assert np.allclose(scores.numpy(), ref, atol=1e-5)
+    plain, _ = manager._compactor_scores(k, q, 6, attention=att)
+    assert not torch.allclose(plain, scores)
+    _reset_config()
+
+
 def main() -> None:
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for test in tests:

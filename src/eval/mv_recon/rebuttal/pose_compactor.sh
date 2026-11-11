@@ -34,6 +34,7 @@ CFG[compactor_kaba]="$compactor_env | --eviction_policy compactor"
 CFG[ours]="$idc_env LEVERAGE_ATTENTION_UTILITY=true LEVERAGE_ATTENTION_FREEZE_UPDATES=5 | "
 # Table B, cumulative (KABA throughout)
 CFG[C0_compactor]="${CFG[compactor_kaba]}"
+CFG[C0_history]="$compactor_env | --eviction_policy compactor --compactor_attention history"   # Compactor + KABA with only difference 1 (causal attention history, per head)
 CFG[C1_headnorm]="$compactor_env | --eviction_policy compactor --compactor_headwise_norm"
 # Same Compactor configurations with each head's keys right-sketched 64 -> 16 before leverage
 CFG[compactor_uniform_sk16]="$compactor_env | --eviction_policy compactor --layer_budget_strategy uniform --compactor_sketch_dim 16"

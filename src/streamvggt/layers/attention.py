@@ -87,6 +87,7 @@ class Attention(nn.Module):
         self.rope = rope
         self.num_anchor_tokens = 0
         self._insert_scores = None  # [B, H, N] frame-block attention score per cached token (noncausal_insert)
+        self._history = None  # per-head attention history (compactor_attention=history): accum/norm/count [B, H, N]
         self._eviction_managers = {}
         self._eviction_profile_totals = {}
         self._eviction_profile_count = 0
@@ -96,9 +97,17 @@ class Attention(nn.Module):
         self._perf_trace_events = []
         self._perf_trace_totals = {}
 
+    def _gather_history(self, keep_indices: torch.Tensor, n_tokens: int) -> None:
+        """Keep the per-head attention history aligned with a per-head (or shared) keep set."""
+        if self._history is None or self._history["accum"].shape[-1] != int(n_tokens):
+            return
+        idx = keep_indices.to(self._history["accum"].device)
+        self._history = {name: torch.gather(t, 2, idx) for name, t in self._history.items()}
+
     def _reset_cache_state(self):
         self.num_anchor_tokens = 0
         self._insert_scores = None
+        self._history = None
         self._eviction_profile_totals = {}
         self._eviction_profile_count = 0
         self._attention_forward_profile_totals = {}
@@ -295,6 +304,7 @@ class Attention(nn.Module):
                 )
             if self._insert_scores is not None and self._insert_scores.shape[-1] == N:
                 self._insert_scores = torch.gather(self._insert_scores, 2, keep_indices)
+            self._gather_history(keep_indices, N)
             final_k, final_v = _materialize_kv_by_keep_indices(
                 k, v, keep_indices, head_shared=True
             )
@@ -461,6 +471,13 @@ class Attention(nn.Module):
         insert_candidates = None
         if self._insert_scores is not None and self._insert_scores.shape[-1] == select_k.shape[2]:
             insert_candidates = self._insert_scores[:, :, num_anchor_tokens:]
+        history_candidates = history_observed = None
+        if eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "history":
+            if self._history is None or self._history["accum"].shape[-1] != select_k.shape[2]:
+                raise RuntimeError("compactor_attention=history: the attention history is not aligned with the cache")
+            h = self._history
+            history_candidates = (h["accum"] / h["norm"].clamp_min(1e-12))[:, :, num_anchor_tokens:]
+            history_observed = h["count"][:, :, num_anchor_tokens:].gt(0)
         if (eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "insert"
                 and insert_candidates is None):
             raise RuntimeError("compactor_attention=insert: stored frame-block scores are not aligned with the cache")
@@ -505,8 +522,9 @@ class Attention(nn.Module):
             candidate_attention_per_head=(
                 insert_candidates
                 if eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "insert"
-                else None
+                else history_candidates
             ),
+            candidate_attention_observed_per_head=history_observed,
         )
         self._perf_trace_end(
             "select",
@@ -613,6 +631,7 @@ class Attention(nn.Module):
         per_head_cache = eviction_policy == "compactor"
         if self._insert_scores is not None and self._insert_scores.shape[-1] == N:
             self._insert_scores = torch.gather(self._insert_scores, 2, keep_indices.to(self._insert_scores.device))
+        self._gather_history(keep_indices, N)
         if per_head_cache and confidence_state is not None:
             raise RuntimeError(
                 "The compactor policy keeps different tokens per head; run it without the confidence gate and "
@@ -968,6 +987,18 @@ class Attention(nn.Module):
                 ablation_config.CONFIG.attention_source == "noncausal_insert"
                 or (eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "insert")
             )
+            if (eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "history"
+                    and cache_write_current_frame):
+                # New tokens join the per-head attention history unobserved (zeros).
+                n_new = int(q.shape[2])
+                prev = self._history
+                if prev is None or prev["accum"].shape[-1] != k.shape[2] - n_new:
+                    shape = (k.shape[0], k.shape[1], k.shape[2] - n_new)
+                    prev = {"accum": torch.zeros(shape, device=k.device), "norm": torch.zeros(shape, device=k.device),
+                            "count": torch.zeros(shape, device=k.device, dtype=torch.uint8)}
+                pad = lambda t: torch.cat(  # noqa: E731
+                    [t, torch.zeros(t.shape[0], t.shape[1], n_new, device=t.device, dtype=t.dtype)], dim=2)
+                self._history = {name: pad(t.to(k.device)) for name, t in prev.items()}
             if need_insert_scores and cache_write_current_frame:
                 # Frame-block score: the new tokens' own queries over the new tokens' keys, no causal mask.
                 n_new = int(q.shape[2])
@@ -1133,6 +1164,20 @@ class Attention(nn.Module):
             attn = self.attn_drop(attn)
 
             x = attn @ v_for_attn
+
+        if (eviction_policy == "compactor" and ablation_config.CONFIG.compactor_attention == "history"
+                and self._history is not None and self._history["accum"].shape[-1] == k_for_attn.shape[2]):
+            # Causal attention history per head: what every live key received from this frame's queries.
+            q_unscaled = q if self.fused_attn else q / self.scale  # the explicit path scaled q in place
+            colsum = EvictionManager.noncausal_attention_colsum(q_unscaled, k_for_attn)
+            score = colsum.float() * (float(k_for_attn.shape[2]) / float(q.shape[2]))
+            h, decay = self._history, float(ablation_config.CONFIG.compactor_history_decay)
+            freeze = int(ablation_config.CONFIG.compactor_history_freeze)
+            active = torch.ones_like(h["count"], dtype=torch.bool) if freeze == 0 else h["count"] < freeze
+            score = torch.nan_to_num(score.to(h["accum"].device), nan=0.0, posinf=0.0, neginf=0.0)
+            h["accum"] = torch.where(active, decay * h["accum"] + score, h["accum"])
+            h["norm"] = torch.where(active, decay * h["norm"] + 1.0, h["norm"])
+            h["count"] = torch.where(active, (h["count"].to(torch.int16) + 1).clamp_max(255).to(torch.uint8), h["count"])
 
         if leverage_attention_utility:
             if confidence_state is None or attention_colsum is None:

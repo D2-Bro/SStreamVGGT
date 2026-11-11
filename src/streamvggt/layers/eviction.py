@@ -530,6 +530,7 @@ class EvictionManager:
         capture_projected_norms: bool = False,
         query: Optional[torch.Tensor] = None,
         candidate_attention_per_head: Optional[torch.Tensor] = None,
+        candidate_attention_observed_per_head: Optional[torch.Tensor] = None,
     ) -> EvictionResult:
         """Select candidate-local indices to retain.
 
@@ -584,7 +585,8 @@ class EvictionManager:
             if query is None:
                 raise ValueError("The compactor policy needs the current queries (query=...)")
             policy_scores, compactor_leverage = self._compactor_scores(
-                k, query, num_anchor_tokens, attention=candidate_attention_per_head
+                k, query, num_anchor_tokens, attention=candidate_attention_per_head,
+                observed=candidate_attention_observed_per_head,
             )
             if self.layer_budget_strategy in LAYER_BUDGET_SCORE_STRATEGIES:
                 # KABA on per-head leverage: the participation ratio of each head, averaged over heads.
@@ -890,6 +892,7 @@ class EvictionManager:
         query: torch.Tensor,
         num_anchor_tokens: int,
         attention: Optional[torch.Tensor] = None,
+        observed: Optional[torch.Tensor] = None,
     ):
         """Compactor (Chari & Van Durme 2025, official compactor-vllm code) ported to the streaming cache.
 
@@ -928,9 +931,17 @@ class EvictionManager:
         gram = x.transpose(-1, -2) @ x + float(CONFIG.compactor_ridge) * torch.eye(D, device=x.device, dtype=x.dtype)
         solved = torch.linalg.solve(gram, x.transpose(-1, -2))  # [B, H, D, Nc]
         leverage = (x * solved.transpose(-1, -2)).sum(dim=-1).clamp_min(0.0).float()
-        scores = self._zscore(attention, dims=(1, 2)) + float(CONFIG.compactor_lambda) * self._zscore(
-            leverage, dims=(1, 2)
-        )
+        lam = float(CONFIG.compactor_lambda)
+        if observed is None:
+            scores = self._zscore(attention, dims=(1, 2)) + lam * self._zscore(leverage, dims=(1, 2))
+        else:
+            # Attention history (compactor_attention=history): only attended tokens have an attention score; the
+            # others score by leverage alone (weight unobserved_lev_multiplier * lam, as in the IDC blend).
+            observed = observed.to(device=attention.device, dtype=torch.bool)
+            mult = 1.0 if CONFIG.unobserved_lev_multiplier is None else float(CONFIG.unobserved_lev_multiplier)
+            z_lev = self._zscore(leverage, dims=(1, 2))
+            z_att = self._zscore(attention, dims=(1, 2), mask=observed)
+            scores = torch.where(observed, z_att + lam * z_lev, mult * lam * z_lev)
         return scores, leverage
 
     @staticmethod

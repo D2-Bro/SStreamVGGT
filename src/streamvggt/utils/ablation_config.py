@@ -11,7 +11,12 @@ the model, aggregator, block and attention signatures. Defaults reproduce the ex
                            to the frame's own keys (no causal mask); the per-head column sum is stored with the
                            token and kept fixed (head-averaged for the layer-shared IDC path).
   compactor_attention      compactor policy: "current" = current-frame queries over all live keys at each eviction;
-                           "insert" = the frame-block score above (per head).
+                           "insert" = the frame-block score above (per head);
+                           "history" = causal attention history kept per head (IDC difference 1 alone): after each
+                           frame's global attention, the attention every live key received from that frame's queries
+                           (column sum, scaled like the IDC utility) is accumulated with an EMA (decay
+                           compactor_history_decay, never frozen when compactor_history_freeze = 0); tokens that have
+                           not been attended yet score by leverage only (unobserved_lev_multiplier, default 1).
   score_norm               "mean": (1-b)*lev/mean(lev) + b*util/mean(util) (IDC, existing).
                            "zscore": z(util) + lam*z(lev), population std (Compactor).
   compactor_lambda         lam above, and in the compactor policy (official code: 0.5).
@@ -41,13 +46,15 @@ class AblationConfig:
     compactor_headwise_norm: bool = False
     compactor_sketch_dim: int = 0
     compactor_attention: str = "current"
+    compactor_history_decay: float = 0.9
+    compactor_history_freeze: int = 0
 
 
 CONFIG = AblationConfig()
 
 _CHOICES = {
     "attention_source": ("causal_history", "noncausal_current", "noncausal_insert"),
-    "compactor_attention": ("current", "insert"),
+    "compactor_attention": ("current", "insert", "history"),
     "score_norm": ("mean", "zscore"),
 }
 

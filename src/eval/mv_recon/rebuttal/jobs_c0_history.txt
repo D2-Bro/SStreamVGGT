@@ -1,0 +1,6 @@
+compB_C0_history	CUDA_DETERMINISTIC=true bash compactor.sh C0_history
+compBfull_C0_history	CUDA_DETERMINISTIC=true MAX_FRAMES=full bash compactor.sh C0_history
+eth3d_compactor_C0_history	CUDA_DETERMINISTIC=true KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C0_history
+pose_compB_C0_history	CUDA_DETERMINISTIC=true bash pose_compactor.sh C0_history
+tum_compactor_C0_history	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=tum_stride2 SSTREAMVGGT_TUM_ROOT=/home/dongjae/dataset/tum OUT_ROOT=../eval_results/pose_evaluation/rebuttal_tum/compactor bash pose_compactor.sh C0_history
+replica_det_compactor_C0_history	CUDA_DETERMINISTIC=true POSE_EVAL_DATASET=replica SSTREAMVGGT_REPLICA_ROOT=/home/dongjae/dataset/replica/Replica OUT_ROOT=../eval_results/pose_evaluation/rebuttal_replica_det_fix/compactor bash pose_compactor.sh C0_history
