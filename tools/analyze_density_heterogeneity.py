@@ -23,7 +23,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-TAUS = ("0.7", "0.8", "0.9")
+TAUS = tuple(os.environ.get("SSTREAMVGGT_DENSITY_TAUS", "0.7,0.8,0.9").split(","))  # as logged
 HET = ("cv", "topbot", "maxmin", "gini", "std", "mean")
 
 
@@ -105,7 +105,7 @@ def synthetic_reference():
     }
     rows = []
     for name, x in sets.items():
-        st = set_statistics(x, (0.5, 0.7, 0.8, 0.9), chunk=256)
+        st = set_statistics(x, (0.5,) + tuple(float(t) for t in TAUS), chunk=256)
         row = {"run": name, "space": "-", "set": "-", "rows": 1, "psi_over_n": st["psi_over_n"]}
         for tau in TAUS:
             for k in HET:

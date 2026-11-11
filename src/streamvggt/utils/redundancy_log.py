@@ -24,7 +24,9 @@ import torch
 _CONFIG = {"dir": None, "every": 10, "taus": (0.5, 0.7, 0.8, 0.9), "scene": None, "path": None,
            "dump_tokens": False}
 _TOKEN_DUMP = {"scene_path": None, "items": {}}  # space -> list of per-(step, layer) dicts
-DENSITY_TAUS = (0.7, 0.8, 0.9)  # local density: per-token count of other tokens with cosine > tau
+# local density: per-token count of other tokens with cosine > tau. SSTREAMVGGT_DENSITY_TAUS / SSTREAMVGGT_COS_TAUS
+# (comma-separated) add thresholds for an analysis run without changing the defaults.
+DENSITY_TAUS = tuple(float(t) for t in os.environ.get("SSTREAMVGGT_DENSITY_TAUS", "0.7,0.8,0.9").split(","))
 
 FIELDS_BASE = [
     "step", "layer", "space", "set", "n_tokens", "head_shared", "psi", "psi_over_n", "rank", "erank", "erank_over_n",
@@ -32,8 +34,10 @@ FIELDS_BASE = [
 ]
 
 
-def configure(log_dir: Optional[str], every: int = 10, taus: Sequence[float] = (0.5, 0.7, 0.8, 0.9),
+def configure(log_dir: Optional[str], every: int = 10, taus: Optional[Sequence[float]] = None,
               dump_tokens: bool = False):
+    if taus is None:
+        taus = [float(t) for t in os.environ.get("SSTREAMVGGT_COS_TAUS", "0.5,0.7,0.8,0.9").split(",")]
     _CONFIG.update(dir=log_dir, every=max(int(every), 1), taus=tuple(float(t) for t in taus),
                    dump_tokens=bool(dump_tokens))
 
