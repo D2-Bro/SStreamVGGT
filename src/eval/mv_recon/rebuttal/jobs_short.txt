@@ -1,0 +1,8 @@
+# Short sequence (first 100 frames) reconstruction, 7-Scenes + NRGBD, CUDA determinism on, after the colsum fix.
+f100_strict_B30000_soft	CUDA_DETERMINISTIC=true MAX_FRAMES=100 OUT_ROOT=../eval_results/mv_recon/rebuttal/strict_frames100 MODES=soft bash strict.sh 30000
+f100_strict_B30000_strict	CUDA_DETERMINISTIC=true MAX_FRAMES=100 OUT_ROOT=../eval_results/mv_recon/rebuttal/strict_frames100 MODES=strict bash strict.sh 30000
+f100_strict_B30000_redistribute	CUDA_DETERMINISTIC=true MAX_FRAMES=100 OUT_ROOT=../eval_results/mv_recon/rebuttal/strict_frames100 bash strict_redistribute.sh 30000
+f100_strict_B60000_soft	CUDA_DETERMINISTIC=true MAX_FRAMES=100 OUT_ROOT=../eval_results/mv_recon/rebuttal/strict_frames100 MODES=soft bash strict.sh 60000
+f100_strict_B60000_strict	CUDA_DETERMINISTIC=true MAX_FRAMES=100 OUT_ROOT=../eval_results/mv_recon/rebuttal/strict_frames100 MODES=strict bash strict.sh 60000
+f100_strict_B60000_redistribute	CUDA_DETERMINISTIC=true MAX_FRAMES=100 OUT_ROOT=../eval_results/mv_recon/rebuttal/strict_frames100 bash strict_redistribute.sh 60000
+f100_wo_kaba_B60000	CUDA_DETERMINISTIC=true MAX_FRAMES=100 OUT_ROOT=../eval_results/mv_recon/rebuttal/wo_kaba_frames100 MODES=soft EXTRA_ARGS='--layer_budget_strategy uniform' bash strict.sh 60000
