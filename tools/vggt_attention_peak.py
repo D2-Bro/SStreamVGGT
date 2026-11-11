@@ -109,8 +109,12 @@ def _record(q, k, v, out):
                         "frac_self": float((same_patch & (qf_ == kf_)).mean()),
                         "frac_same_position": float((same_patch & (qf_ != kf_)).mean()),
                         "frac_cross_frame": float((qf_ != kf_).mean())})
-    knorm = kf[0].norm(dim=-1)
-    S.keynorm.append({"layer": layer, "key_norm_all": float(knorm.mean())})
+    knorm = kf[0].norm(dim=-1)  # [H, N], per-head (64-d) norm
+    tok = kf[0].square().sum(dim=(0, 2)).sqrt()  # [N], heads concatenated (1024-d): KABA's key-norm term
+    S.keynorm.append({"layer": layer, "key_norm_all": float(knorm.mean()), "key_token_norm_all": float(tok.mean()),
+                      "key_token_norm_last": float(tok[(F_ - 1) * P:].mean()),
+                      "key_token_norm_patch": float(tok[~special_key].mean()),
+                      "key_token_norm_special": float(tok[special_key].mean()), "key_token_norm_std": float(tok.std())})
 
 
 def main():

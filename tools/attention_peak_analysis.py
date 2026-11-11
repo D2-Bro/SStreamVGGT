@@ -125,9 +125,14 @@ def _record(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor
                         "frac_cross_frame": float((kframe != cur).mean())})
     State.union.setdefault(layer, []).extend(
         zip(vals_np.tolist(), [step] * TOP_AVGGT, qi.tolist(), kframe.tolist(), kpatch.tolist()))
-    knorm = kf[0].norm(dim=-1)  # [H, N]
+    knorm = kf[0].norm(dim=-1)  # [H, N], per-head (64-d) norm
+    tok = kf[0].square().sum(dim=(0, 2)).sqrt()  # [N], heads concatenated (1024-d): KABA's key-norm term
     State.keynorm.append({"layer": layer, "step": step, "key_norm_all": float(knorm.mean()),
-                          "key_norm_current": float(knorm[:, past:].mean())})
+                          "key_norm_current": float(knorm[:, past:].mean()),
+                          "key_token_norm_all": float(tok.mean()), "key_token_norm_current": float(tok[past:].mean()),
+                          "key_token_norm_patch": float(tok[~special_key].mean()),
+                          "key_token_norm_special": float(tok[special_key].mean()),
+                          "key_token_norm_std": float(tok.std())})
 
 
 def install_patches(model, collect: bool) -> None:
