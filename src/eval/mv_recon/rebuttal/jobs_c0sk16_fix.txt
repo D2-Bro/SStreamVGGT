@@ -1,0 +1,2 @@
+f100_C0_sk16_history	CUDA_DETERMINISTIC=true MAX_FRAMES=100 bash compactor.sh C0_sk16_history
+eth3d_big_C0_sk16_history	CUDA_DETERMINISTIC=true KF_EVERY=1 MAX_FRAMES=full EXTRA_ARGS='--eval_datasets ETH3D' OUT_ROOT=../eval_results/mv_recon/rebuttal_eth3d/compactor bash compactor.sh C0_sk16_history
