@@ -212,6 +212,7 @@ def get_args_parser():
     parser.add_argument("--compactor_ridge", type=float, default=5e-3)
     parser.add_argument("--compactor_sketch_dim", type=int, default=0, help="Compactor policy: right-sketch each head's keys to this many dims before leverage (0 = exact)")
     parser.add_argument("--compactor_attention", choices=("current", "insert", "history"), default="current", help="Compactor policy attention score: current = current-frame queries over all live keys at each eviction; insert = frame-block score computed once when the frame enters (its queries over its own keys); history = causal attention history accumulated per head (EMA 0.9, no freeze)")
+    parser.add_argument("--compactor_history_freeze", type=int, default=0, help="compactor_attention=history: stop updating a token's attention history after this many updates (0 = never freeze; IDC uses 5)")
     parser.add_argument("--compactor_headwise_norm", action="store_true")
     parser.add_argument("--no_cuda_deterministic", action="store_true", help="Keep the seeds but do not force deterministic CUDA kernels")
     parser.add_argument("--redundancy_log", action="store_true", help="Write cache redundancy / local density statistics per sequence to <output_dir>/<dataset>/redundancy/<seq>.csv")
@@ -690,6 +691,7 @@ if __name__ == "__main__":
         compactor_headwise_norm=args.compactor_headwise_norm,
         compactor_sketch_dim=args.compactor_sketch_dim,
         compactor_attention=args.compactor_attention,
+        compactor_history_freeze=args.compactor_history_freeze,
     )
     if args.eviction_policy == "compactor" and (args.leverage_conf_gate or args.leverage_attention_utility):
         raise SystemExit("Error: --eviction_policy compactor runs without --leverage_conf_gate and --leverage_attention_utility")

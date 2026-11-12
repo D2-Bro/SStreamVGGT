@@ -1,0 +1,1 @@
+C0_sk16_history_freeze_full	CUDA_DETERMINISTIC=true MAX_FRAMES=full bash compactor.sh C0_sk16_history_freeze
