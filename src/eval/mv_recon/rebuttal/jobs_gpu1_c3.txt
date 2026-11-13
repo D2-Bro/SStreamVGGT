@@ -1,0 +1,2 @@
+# C3 (Compactor + headnorm + concat + history) full sequence, 7-Scenes + NRGBD, determinism on; rerun after the OOM. GPU 1, after the full-cache stride runs.
+compBfull_C3_history_rerun	CUDA_DETERMINISTIC=true MAX_FRAMES=full bash compactor.sh C3_history
