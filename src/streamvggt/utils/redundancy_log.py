@@ -30,7 +30,7 @@ DENSITY_TAUS = tuple(float(t) for t in os.environ.get("SSTREAMVGGT_DENSITY_TAUS"
 
 FIELDS_BASE = [
     "step", "layer", "space", "set", "n_tokens", "head_shared", "psi", "psi_over_n", "rank", "erank", "erank_over_n",
-    "stable_rank", "mean_cos",
+    "stable_rank", "mean_cos", "std_cos",
 ]
 
 
@@ -160,6 +160,13 @@ def set_statistics(x: torch.Tensor, taus: Sequence[float], chunk: int = 1024,
     # cosine: exact mean over pairs, threshold fractions and nearest-neighbour cosine over chunks
     s = x.sum(dim=0)
     out["mean_cos"] = float((s @ s - n) / (n * (n - 1))) if n > 1 else float("nan")
+    # std over the n(n-1) pairs: sum_{i!=j} cos_ij^2 = ||X^T X||_F^2 - n for unit rows (feature-space Gram, d x d)
+    if n > 1:
+        g = x.T @ x
+        mean_sq = (float((g * g).sum()) - n) / (n * (n - 1))
+        out["std_cos"] = math.sqrt(max(mean_sq - out["mean_cos"] ** 2, 0.0))
+    else:
+        out["std_cos"] = float("nan")
     counts = torch.zeros(len(taus), dtype=torch.float64, device=x.device)
     nn = torch.empty(n, dtype=torch.float64, device=x.device)
     taus_t = torch.tensor(list(taus), dtype=torch.float64, device=x.device)
