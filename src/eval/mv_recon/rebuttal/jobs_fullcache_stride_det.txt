@@ -1,0 +1,4 @@
+# StreamVGGT with a full (unbounded) cache at large strides, 7-Scenes + NRGBD, CUDA determinism on, GPU 1 only.
+fullcache_stride20_det	CUDA_DETERMINISTIC=true BUDGETS=full OUT_ROOT=../eval_results/mv_recon/rebuttal/stride_det bash stride.sh 20
+fullcache_stride50_det	CUDA_DETERMINISTIC=true BUDGETS=full OUT_ROOT=../eval_results/mv_recon/rebuttal/stride_det bash stride.sh 50
+fullcache_stride100_det	CUDA_DETERMINISTIC=true BUDGETS=full OUT_ROOT=../eval_results/mv_recon/rebuttal/stride_det bash stride.sh 100
