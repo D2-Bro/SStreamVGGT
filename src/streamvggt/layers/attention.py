@@ -923,6 +923,8 @@ class Attention(nn.Module):
                     initial_confidence_gate = parsed_conf_gate_init
                 confidence_state = _current_confidence(current_k.shape[2], initial_confidence_gate)
 
+            if ablation_config.CONFIG.kv_cache_key_dtype == "value" and current_k.dtype != current_v.dtype:
+                current_k = current_k.to(current_v.dtype)  # cache keys in the value dtype (official StreamVGGT: bf16)
             write_k = current_k
             write_v = current_v
             write_confidence_state = confidence_state

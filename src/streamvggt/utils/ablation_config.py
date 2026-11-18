@@ -30,6 +30,11 @@ the model, aggregator, block and attention signatures. Defaults reproduce the ex
   compactor_sketch_dim     compactor policy: 0 = exact per-head leverage on the 64-d keys; k > 0 = right-sketch each
                            head's keys to k dims first (Gaussian N(0, 1/k), seed 42, shared by heads and layers, as
                            in the official code) and compute the ridge leverage on the k x k Gram matrix.
+  kv_cache_key_dtype       dtype the KV cache stores keys in. "auto" (default) = whatever the cache path produces (the
+                           attention-utility path stores fp16; without it the post-norm/RoPE keys stay fp32 under bf16
+                           autocast). "value" = cast the current frame's keys to the value dtype before they are cached,
+                           as the official StreamVGGT cache does (bf16); attention sees the same bf16 keys either way,
+                           since fused SDPA under autocast casts its inputs to bf16.
 """
 
 from dataclasses import dataclass, fields
@@ -48,6 +53,7 @@ class AblationConfig:
     compactor_attention: str = "current"
     compactor_history_decay: float = 0.9
     compactor_history_freeze: int = 0
+    kv_cache_key_dtype: str = "auto"
 
 
 CONFIG = AblationConfig()
@@ -56,6 +62,7 @@ _CHOICES = {
     "attention_source": ("causal_history", "noncausal_current", "noncausal_insert"),
     "compactor_attention": ("current", "insert", "history"),
     "score_norm": ("mean", "zscore"),
+    "kv_cache_key_dtype": ("auto", "value"),
 }
 
 
