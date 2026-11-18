@@ -1,0 +1,1 @@
+# Pending jobs of jobs_mem7.txt on GPUs 0, 2, 3 (GPU 4 is reserved for C0_sk16_history_freeze).
