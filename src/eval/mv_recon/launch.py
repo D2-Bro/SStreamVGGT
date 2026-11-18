@@ -247,7 +247,8 @@ def get_args_parser():
     parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of chunk-level attention observations accumulated before freezing token utility")
     parser.add_argument("--leverage_attention_colsum_subsample_ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument("--leverage_conf_gate_special_mode", type=str, default="mean", choices=("mean", "one"), help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0")
-    parser.add_argument("--layer_budget_strategy", type=str, default="value_weighted_leverage_pr", choices=("uniform", "leverage_pr", "key_norm", "value_weighted_leverage_pr"), help="Layer-wise KV budget allocation strategy")
+    parser.add_argument("--layer_budget_strategy", type=str, default="value_weighted_leverage_pr", choices=("uniform", "leverage_pr", "key_norm", "value_weighted_leverage_pr", "static_profile"), help="Layer-wise KV budget allocation strategy (static_profile: fixed per-layer proportions from --layer_budget_proportions_path)")
+    parser.add_argument("--layer_budget_proportions_path", type=str, default=None, help="JSON with fixed per-layer budget proportions ({\"num_layers\": 24, \"proportions\": [...]}) for --layer_budget_strategy static_profile")
     parser.add_argument(
         "--layer_budget_score_only",
         "--layer-budget-score-only",
@@ -297,6 +298,7 @@ def get_args_parser():
     add_token_overlay_dump_args(parser)
     parser.add_argument("--eval_frame_stride", type=int, default=1, help="Use every Nth frame only when building eval point clouds; inference still uses all frames")
     parser.add_argument("--inputs_on_gpu", action="store_true", help="move the whole input sequence (images, GT points, masks) to the GPU before inference (previous behaviour; memory grows with sequence length)")
+    parser.add_argument("--key_dump_dir", type=str, default=None, help="Save the keys every global layer produces for each frame (k_norm output) to <dir>/<dataset>/<scene>.pt (EpiCache-style layer sensitivity)")
     parser.add_argument("--eval_stage", choices=("all", "infer", "none"), default="all", help="all runs metrics inline; infer saves point clouds for evaluate_saved.py; none runs inference only (no metrics, e.g. for analysis logs)")
     parser.add_argument("--eval_device", choices=("cpu", "cuda"), default="cpu", help="device for the inline metrics of --eval_stage all: cpu = Open3D legacy ICP + pykdtree (reference), cuda = the same ICP loop and exact NN distances on this rank's GPU")
     parser.add_argument(
@@ -473,7 +475,7 @@ def main(args):
         model = StreamVGGT(total_budget=args.budget)
         ckpt = torch.load(args.weights, map_location=device)
         model.load_state_dict(ckpt, strict=True)
-        if args.layer_budget_strategy == "cosine_precomputed":
+        if args.layer_budget_strategy in ("cosine_precomputed", "static_profile"):
             model.set_layer_budget_proportions(args.layer_budget_proportions_path)
             print(f"Loaded precomputed layer budget proportions: {args.layer_budget_proportions_path}")
         model.eval()
@@ -658,6 +660,10 @@ def main(args):
                                     "layer_budget_scores.csv",
                                 )
 
+                            if args.key_dump_dir:
+                                from streamvggt.utils import key_dump
+                                key_dump.install(model)
+                                key_dump.set_scene(osp.join(args.key_dump_dir, name_data, f"{scene_key}.pt"))
                             if args.kv_bytes_log:
                                 from streamvggt.utils import kv_bytes_log
                                 kv_bytes_log.configure(osp.join(args.output_dir, name_data, "kv_bytes"))
@@ -742,6 +748,8 @@ def main(args):
                             if torch.cuda.is_available():
                                 torch.cuda.synchronize(device)
                             infer_time = time.perf_counter() - infer_start
+                            if args.key_dump_dir:
+                                key_dump.flush()
                             fps = num_input_frames / infer_time if infer_time > 0 else float("inf")
                             peak_mem_gb = (
                                 torch.cuda.max_memory_allocated(device) / 1024 ** 3

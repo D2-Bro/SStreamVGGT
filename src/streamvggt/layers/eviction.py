@@ -17,6 +17,7 @@ VALID_LAYER_BUDGET_STRATEGIES = (
     "leverage_pr",
     "key_norm",
     "value_weighted_leverage_pr",
+    "static_profile",  # fixed per-layer proportions (aggregator.layer_budget_proportions), e.g. an EpiCache profile
 )
 
 

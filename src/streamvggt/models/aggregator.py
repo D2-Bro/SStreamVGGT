@@ -1215,6 +1215,14 @@ class Aggregator(nn.Module):
                 active_layer_scores = torch.zeros_like(self.last_layer_budget_scores)
                 allocation_alpha = 0.0
                 allocation_min_tokens = layer_budget_min_tokens
+            elif layer_budget_strategy == "static_profile":
+                # Fixed per-layer proportions (e.g. an offline EpiCache sensitivity profile): budgets proportional
+                # to them; the anchor floor / strict modes below apply as for KABA.
+                if self.layer_budget_proportions is None:
+                    raise ValueError("layer_budget_strategy='static_profile' needs set_layer_budget_proportions()")
+                active_layer_scores = self.layer_budget_proportions.detach().float().to(self.last_layer_budget_scores.device)
+                allocation_alpha = 1.0
+                allocation_min_tokens = layer_budget_min_tokens
             elif layer_budget_strategy in VALUE_WEIGHTED_LAYER_BUDGET_STRATEGIES:
                 active_layer_scores = self._combine_value_weighted_layer_scores(
                     self.last_layer_budget_base_scores,

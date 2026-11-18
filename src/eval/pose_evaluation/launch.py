@@ -192,7 +192,8 @@ def get_args_parser():
     parser.add_argument("--leverage_attention_freeze_updates", type=int, default=5, help="Number of chunk-level attention observations accumulated before freezing token utility")
     parser.add_argument("--leverage_attention_colsum_subsample_ratio", type=float, default=1.0, help="Fraction of query rows used by the STAC CUDA column-sum kernel")
     parser.add_argument("--leverage_conf_gate_special_mode", type=str, default="mean", choices=("mean", "one"), help="Gate mode for special/prefix tokens: mean uses the patch gate mean; one sets them to 1.0")
-    parser.add_argument("--layer_budget_strategy", type=str, default="value_weighted_leverage_pr", choices=("uniform", "leverage_pr", "key_norm", "value_weighted_leverage_pr"), help="Layer-wise KV budget allocation strategy")
+    parser.add_argument("--layer_budget_strategy", type=str, default="value_weighted_leverage_pr", choices=("uniform", "leverage_pr", "key_norm", "value_weighted_leverage_pr", "static_profile"), help="Layer-wise KV budget allocation strategy (static_profile: fixed per-layer proportions from --layer_budget_proportions_path)")
+    parser.add_argument("--layer_budget_proportions_path", type=str, default=None, help="JSON with fixed per-layer budget proportions ({\"num_layers\": 24, \"proportions\": [...]}) for --layer_budget_strategy static_profile")
     parser.add_argument(
         "--layer_budget_score_only",
         "--layer-budget-score-only",
@@ -712,7 +713,7 @@ if __name__ == "__main__":
     model = StreamVGGT(total_budget=args.budget)
     checkpoint = torch.load(args.weights, map_location="cpu")
     model.load_state_dict(checkpoint, strict=True)
-    if args.layer_budget_strategy == "cosine_precomputed":
+    if args.layer_budget_strategy in ("cosine_precomputed", "static_profile"):
         model.set_layer_budget_proportions(args.layer_budget_proportions_path)
         print(f"Loaded precomputed layer budget proportions: {args.layer_budget_proportions_path}")
     model.eval()
